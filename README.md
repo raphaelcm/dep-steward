@@ -4,7 +4,7 @@
 
 A steward is entrusted to manage something with care and judgment on your behalf. `dep-steward` does that for your dependency updates: a Claude cloud agent reviews every Dependabot PR — reading changelogs, enumerating breaking changes, and grepping *your* code for affected usage — and a **fully deterministic gate** decides the merge. The gate re-checks everything the model claims, so a prompt-injected dependency diff can never cause an unsafe merge.
 
-This is not blind merging. It **auto-reviews** every Dependabot PR, **auto-updates** what's provably safe, and **merges only when safe**: routine minor/patch bumps sail through once CI is green, while major bumps get a real, changelog-grounded review and are escalated to you the moment anything is uncertain.
+This is not blind merging. `dep-steward` configures Dependabot to **auto-update** your dependencies on a schedule, **auto-reviews** every PR it opens with a Claude agent, and **auto-merges only when it's safe**: routine minor/patch bumps sail through once CI is green, while major bumps get a real, changelog-grounded review and are escalated to you the moment anything is uncertain.
 
 ## Install
 
@@ -28,25 +28,29 @@ sh -c "$(curl -fsSL https://raw.githubusercontent.com/raphaelcm/dep-steward/main
 
 ## How it works
 
-Two decoupled paths, split along an LLM-judgment-vs-deterministic line:
+`dep-steward` installs three stages that run in sequence — the Dependabot config that **auto-updates**, then a two-job pipeline that **auto-reviews** and **auto-merges only when safe**. The two jobs split along an LLM-judgment-vs-deterministic line:
 
 ```
-Dependabot opens a PR
+① AUTO-UPDATE  —  Dependabot, configured by .github/dependabot.yml
+      opens dependency-update PRs on a schedule; minor/patch bumps are
+      grouped into one PR, majors arrive individually.
         │
-        ├─►  review job  (Claude cloud agent, never merges)
-        │        reads the diff, classifies each bump, fetches changelogs,
-        │        greps your code, posts ONE comment. For singleton/major PRs
-        │        the comment carries a structured AUTOMERGE-DECISION-V1 block.
+        ▼
+② AUTO-REVIEW  —  review job  (Claude cloud agent, never merges)
+      reads the diff, classifies each bump, fetches changelogs, greps your
+      code, posts ONE comment. For singleton/major PRs the comment carries
+      a structured AUTOMERGE-DECISION-V1 block.
         │
-        └─►  auto-merge job  (deterministic gate — the only thing that merges)
-                 re-checks, independently of the model:
-                   • author is Dependabot        • PR is open
-                   • CI is green                 • every changed path is whitelisted
-                 then:
-                   • minor/patch GROUP PR  → merge with zero LLM input
-                   • singleton / MAJOR PR  → merge only if the model's block says
-                     recommendation=merge AND our_usage_affected=false
-                   • anything else / uncertain → leave it, label needs-human-review
+        ▼
+③ AUTO-MERGE-WHEN-SAFE  —  auto-merge job  (deterministic gate; the only thing that merges)
+      re-checks, independently of the model:
+        • author is Dependabot        • PR is open
+        • CI is green                 • every changed path is whitelisted
+      then:
+        • minor/patch GROUP PR  → merge with zero LLM input
+        • singleton / MAJOR PR  → merge only if the model's block says
+          recommendation=merge AND our_usage_affected=false
+        • anything else / uncertain → leave it, label needs-human-review
 ```
 
 The whitelist + CI checks are **load-bearing**: even a maximally injection-compromised model cannot cause a merge that touches your `src/` or that breaks tests, because the gate applies those checks itself, ignoring anything the model says about them. See [SECURITY.md](SECURITY.md).
