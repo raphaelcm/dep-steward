@@ -299,7 +299,27 @@ fi
 # ---- secret in BOTH stores (the marquee gotcha) ----------------------------
 TOKEN="${CLAUDE_CODE_OAUTH_TOKEN:-}"
 if [ -z "$TOKEN" ] && [ -t 0 ]; then
-  printf 'Paste your CLAUDE_CODE_OAUTH_TOKEN (input hidden): '
+  # Fold token generation into the flow when Claude Code is installed. `claude
+  # setup-token` is interactive by design (browser OAuth) and prints the token
+  # for manual copy — it can't be captured silently — so we launch it inline
+  # and then read the token from the same prompt.
+  if command -v claude >/dev/null 2>&1; then
+    printf 'No CLAUDE_CODE_OAUTH_TOKEN set. Mint one now with claude setup-token? [Y/n] '
+    read -r ans
+    case "$ans" in
+      ''|[Yy]*)
+        say "Launching 'claude setup-token' — authorize in the browser, then copy the token it prints."
+        claude setup-token || warn "claude setup-token did not complete; you can still paste a token below"
+        printf 'Paste the token it printed (input hidden): '
+        ;;
+      *)
+        printf 'Paste your CLAUDE_CODE_OAUTH_TOKEN (input hidden): '
+        ;;
+    esac
+  else
+    info "Tip: with Claude Code installed, 'claude setup-token' mints this token (needs a Claude subscription)."
+    printf 'Paste your CLAUDE_CODE_OAUTH_TOKEN (input hidden): '
+  fi
   stty -echo 2>/dev/null || true
   read -r TOKEN
   stty echo 2>/dev/null || true
