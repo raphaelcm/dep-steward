@@ -37,14 +37,17 @@ case "$cmd" in
   api)
     case "$*" in
       *"-X PATCH"*) exit 0 ;;
-      *protection*) echo '{}'; exit 0 ;;
+      # The installer runs 'gh api .../rules/branches/<b> --jq <expr>'. The stub
+      # ignores --jq, so it emits the POST-jq value directly: the comma-joined
+      # required-check contexts (GH_REQUIRED_CONTEXTS), empty by default.
+      *rules/branches*) printf '%s' "\${GH_REQUIRED_CONTEXTS:-}"; exit 0 ;;
     esac
     exit 0 ;;
 esac
 exit 0
 `;
 
-function runInstaller() {
+function runInstaller(extraEnv = {}) {
   const bin = mkdtempSync(join(tmpdir(), 'ds-bin-'));
   const ghLog = join(bin, 'gh.log');
   writeFileSync(join(bin, 'gh'), FAKE_GH);
@@ -55,7 +58,7 @@ function runInstaller() {
   writeFileSync(join(repoDir, 'package-lock.json'), '{}\n');
   execFileSync('git', ['init', '-q'], { cwd: repoDir });
 
-  execFileSync('sh', [join(REPO, 'install.sh'), '--ci-name', 'CI'], {
+  const stdout = execFileSync('sh', [join(REPO, 'install.sh'), '--ci-name', 'CI'], {
     cwd: repoDir,
     env: {
       ...process.env,
@@ -63,11 +66,13 @@ function runInstaller() {
       GH_LOG: ghLog,
       DEP_STEWARD_SRC: REPO,
       CLAUDE_CODE_OAUTH_TOKEN: 'oauth-tok-xyz',
+      ...extraEnv,
     },
+    encoding: 'utf8',
     stdio: 'pipe',
   });
 
-  return { log: readFileSync(ghLog, 'utf8'), repoDir };
+  return { log: readFileSync(ghLog, 'utf8'), repoDir, stdout };
 }
 
 const { log, repoDir } = runInstaller();
@@ -110,4 +115,13 @@ test('writes the four automation files into the target repo', () => {
   ]) {
     assert.ok(existsSync(join(repoDir, f)), `expected ${f} to be written`);
   }
+});
+
+test('reports required status checks from the effective-rules endpoint (regression: ruleset blind spot)', () => {
+  // A ruleset that requires the "CI" context. The old code queried only the
+  // classic /protection endpoint, which 404s on ruleset repos, so it would have
+  // false-warned "CI is not required". The rules-aware check must report it.
+  const { stdout } = runInstaller({ GH_REQUIRED_CONTEXTS: 'CI' });
+  assert.match(stdout, /Required status checks on 'main': CI/);
+  assert.doesNotMatch(stdout, /No status checks are required/);
 });

@@ -349,15 +349,25 @@ else
   warn "could not enable auto-merge; turn it on in Settings → General → Pull Requests"
 fi
 
-# ---- branch protection advice (detect only) --------------------------------
-prot=$(gh api "repos/$NWO/branches/$DEFAULT_BRANCH/protection" 2>/dev/null || true)
-if printf '%s' "$prot" | grep -q "$CI_NAME"; then
-  info "branch protection on '$DEFAULT_BRANCH' already references '$CI_NAME'"
+# ---- required-status-check advice (detect only; rulesets + classic) --------
+# GitHub requires status checks by *context* (a job / check-run name), not by
+# workflow name, and reports them via the effective-rules endpoint — which
+# covers BOTH rulesets and classic branch protection. (The classic
+# /branches/<b>/protection endpoint alone 404s on ruleset-based repos, which
+# would misreport.) We can't reliably map your CI workflow to its contexts, so
+# we report what's required and let you confirm your CI checks are among them.
+required=$(gh api "repos/$NWO/rules/branches/$DEFAULT_BRANCH" \
+  --jq '[.[] | select(.type=="required_status_checks")
+              | .parameters.required_status_checks[]?.context] | join(", ")' \
+  2>/dev/null || true)
+say ""
+if [ -n "$required" ]; then
+  info "Required status checks on '$DEFAULT_BRANCH': $required"
+  info "Confirm your '$CI_NAME' checks are among them — the gate treats CI-green as authoritative."
 else
-  say ""
-  warn "'$CI_NAME' is not a required status check on '$DEFAULT_BRANCH'."
-  info "The gate treats CI-green as authoritative; make CI required so nobody can merge around it:"
-  info "Settings → Branches → add a rule for '$DEFAULT_BRANCH' → Require status checks → '$CI_NAME'"
+  warn "No status checks are required on '$DEFAULT_BRANCH'."
+  info "The gate re-checks CI itself before merging, so the bot is safe — but requiring your '$CI_NAME'"
+  info "checks adds defense in depth (nobody merges around a red build). Set it in Settings → Rules."
 fi
 
 # ---- done ------------------------------------------------------------------
