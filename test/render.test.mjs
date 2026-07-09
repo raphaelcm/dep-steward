@@ -14,13 +14,8 @@ import { fileURLToPath } from 'node:url';
  * model; assignee "octocat"), must reproduce the committed fixtures under
  * test/fixtures/expected/reference/ BYTE FOR BYTE.
  * This locks the rendering logic — any drift in a template or a substitution
- * fails here.
- *
- * History: these fixtures began as a byte-for-byte reproduction of Runsense's
- * live pipeline (that parity was the acceptance gate for the dogfood, PR #1617:
- * everything identical except the gate's relocated path). The fixtures have
- * since moved ahead of that snapshot with the escalate-assignee feature, so they
- * are now a synthetic reference rather than a mirror of any one repo.
+ * fails here. The fixtures are a synthetic reference, not a mirror of any real
+ * repo.
  */
 
 const REPO = dirname(dirname(fileURLToPath(import.meta.url)));
