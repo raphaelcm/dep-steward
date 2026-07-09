@@ -94,6 +94,22 @@ Only singleton and major bumps trigger a model review; grouped minor/patch PRs m
 **Can this merge something malicious?**
 The gate merges only PRs whose every changed file is on the dependency/workflow whitelist and whose CI is green — both checked independently of the model. An injected diff can at most flip the model's recommendation, but it can't smuggle a source change past the whitelist or make broken tests pass. Details in [SECURITY.md](SECURITY.md).
 
+**How will I know when a PR needs me? / What happens to an escalated PR?**
+When the reviewer judges a PR unsafe or uncertain — a breaking change that affects you, a changelog it can't read, a CVE, files outside the whitelist, or plain uncertainty — dep-steward:
+
+- adds the **`needs-human-review`** label to the PR, and
+- posts a **comment** explaining exactly why, with its structured decision block. Security advisories (CVEs) are flagged **PRIORITY** at the top of the comment.
+
+The PR is then left open and untouched — the gate never merges an escalated PR. (If the reviewer ever fails to produce a verdict at all, its job goes **red** and still applies the label, so a broken review can't pass silently.)
+
+This release does **not** push an active notification — no email, Slack, or `@`-mention. You find the PRs waiting on you by filtering open PRs on the label:
+
+```
+https://github.com/<owner>/<repo>/pulls?q=is%3Aopen+label%3Aneeds-human-review
+```
+
+Bookmark that (or save it as a view). Active escalation notifications are a planned enhancement, not part of the initial release.
+
 **How do I stop major bumps from ever merging automatically?**
 It's conservative by default: a major bump merges only if the model affirmatively recommends it *and* finds no affected usage. To make majors always wait for a human, tell the reviewer to always escalate majors (edit `.github/dependabot-review-prompt.md`), or require human review on those PRs via branch protection.
 
