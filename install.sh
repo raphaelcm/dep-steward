@@ -233,8 +233,6 @@ render_workflow() {
       "$SRC/templates/dependabot-review.yml"
 }
 
-render_command() { cat "$SRC/templates/dep-steward-summary.md"; }
-
 render_gate() {
   inject '//__PREFIXES__' "$GROUP_PREFIXES" < "$SRC/templates/gate.cjs" \
     | inject '//__WL_EXACT__' "$WL_EXACT" \
@@ -255,7 +253,6 @@ if [ "$RENDER_ONLY" -eq 1 ]; then
   emit render_prompt          "$OUT/.github/dependabot-review-prompt.md"
   emit render_workflow        "$OUT/.github/workflows/dependabot-review.yml"
   emit render_gate            "$OUT/$GATE_PATH"
-  emit render_command         "$OUT/.claude/commands/dep-steward-summary.md"
   say "Rendered to $OUT (ecosystems: $ACTIVE; ci: $CI_NAME; model: $MODEL; assignee: ${ASSIGNEE:-none})"
   exit 0
 fi
@@ -320,9 +317,8 @@ emit render_dependabot_yml "$STAGE/.github/dependabot.yml"
 emit render_prompt          "$STAGE/.github/dependabot-review-prompt.md"
 emit render_workflow        "$STAGE/.github/workflows/dependabot-review.yml"
 emit render_gate            "$STAGE/$GATE_PATH"
-emit render_command         "$STAGE/.claude/commands/dep-steward-summary.md"
 
-FILES=".github/dependabot.yml .github/dependabot-review-prompt.md .github/workflows/dependabot-review.yml $GATE_PATH .claude/commands/dep-steward-summary.md"
+FILES=".github/dependabot.yml .github/dependabot-review-prompt.md .github/workflows/dependabot-review.yml $GATE_PATH"
 
 if [ "$DRY_RUN" -eq 1 ]; then
   say "[dry-run] files that would be written:"
@@ -446,8 +442,10 @@ fi
 
 # ---- done ------------------------------------------------------------------
 say ""
-say "Done. Smoke-test against an existing Dependabot PR without waiting for Monday:"
+say "Done. Commit the generated files under .github/ to activate the pipeline, then"
+say "smoke-test against an existing Dependabot PR without waiting for Monday:"
 info "gh workflow run dependabot-review.yml --repo $NWO -f pr_number=<PR>"
 say ""
-say "In Claude Code, run /dep-steward-summary any time to see what it's handled and the time it saved."
-say "Commit the generated files (.github/ + .claude/commands/) to activate the pipeline."
+say "Optional, one-time: add the /dep-steward-summary command to YOUR Claude command"
+say "library (personal — in your / menu everywhere, not tied to this repo):"
+info "curl -fsSL $REPO_URL/raw/main/templates/dep-steward-summary.md > ~/.claude/commands/dep-steward-summary.md"

@@ -108,16 +108,19 @@ test('enables auto-merge on the repo', () => {
   );
 });
 
-test('writes the automation files + the /dep-steward-summary command into the target repo', () => {
+test('writes the automation files into the target repo (repo scope only — no personal-config writes)', () => {
   for (const f of [
     '.github/dependabot.yml',
     '.github/dependabot-review-prompt.md',
     '.github/workflows/dependabot-review.yml',
     '.github/dependabot-automerge/gate.cjs',
-    '.claude/commands/dep-steward-summary.md',
   ]) {
     assert.ok(existsSync(join(repoDir, f)), `expected ${f} to be written`);
   }
+  // The installer must NOT create a per-repo copy of the summary command — it is
+  // a personal, install-once tool, not a repo artifact.
+  assert.ok(!existsSync(join(repoDir, '.claude/commands/dep-steward-summary.md')),
+    'installer should not write the summary command into the repo');
 });
 
 test('wires the default escalation assignee (from gh api user) into the escalate path', () => {

@@ -67,7 +67,6 @@ Files written into your repo (review and commit them like any change):
 | `.github/dependabot-review-prompt.md` | the reviewer's instructions |
 | `.github/dependabot.yml` | groups minor/patch bumps; majors stay individual |
 | `.github/dependabot-automerge/gate.cjs` | the deterministic gate (vanilla Node, zero deps) |
-| `.claude/commands/dep-steward-summary.md` | the `/dep-steward-summary` command (see below) |
 
 GitHub settings it configures (via `gh`):
 
@@ -80,9 +79,17 @@ It does not touch your source, your existing CI workflow, or your git history.
 
 ## Seeing what it's done: `/dep-steward-summary`
 
-The installer also drops a Claude Code command at `.claude/commands/dep-steward-summary.md`. Run **`/dep-steward-summary`** in Claude Code any time for a read-only readout: what dep-steward auto-merged, what it escalated and why, any security updates it landed, and an honest estimate of the time it saved — the counts are exact, and the per-PR minutes are stated as an assumption you can adjust. Pass a window if you like: `/dep-steward-summary 90d`.
+`/dep-steward-summary` is a Claude Code command that gives a read-only readout: what dep-steward auto-merged, what it escalated and why, any security updates it landed, and an honest time-saved estimate (counts exact; per-PR minutes an assumption you can adjust). Pass a window if you like: `/dep-steward-summary 90d`.
 
-It's pull, not push — no standing noise; you look when you're curious.
+It's a **personal, install-once** tool — it summarizes whatever repo you're in, so it belongs in *your* Claude command library, not in any one repo. The per-repo installer deliberately does **not** write to your `~/.claude/` (a repo-setup tool has no business editing your personal config). Install it yourself, once:
+
+```sh
+mkdir -p ~/.claude/commands
+curl -fsSL https://raw.githubusercontent.com/raphaelcm/dep-steward/main/templates/dep-steward-summary.md \
+  > ~/.claude/commands/dep-steward-summary.md
+```
+
+Now it's in your `/` menu everywhere — Claude Desktop and the CLI both read that library. (Prefer a repo-shared copy for your team instead? Drop the same file at `.claude/commands/dep-steward-summary.md` in the repo; it'll show in the `/` menu for anyone working in that repo.) It's pull, not push — no standing noise.
 
 ## FAQ
 

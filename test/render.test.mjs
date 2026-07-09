@@ -31,7 +31,6 @@ const FILES = [
   '.github/dependabot-review-prompt.md',
   '.github/workflows/dependabot-review.yml',
   '.github/dependabot-automerge/gate.cjs',
-  '.claude/commands/dep-steward-summary.md',
 ];
 
 // A representative multi-ecosystem repo, so the fixture exercises the catalog
