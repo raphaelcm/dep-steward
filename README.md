@@ -1,6 +1,6 @@
 # dep-steward
 
-**Claude-reviewed, injection-safe Dependabot automation for GitHub — auto-review, auto-update, and auto-merge-when-safe, installed in one line.**
+**Claude-reviewed, injection-safe Dependabot automation for GitHub — auto-update, auto-review, and auto-merge-when-safe, installed in one line.**
 
 A steward is entrusted to manage something with care and judgment on your behalf. `dep-steward` does that for your dependency updates: a Claude cloud agent reviews every Dependabot PR — reading changelogs, enumerating breaking changes, and grepping *your* code for affected usage — and a **fully deterministic gate** decides the merge. The gate re-checks everything the model claims, so a prompt-injected dependency diff can never cause an unsafe merge.
 

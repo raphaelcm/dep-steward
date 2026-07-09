@@ -1,7 +1,7 @@
 #!/bin/sh
 # dep-steward installer — adds Claude-reviewed, injection-safe Dependabot
-# automation to a GitHub repo in one command: auto-review every dependency PR,
-# auto-update what's provably safe, and auto-merge only when safe.
+# automation to a GitHub repo in one command: auto-update your dependencies on a
+# schedule, auto-review every PR with a Claude agent, and auto-merge only when safe.
 #
 #   sh -c "$(curl -fsSL https://raw.githubusercontent.com/raphaelcm/dep-steward/main/install.sh)"
 #
@@ -48,8 +48,8 @@ die()  { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 
 usage() {
   cat <<'USAGE'
-dep-steward installer — Claude auto-reviews your Dependabot PRs, auto-updates
-what's provably safe, and auto-merges only when safe.
+dep-steward installer — Dependabot auto-updates your dependencies, a Claude agent
+auto-reviews each PR, and the gate auto-merges only when it's safe.
 
 Usage: run in the repo you want to protect:
   sh -c "$(curl -fsSL https://raw.githubusercontent.com/raphaelcm/dep-steward/main/install.sh)"
