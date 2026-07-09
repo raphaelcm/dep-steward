@@ -110,8 +110,8 @@ const WHITELIST_EXACT = new Set([
 const WHITELIST_REGEX = [
   /^requirements.*\.txt$/,
   /^Dockerfile\..+$/,
-  /^[^\/]+\.dockerfile$/,
-  /^\.github\/workflows\/[^\/]+\.ya?ml$/,
+  /^[^/]+\.dockerfile$/,
+  /^\.github\/workflows\/[^/]+\.ya?ml$/,
   /^\.github\/actions\//,
   /(^|\/)action\.ya?ml$/,
 ];

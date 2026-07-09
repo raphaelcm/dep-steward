@@ -155,7 +155,7 @@ detect_ecosystems() {
   if [ -f ./Gemfile ] || ls ./*.gemspec >/dev/null 2>&1; then
     reg_eco bundler bundler bundler-minor-patch
     reg_exact Gemfile Gemfile.lock gems.rb gems.locked
-    reg_regex '/^[^\/]+\.gemspec$/'
+    reg_regex '/^[^/]+\.gemspec$/'
   fi
   [ -f ./composer.json ] && { reg_eco composer composer composer-minor-patch; reg_exact composer.json composer.lock; }
   [ -f ./pom.xml ] && { reg_eco maven maven maven-minor-patch; reg_exact pom.xml; }
@@ -166,16 +166,16 @@ detect_ecosystems() {
   if ls ./*.csproj ./*.fsproj ./*.vbproj ./*.sln >/dev/null 2>&1 || [ -f ./packages.config ] || [ -f ./Directory.Packages.props ]; then
     reg_eco nuget nuget nuget-minor-patch
     reg_exact packages.config packages.lock.json global.json Directory.Packages.props Directory.Build.props Directory.Build.targets
-    reg_regex '/^[^\/]+\.(csproj|vbproj|fsproj|proj|sln|slnx)$/'
+    reg_regex '/^[^/]+\.(csproj|vbproj|fsproj|proj|sln|slnx)$/'
   fi
   if [ -f ./Dockerfile ] || [ -f ./Containerfile ] || ls ./*.dockerfile >/dev/null 2>&1; then
     reg_eco docker docker docker-minor-patch
     reg_exact Dockerfile Containerfile
-    reg_regex '/^Dockerfile\..+$/' '/^[^\/]+\.dockerfile$/'
+    reg_regex '/^Dockerfile\..+$/' '/^[^/]+\.dockerfile$/'
   fi
   # GitHub Actions — always on (workflow + composite-action bumps).
   reg_eco github-actions github_actions actions-minor-patch
-  reg_regex '/^\.github\/workflows\/[^\/]+\.ya?ml$/' '/^\.github\/actions\//' '/(^|\/)action\.ya?ml$/'
+  reg_regex '/^\.github\/workflows\/[^/]+\.ya?ml$/' '/^\.github\/actions\//' '/(^|\/)action\.ya?ml$/'
 }
 detect_ecosystems
 ACTIVE=$(printf '%s' "$ACTIVE" | sed 's/^ *//')
