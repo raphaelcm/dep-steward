@@ -10,8 +10,9 @@ import { fileURLToPath } from 'node:url';
  * Render determinism.
  *
  * install.sh --render-only, given a fixed reference parameter set (CI workflow
- * "CI"; npm + GitHub Actions; default model; assignee "octocat"), must reproduce
- * the committed fixtures under test/fixtures/expected/reference/ BYTE FOR BYTE.
+ * "CI"; a multi-ecosystem repo — npm/pip/cargo/gomod/docker + Actions; default
+ * model; assignee "octocat"), must reproduce the committed fixtures under
+ * test/fixtures/expected/reference/ BYTE FOR BYTE.
  * This locks the rendering logic — any drift in a template or a substitution
  * fails here.
  *
@@ -33,10 +34,14 @@ const FILES = [
   '.claude/commands/dep-steward-summary.md',
 ];
 
+// A representative multi-ecosystem repo, so the fixture exercises the catalog
+// broadly: exact-path ecosystems (cargo, gomod), a regex ecosystem (pip's
+// requirements*.txt), the conservative docker whitelist, npm, and always Actions.
+const REFERENCE_MANIFESTS = ['package.json', 'package-lock.json', 'requirements.txt', 'Cargo.toml', 'go.mod', 'Dockerfile'];
+
 function renderReference() {
   const fakeRepo = mkdtempSync(join(tmpdir(), 'ds-ref-repo-'));
-  writeFileSync(join(fakeRepo, 'package.json'), '{}\n');
-  writeFileSync(join(fakeRepo, 'package-lock.json'), '{}\n');
+  for (const m of REFERENCE_MANIFESTS) writeFileSync(join(fakeRepo, m), '\n');
   const out = mkdtempSync(join(tmpdir(), 'ds-ref-out-'));
   execFileSync(
     'sh',
@@ -67,4 +72,21 @@ test('the escalate path assigns the configured maintainer', () => {
   const wf = readFileSync(join(rendered, '.github/workflows/dependabot-review.yml'), 'utf8');
   assert.match(prompt, /--add-label needs-human-review --add-assignee octocat/);
   assert.match(wf, /--add-label needs-human-review --add-assignee octocat/);
+});
+
+test('generates a dependabot.yml entry per detected ecosystem', () => {
+  const yml = readFileSync(join(rendered, '.github/dependabot.yml'), 'utf8');
+  for (const eco of ['npm', 'pip', 'cargo', 'gomod', 'docker', 'github-actions']) {
+    assert.match(yml, new RegExp(`package-ecosystem: ${eco}\\b`), `missing ${eco} in dependabot.yml`);
+  }
+});
+
+test("the gate keys off Dependabot's branch slugs, not the config names", () => {
+  const gate = readFileSync(join(rendered, '.github/dependabot-automerge/gate.cjs'), 'utf8');
+  // The three slugs that differ from the config value are the ones we most fear.
+  assert.match(gate, /'dependabot\/npm_and_yarn\/npm-minor-patch-'/);
+  assert.match(gate, /'dependabot\/go_modules\/gomod-minor-patch-'/);
+  assert.match(gate, /'dependabot\/github_actions\/actions-minor-patch-'/);
+  // And an identity one for good measure.
+  assert.match(gate, /'dependabot\/cargo\/cargo-minor-patch-'/);
 });

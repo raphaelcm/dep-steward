@@ -33,9 +33,12 @@
  * callers simple).
  */
 
+// One prefix per configured ecosystem: `dependabot/<branch-slug>/<group-name>-`.
+// The installer renders these from the ecosystems it detected — the branch slug
+// is Dependabot's own (npm→npm_and_yarn, gomod→go_modules, …), not the config
+// value.
 const ELIGIBLE_GROUP_PREFIXES = [
-  'dependabot/npm_and_yarn/npm-minor-patch-',
-  'dependabot/github_actions/actions-minor-patch-',
+//__PREFIXES__
 ];
 
 // Two strings, one identity. The Dependabot GitHub App's login is normalized
@@ -71,13 +74,23 @@ const TRUSTED_DECISION_AUTHORS = new Set([
 const V1_OPEN = '<!-- AUTOMERGE-DECISION-V1 -->';
 const V1_CLOSE = '<!-- /AUTOMERGE-DECISION-V1 -->';
 
+// The dependency surface a routine bump may touch, rendered from the detected
+// ecosystems: exact manifest/lock filenames plus regexes for the variable ones
+// (requirements*.txt, *.csproj, the GitHub Actions surface, …). A PR that
+// changes anything NOT matched here is rejected regardless of the LLM.
+const WHITELIST_EXACT = new Set([
+//__WL_EXACT__
+]);
+const WHITELIST_REGEX = [
+//__WL_REGEX__
+];
+
 function isWhitelistedPath(p) {
-  return (
-    p === 'package.json' ||
-//__LOCKFILE_TERMS__
-    /^\.github\/workflows\/[^/]+\.ya?ml$/.test(p) ||
-    p.startsWith('.github/actions/')
-  );
+  if (WHITELIST_EXACT.has(p)) return true;
+  for (const re of WHITELIST_REGEX) {
+    if (re.test(p)) return true;
+  }
+  return false;
 }
 
 function extractDecisionBlock(body) {

@@ -93,7 +93,13 @@ A Dependabot-triggered workflow run reads secrets from the *Dependabot* secret s
 No. The installer detects your CI workflow's name and templates it into the pipeline. Pass `--ci-name "<name>"` to override. The gate keys off this exact name, so it does need *a* CI workflow to exist.
 
 **Which ecosystems are supported?**
-v1 fully supports the **JavaScript family (npm / pnpm / yarn) + GitHub Actions** — it detects your lockfile and tailors the safety whitelist accordingly. Other ecosystems (pip, cargo, go, …) are a data-only addition; the whitelist and grouping live in one place and the structure is documented for contributions.
+Any Dependabot ecosystem the installer detects at your repo root: **npm/yarn/pnpm, pip (incl. poetry/pipenv), uv, cargo, Go modules, Bundler, Composer, Maven, Gradle, NuGet, Docker, and GitHub Actions** (Actions is always managed). The installer detects which manifests you have and generates the matching `dependabot.yml` entries, group-branch prefixes, and safety whitelist from one catalog (`detect_ecosystems` in `install.sh`) — so a repo with, say, `Cargo.toml` + `go.mod` + a `Dockerfile` gets all three managed.
+
+Two things worth knowing:
+- **The whitelist is deliberately conservative.** Docker only auto-merges `Dockerfile`-style files, *not* arbitrary YAML — so a Dependabot bump to an image tag in a Kubernetes manifest is escalated to you rather than silently merged. Anything a routine bump touches that isn't a known manifest/lockfile → escalated, never auto-merged.
+- **Manifests are detected at the repo root** (`directory: /`). Monorepo/subdirectory manifests aren't auto-detected yet — you'd add entries by hand.
+
+Adding an ecosystem is genuinely a small change: one clause in `detect_ecosystems` (its `package-ecosystem`, Dependabot's branch slug, and its manifest paths). The branch slug is Dependabot's own — for most ecosystems it equals the config value, but three don't (`npm`→`npm_and_yarn`, `gomod`→`go_modules`, `github-actions`→`github_actions`), which is exactly the kind of thing this tool gets right for you.
 
 **How much does it cost in tokens?**
 Only singleton and major bumps trigger a model review; grouped minor/patch PRs merge with zero model calls. A major-bump review is one bounded agent run (≤60 turns).

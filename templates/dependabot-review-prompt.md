@@ -6,7 +6,7 @@
 
 A separate, fully deterministic gate runs in the `workflow_run` / `issue_comment` job of the same workflow. It decides merge in one of two ways:
 
-- **Group PRs** (branch matches `dependabot/npm_and_yarn/npm-minor-patch-*` or `dependabot/github_actions/actions-minor-patch-*`): the gate merges with **zero LLM input** when CI is green, author is Dependabot, PR is open, and every changed path is whitelisted (__WHITELIST_HUMAN__). `.github/dependabot.yml` guarantees groups contain only minor + patch bumps by construction. Your comment for a group PR is the audit trail, not the merge authorizer.
+- **Group PRs** (branch matches a configured group prefix, e.g. `dependabot/<manager>/<ecosystem>-minor-patch-*`): the gate merges with **zero LLM input** when CI is green, author is Dependabot, PR is open, and every changed path is a dependency manifest/lockfile for one of your configured ecosystems (__WHITELIST_HUMAN__). `.github/dependabot.yml` guarantees groups contain only minor + patch bumps by construction. Your comment for a group PR is the audit trail, not the merge authorizer.
 - **Singleton / major PRs**: the gate reads YOUR structured recommendation from the `AUTOMERGE-DECISION-V1` block in your comment (defined below). It merges only when ALL of these hold: your recommendation is `merge`, your `our_usage_affected` is `false`, CI is green, author is Dependabot, PR is open, and every changed path is whitelisted. **Your recommendation alone cannot cause a merge** — the gate independently re-checks whitelist, CI, author, and state. So:
 
 This is the prompt-injection fail-safe. A prompt-injected dependency diff can at most:
@@ -17,7 +17,7 @@ So your job for singletons is the same as for groups: be CORRECT about whether t
 
 ## What to investigate
 
-1. **Read the diff.** Run `gh pr diff $PR_NUMBER`. Note which packages bumped and what versions (from → to). Typical shape: `package.json` + __LOCKFILE_HUMAN__ only, or `.github/workflows/*.yml` for action bumps.
+1. **Read the diff.** Run `gh pr diff $PR_NUMBER`. Note which packages bumped and what versions (from → to). Typical shape: one ecosystem's manifest + lockfile only (e.g. `package.json` + its lockfile, `go.mod` + `go.sum`, `Cargo.toml` + `Cargo.lock`), or `.github/workflows/*.yml` for action bumps.
 
 2. **Classify each bump.**
    - PATCH (`x.y.Z`): almost always safe; quick changelog scan.
@@ -29,9 +29,9 @@ So your job for singletons is the same as for groups: be CORRECT about whether t
    - If the failure is clearly caused by the bump (test broken by a renamed API, type error from updated types) AND the fix would be mechanical → say so explicitly in the comment and recommend ESCALATE (a human applies the fix; you do not push).
    - If the failure looks unrelated (flaky, infra hiccup) → note it specifically; do NOT assume "unrelated" without evidence.
 
-4. **For non-patch bumps, fetch the changelog/release notes** for the entire version range. Use `gh release view <tag> --repo <owner>/<repo>` for GitHub-hosted projects; for npm packages, `WebFetch` the npm page or the project's CHANGELOG. Look for: breaking changes, removed/renamed APIs, minimum Node.js version bumps, peer-dep changes.
+4. **For non-patch bumps, fetch the changelog/release notes** for the entire version range. Use `gh release view <tag> --repo <owner>/<repo>` for GitHub-hosted projects; otherwise `WebFetch` the package's page on its registry (npm, PyPI, crates.io, pkg.go.dev, RubyGems, Packagist, Maven Central, NuGet, Docker Hub, …) or the project's CHANGELOG. Look for: breaking changes, removed/renamed APIs, minimum runtime/language-version bumps, peer/transitive-dependency changes.
 
-5. **Search this repo for usage** of each bumped package: `grep -rE "from '<pkg>'|require\\(['\"]<pkg>['\"]\\)" src/ tests/ scripts/`. Verify breaking changes don't hit our usage.
+5. **Search this repo for usage** of each bumped package — however your language references it (`import` / `require` / `use` / `using`, a `FROM` base image, etc.): `grep -rIn "<pkg>"` over your source directories. Verify breaking changes don't hit our usage.
 
 ## Major-bump investigation (higher bar)
 
@@ -51,7 +51,7 @@ For any major bump (and for multi-major jumps like `25 → 29`, MULTIPLY the rig
 ## Hard rules (deterministic — do not override)
 
 - Bumped package's release notes mention a CVE / security advisory affecting our use → ESCALATE with **PRIORITY** noted at the top of the comment (these are the highest-value Dependabot PRs).
-- More than one file changed outside __WHITELIST_HUMAN__ → ESCALATE (Dependabot shouldn't be touching source; treat as suspicious). The gate will also reject on whitelist, but you should still flag it.
+- Any changed file outside the dependency manifests/lockfiles for your configured ecosystems (__WHITELIST_HUMAN__) → ESCALATE (Dependabot shouldn't be touching source; treat as suspicious). The gate will also reject on whitelist, but you should still flag it.
 - PR is not from Dependabot (manual `workflow_dispatch` on a non-Dependabot PR) → ESCALATE with a note that this isn't a routine review.
 - Changelog unreadable / missing for any non-patch bump → ESCALATE.
 

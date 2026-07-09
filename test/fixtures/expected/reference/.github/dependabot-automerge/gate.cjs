@@ -33,8 +33,16 @@
  * callers simple).
  */
 
+// One prefix per configured ecosystem: `dependabot/<branch-slug>/<group-name>-`.
+// The installer renders these from the ecosystems it detected — the branch slug
+// is Dependabot's own (npm→npm_and_yarn, gomod→go_modules, …), not the config
+// value.
 const ELIGIBLE_GROUP_PREFIXES = [
   'dependabot/npm_and_yarn/npm-minor-patch-',
+  'dependabot/pip/pip-minor-patch-',
+  'dependabot/cargo/cargo-minor-patch-',
+  'dependabot/go_modules/gomod-minor-patch-',
+  'dependabot/docker/docker-minor-patch-',
   'dependabot/github_actions/actions-minor-patch-',
 ];
 
@@ -71,13 +79,49 @@ const TRUSTED_DECISION_AUTHORS = new Set([
 const V1_OPEN = '<!-- AUTOMERGE-DECISION-V1 -->';
 const V1_CLOSE = '<!-- /AUTOMERGE-DECISION-V1 -->';
 
+// The dependency surface a routine bump may touch, rendered from the detected
+// ecosystems: exact manifest/lock filenames plus regexes for the variable ones
+// (requirements*.txt, *.csproj, the GitHub Actions surface, …). A PR that
+// changes anything NOT matched here is rejected regardless of the LLM.
+const WHITELIST_EXACT = new Set([
+  'package.json',
+  'package-lock.json',
+  'npm-shrinkwrap.json',
+  'yarn.lock',
+  'pnpm-lock.yaml',
+  'requirements.txt',
+  'requirements.in',
+  'Pipfile',
+  'Pipfile.lock',
+  'pyproject.toml',
+  'poetry.lock',
+  'setup.py',
+  'setup.cfg',
+  'pdm.lock',
+  'Cargo.toml',
+  'Cargo.lock',
+  'go.mod',
+  'go.sum',
+  'go.work',
+  'go.work.sum',
+  'Dockerfile',
+  'Containerfile',
+]);
+const WHITELIST_REGEX = [
+  /^requirements.*\.txt$/,
+  /^Dockerfile\..+$/,
+  /^[^\/]+\.dockerfile$/,
+  /^\.github\/workflows\/[^\/]+\.ya?ml$/,
+  /^\.github\/actions\//,
+  /(^|\/)action\.ya?ml$/,
+];
+
 function isWhitelistedPath(p) {
-  return (
-    p === 'package.json' ||
-    p === 'package-lock.json' ||
-    /^\.github\/workflows\/[^/]+\.ya?ml$/.test(p) ||
-    p.startsWith('.github/actions/')
-  );
+  if (WHITELIST_EXACT.has(p)) return true;
+  for (const re of WHITELIST_REGEX) {
+    if (re.test(p)) return true;
+  }
+  return false;
 }
 
 function extractDecisionBlock(body) {

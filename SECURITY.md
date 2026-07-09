@@ -13,7 +13,7 @@ Merging is done only by the **deterministic gate** (`.github/dependabot-automerg
 - the PR author is Dependabot,
 - the PR is open,
 - CI is green (re-queried at gate time), and
-- **every changed path is on the whitelist** (`package.json`, your lockfile, `.github/workflows/*.yml`, `.github/actions/**`).
+- **every changed path is on the whitelist** — the dependency manifests and lockfiles for your configured ecosystems (e.g. `package.json`/lockfiles, `Cargo.toml`/`Cargo.lock`, `go.mod`/`go.sum`, `requirements*.txt`, `Dockerfile`) plus `.github/workflows/*.yml` and `.github/actions/**`. The whitelist is generated per-ecosystem and kept conservative (e.g. Docker matches `Dockerfile`s, not arbitrary YAML).
 
 For a minor/patch **group** PR that is enough — no model input is consulted at all. For a singleton/**major** PR, the gate *additionally* requires the model's structured `AUTOMERGE-DECISION-V1` block to say `recommendation: merge` and `our_usage_affected: false` — but that is a necessary condition layered **on top of** the deterministic checks, never a replacement for them.
 

@@ -118,33 +118,71 @@ if [ -z "$SRC" ]; then
 fi
 [ -f "$SRC/templates/dependabot.yml" ] || die "templates not found under $SRC"
 
-# ---- detect ecosystem (JS lockfiles) from the current directory ------------
-LOCKFILES=''
-for lf in package-lock.json pnpm-lock.yaml yarn.lock npm-shrinkwrap.json; do
-  [ -f "./$lf" ] && LOCKFILES="$LOCKFILES $lf"
-done
-LOCKFILES=$(printf '%s' "$LOCKFILES" | sed 's/^ *//;s/ *$//')
-if [ -z "$LOCKFILES" ]; then
-  [ -f ./package.json ] || warn "no package.json / lockfile found — dep-steward v1 targets JS (npm/pnpm/yarn) + GitHub Actions. Installing anyway; review the generated whitelist."
-  LOCKFILES='package-lock.json'
-fi
+# ---- ecosystem catalog -----------------------------------------------------
+# Detect the package managers present at the repo root and assemble every
+# downstream value from that one set: the dependabot.yml `updates:` entries, the
+# gate's group-branch prefixes, and the gate's path whitelist. Branch slugs and
+# manifest paths are from dependabot-core (only npm→npm_and_yarn,
+# gomod→go_modules, github-actions→github_actions differ from the config value).
+# To add an ecosystem, add one clause to detect_ecosystems. GitHub Actions is
+# always managed. Non-root manifests (directory: /) are out of scope for now.
+ACTIVE=''          # package-ecosystem names, space-separated (for the summary)
+LANG_COUNT=0       # count of non-actions ecosystems detected
+DEP_UPDATES=''     # generated dependabot.yml `updates:` entries
+GROUP_PREFIXES=''  # gate ELIGIBLE_GROUP_PREFIXES (JS-quoted, one per line)
+WL_EXACT=''        # gate WHITELIST_EXACT (JS-quoted paths, one per line)
+WL_REGEX=''        # gate WHITELIST_REGEX (JS regex literals, one per line)
 
-# ---- assemble the ecosystem-driven render values ---------------------------
-# gate.cjs whitelist terms (one JS expression per lockfile)
-LOCKFILE_TERMS=''
-for lf in $LOCKFILES; do
-  line="    p === '$lf' ||"
-  if [ -z "$LOCKFILE_TERMS" ]; then LOCKFILE_TERMS="$line"; else LOCKFILE_TERMS="$LOCKFILE_TERMS$NL$line"; fi
-done
-# prompt: human-readable whitelist + lockfile phrase
-# shellcheck disable=SC2016  # backticks here are literal Markdown, not command substitution
-WHITELIST_HUMAN='`package.json`'
-for lf in $LOCKFILES; do WHITELIST_HUMAN="$WHITELIST_HUMAN / \`$lf\`"; done
-WHITELIST_HUMAN="$WHITELIST_HUMAN / \`.github/workflows/*.yml\` / \`.github/actions/**\`"
-LOCKFILE_HUMAN=''
-for lf in $LOCKFILES; do
-  if [ -z "$LOCKFILE_HUMAN" ]; then LOCKFILE_HUMAN="\`$lf\`"; else LOCKFILE_HUMAN="$LOCKFILE_HUMAN + \`$lf\`"; fi
-done
+reg_eco() { # $1=package-ecosystem  $2=branch-slug  $3=group-name
+  ACTIVE="$ACTIVE $1"
+  case "$1" in github-actions) : ;; *) LANG_COUNT=$((LANG_COUNT + 1)) ;; esac
+  DEP_UPDATES="${DEP_UPDATES}  - package-ecosystem: $1${NL}    directory: /${NL}    schedule:${NL}      interval: weekly${NL}      day: monday${NL}    groups:${NL}      $3:${NL}        update-types:${NL}          - minor${NL}          - patch${NL}${NL}"
+  GROUP_PREFIXES="${GROUP_PREFIXES}  'dependabot/$2/$3-',${NL}"
+}
+reg_exact() { for p in "$@"; do WL_EXACT="${WL_EXACT}  '$p',${NL}"; done; }
+reg_regex() { for r in "$@"; do WL_REGEX="${WL_REGEX}  $r,${NL}"; done; }
+
+detect_ecosystems() {
+  [ -f ./package.json ] && { reg_eco npm npm_and_yarn npm-minor-patch; reg_exact package.json package-lock.json npm-shrinkwrap.json yarn.lock pnpm-lock.yaml; }
+  [ -f ./uv.lock ] && { reg_eco uv uv uv-minor-patch; reg_exact pyproject.toml uv.lock; }
+  if [ -f ./requirements.txt ] || [ -f ./Pipfile ] || [ -f ./poetry.lock ] || [ -f ./setup.py ] || { [ -f ./pyproject.toml ] && [ ! -f ./uv.lock ]; }; then
+    reg_eco pip pip pip-minor-patch
+    reg_exact requirements.txt requirements.in Pipfile Pipfile.lock pyproject.toml poetry.lock setup.py setup.cfg pdm.lock
+    reg_regex '/^requirements.*\.txt$/'
+  fi
+  [ -f ./Cargo.toml ] && { reg_eco cargo cargo cargo-minor-patch; reg_exact Cargo.toml Cargo.lock; }
+  [ -f ./go.mod ] && { reg_eco gomod go_modules gomod-minor-patch; reg_exact go.mod go.sum go.work go.work.sum; }
+  if [ -f ./Gemfile ] || ls ./*.gemspec >/dev/null 2>&1; then
+    reg_eco bundler bundler bundler-minor-patch
+    reg_exact Gemfile Gemfile.lock gems.rb gems.locked
+    reg_regex '/^[^\/]+\.gemspec$/'
+  fi
+  [ -f ./composer.json ] && { reg_eco composer composer composer-minor-patch; reg_exact composer.json composer.lock; }
+  [ -f ./pom.xml ] && { reg_eco maven maven maven-minor-patch; reg_exact pom.xml; }
+  if [ -f ./build.gradle ] || [ -f ./build.gradle.kts ]; then
+    reg_eco gradle gradle gradle-minor-patch
+    reg_exact build.gradle build.gradle.kts settings.gradle settings.gradle.kts gradle.properties gradle.lockfile gradle/libs.versions.toml
+  fi
+  if ls ./*.csproj ./*.fsproj ./*.vbproj ./*.sln >/dev/null 2>&1 || [ -f ./packages.config ] || [ -f ./Directory.Packages.props ]; then
+    reg_eco nuget nuget nuget-minor-patch
+    reg_exact packages.config packages.lock.json global.json Directory.Packages.props Directory.Build.props Directory.Build.targets
+    reg_regex '/^[^\/]+\.(csproj|vbproj|fsproj|proj|sln|slnx)$/'
+  fi
+  if [ -f ./Dockerfile ] || [ -f ./Containerfile ] || ls ./*.dockerfile >/dev/null 2>&1; then
+    reg_eco docker docker docker-minor-patch
+    reg_exact Dockerfile Containerfile
+    reg_regex '/^Dockerfile\..+$/' '/^[^\/]+\.dockerfile$/'
+  fi
+  # GitHub Actions — always on (workflow + composite-action bumps).
+  reg_eco github-actions github_actions actions-minor-patch
+  reg_regex '/^\.github\/workflows\/[^\/]+\.ya?ml$/' '/^\.github\/actions\//' '/(^|\/)action\.ya?ml$/'
+}
+detect_ecosystems
+ACTIVE=$(printf '%s' "$ACTIVE" | sed 's/^ *//')
+[ "$LANG_COUNT" -eq 0 ] && warn "no language package manager detected at the repo root — only GitHub Actions will be managed. (Run this at the repo root; non-root manifests aren't detected yet.)"
+
+# prompt: the human-readable ecosystem list (e.g. "npm, cargo, github-actions")
+WHITELIST_HUMAN=$(printf '%s' "$ACTIVE" | tr ' ' ',' | sed 's/,/, /g')
 
 # Escalation assignee → the flag + note rendered into the prompt and workflow.
 # Empty assignee renders nothing (opt-out). Computed here in code so only the
@@ -169,11 +207,17 @@ ci_runlist_token() {
   esac
 }
 
-render_dependabot_yml() { cat "$SRC/templates/dependabot.yml"; }
+# inject a multi-line block where a marker line appears in the piped template.
+inject() { # inject <marker> <block> ; filters stdin -> stdout
+  bf=$(mktemp); printf '%s' "$2" > "$bf"
+  awk -v m="$1" -v bf="$bf" '$0==m{while((getline l<bf)>0)print l;close(bf);next}{print}'
+  rm -f "$bf"
+}
+
+render_dependabot_yml() { inject '#__UPDATES__' "$DEP_UPDATES" < "$SRC/templates/dependabot.yml"; }
 
 render_prompt() {
   sed -e "s|__WHITELIST_HUMAN__|$WHITELIST_HUMAN|g" \
-      -e "s|__LOCKFILE_HUMAN__|$LOCKFILE_HUMAN|g" \
       -e "s|__ASSIGN_FLAG__|$ASSIGN_FLAG|g" \
       -e "s|__ASSIGN_NOTE__|$ASSIGN_NOTE|g" \
       "$SRC/templates/dependabot-review-prompt.md"
@@ -192,13 +236,9 @@ render_workflow() {
 render_command() { cat "$SRC/templates/dep-steward-summary.md"; }
 
 render_gate() {
-  bf=$(mktemp)
-  printf '%s\n' "$LOCKFILE_TERMS" > "$bf"
-  awk -v bf="$bf" '
-    $0 == "//__LOCKFILE_TERMS__" { while ((getline line < bf) > 0) print line; close(bf); next }
-    { print }
-  ' "$SRC/templates/gate.cjs"
-  rm -f "$bf"
+  inject '//__PREFIXES__' "$GROUP_PREFIXES" < "$SRC/templates/gate.cjs" \
+    | inject '//__WL_EXACT__' "$WL_EXACT" \
+    | inject '//__WL_REGEX__' "$WL_REGEX"
 }
 
 # write one rendered file to a destination path (creating parent dirs)
@@ -216,7 +256,7 @@ if [ "$RENDER_ONLY" -eq 1 ]; then
   emit render_workflow        "$OUT/.github/workflows/dependabot-review.yml"
   emit render_gate            "$OUT/$GATE_PATH"
   emit render_command         "$OUT/.claude/commands/dep-steward-summary.md"
-  say "Rendered to $OUT (lockfiles: $LOCKFILES; ci: $CI_NAME; model: $MODEL; assignee: ${ASSIGNEE:-none})"
+  say "Rendered to $OUT (ecosystems: $ACTIVE; ci: $CI_NAME; model: $MODEL; assignee: ${ASSIGNEE:-none})"
   exit 0
 fi
 
@@ -267,7 +307,7 @@ fi
 # ---- summary ---------------------------------------------------------------
 say ""
 say "dep-steward — installing into $NWO (default branch: $DEFAULT_BRANCH)"
-info "lockfile(s):  $LOCKFILES"
+info "ecosystems:   $ACTIVE"
 info "CI workflow:  $CI_NAME"
 info "review model: $MODEL"
 info "gate path:    $GATE_PATH"

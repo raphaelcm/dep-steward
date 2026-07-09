@@ -1,27 +1,3 @@
 version: 2
 updates:
-  - package-ecosystem: npm
-    directory: /
-    schedule:
-      interval: weekly
-      day: monday
-    groups:
-      npm-minor-patch:
-        update-types:
-          - minor
-          - patch
-
-  - package-ecosystem: github-actions
-    directory: /
-    schedule:
-      interval: weekly
-      day: monday
-    groups:
-      # Symmetric to npm-minor-patch: routine minor/patch action bumps arrive
-      # as one group PR that the auto-merge gate can treat as non-major by
-      # construction. Major action bumps come as separate singleton PRs and
-      # are left for human review.
-      actions-minor-patch:
-        update-types:
-          - minor
-          - patch
+#__UPDATES__

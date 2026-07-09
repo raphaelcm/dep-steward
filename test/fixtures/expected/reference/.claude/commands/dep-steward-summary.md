@@ -11,7 +11,7 @@ Read and report only — change nothing.
 
 Scope: use `$ARGUMENTS` if given (e.g. `90d`, or `since 2026-01-01`). Otherwise cover since the pipeline was installed — infer that from the first commit that added the workflow: `git log --diff-filter=A --format=%as -- .github/workflows/dependabot-review.yml | tail -1`. State the window you used.
 
-- **Auto-merged:** `gh pr list --author app/dependabot --state merged --limit 200 --json number,title,mergedAt,headRefName`. Branches matching `dependabot/npm_and_yarn/npm-minor-patch-*` or `dependabot/github_actions/actions-minor-patch-*` are the routine group auto-merges; the rest are singleton/major.
+- **Auto-merged:** `gh pr list --author app/dependabot --state merged --limit 200 --json number,title,mergedAt,headRefName`. Branches whose name contains `-minor-patch-` (e.g. `dependabot/<manager>/<ecosystem>-minor-patch-*`) are the routine group auto-merges; the rest are singleton/major.
 - **Waiting on the human:** `gh pr list --author app/dependabot --label needs-human-review --state open --json number,title`.
 - **What was investigated:** for the singleton/major PRs, read the review comment's decision and its `breaking_changes_enumerated` (changelogs read, usage grepped). Flag any comment that marks a CVE / security advisory (the reviewer tags those **PRIORITY**).
 

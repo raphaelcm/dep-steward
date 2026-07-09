@@ -11,17 +11,58 @@ updates:
           - minor
           - patch
 
+  - package-ecosystem: pip
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    groups:
+      pip-minor-patch:
+        update-types:
+          - minor
+          - patch
+
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    groups:
+      cargo-minor-patch:
+        update-types:
+          - minor
+          - patch
+
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    groups:
+      gomod-minor-patch:
+        update-types:
+          - minor
+          - patch
+
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    groups:
+      docker-minor-patch:
+        update-types:
+          - minor
+          - patch
+
   - package-ecosystem: github-actions
     directory: /
     schedule:
       interval: weekly
       day: monday
     groups:
-      # Symmetric to npm-minor-patch: routine minor/patch action bumps arrive
-      # as one group PR that the auto-merge gate can treat as non-major by
-      # construction. Major action bumps come as separate singleton PRs and
-      # are left for human review.
       actions-minor-patch:
         update-types:
           - minor
           - patch
+

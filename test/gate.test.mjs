@@ -34,8 +34,10 @@ const REPO = dirname(dirname(fileURLToPath(import.meta.url)));
 
 function renderGate() {
   const fakeRepo = mkdtempSync(join(tmpdir(), 'ds-repo-'));
-  writeFileSync(join(fakeRepo, 'package.json'), '{}\n');
-  writeFileSync(join(fakeRepo, 'package-lock.json'), '{}\n');
+  // Multi-ecosystem, so the gate's whitelist + group prefixes cover more than npm.
+  for (const m of ['package.json', 'package-lock.json', 'requirements.txt', 'Cargo.toml', 'go.mod', 'Dockerfile']) {
+    writeFileSync(join(fakeRepo, m), '\n');
+  }
   const out = mkdtempSync(join(tmpdir(), 'ds-out-'));
   execFileSync('sh', [join(REPO, 'install.sh'), '--render-only', '--out', out, '--ci-name', 'CI'], {
     cwd: fakeRepo,
@@ -252,3 +254,46 @@ for (const [author, note] of [
     assert.equal(decision, 'merge');
   });
 }
+
+// ---- Multi-ecosystem: the whitelist + group prefixes cover every configured ecosystem ----
+
+const BASE = { CI_CONCLUSION: 'success', PR_AUTHOR: 'app/dependabot', PR_STATE: 'OPEN' };
+
+for (const [eco, branch, paths] of [
+  ['cargo', 'dependabot/cargo/cargo-minor-patch-a', 'Cargo.toml\nCargo.lock'],
+  ['go modules (slug go_modules ≠ config gomod)', 'dependabot/go_modules/gomod-minor-patch-a', 'go.mod\ngo.sum'],
+  ['pip', 'dependabot/pip/pip-minor-patch-a', 'requirements.txt'],
+  ['docker', 'dependabot/docker/docker-minor-patch-a', 'Dockerfile'],
+]) {
+  test(`merges a clean ${eco} group PR`, () => {
+    assert.equal(runGate({ ...BASE, HEAD_BRANCH: branch, CHANGED_PATHS: paths }).decision, 'merge');
+  });
+}
+
+test('pip whitelist accepts requirements-*.txt via regex', () => {
+  const { decision } = runGate({
+    ...BASE,
+    HEAD_BRANCH: 'dependabot/pip/pip-minor-patch-a',
+    CHANGED_PATHS: 'requirements.txt\nrequirements-dev.txt',
+  });
+  assert.equal(decision, 'merge');
+});
+
+test('a group PR touching a source file outside the whitelist is skipped (cross-ecosystem)', () => {
+  const { decision, reason } = runGate({
+    ...BASE,
+    HEAD_BRANCH: 'dependabot/cargo/cargo-minor-patch-a',
+    CHANGED_PATHS: 'Cargo.toml\nsrc/main.rs',
+  });
+  assert.equal(decision, 'skip');
+  assert.match(reason, /whitelist/);
+});
+
+test('docker whitelist is conservative: a k8s YAML image bump is NOT auto-merged (escalates)', () => {
+  const { decision } = runGate({
+    ...BASE,
+    HEAD_BRANCH: 'dependabot/docker/docker-minor-patch-a',
+    CHANGED_PATHS: 'k8s/deploy.yaml',
+  });
+  assert.equal(decision, 'skip');
+});
