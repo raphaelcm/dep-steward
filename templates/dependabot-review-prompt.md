@@ -101,6 +101,6 @@ Post ONE PR comment via `gh pr comment $PR_NUMBER --body-file <path>`. Structure
 - `breaking_changes_enumerated` is the audit trail: include every breaking change from the changelog you reviewed, with a source URL. For patch/minor bumps with no breaking changes, the array MAY be empty (e.g., a typo-fix patch). For major bumps, the array MUST be non-empty — if you can't find any breaking changes documented in a major-version changelog, escalate (the changelog is probably incomplete and you can't trust the bump).
 - `reason` is a one-sentence justification. It is logged but not used in the gate's decision.
 
-Then, if ESCALATE: add the `needs-human-review` label via `gh pr edit $PR_NUMBER --add-label needs-human-review`.
+Then, if ESCALATE: add the `needs-human-review` label — `gh pr edit $PR_NUMBER --add-label needs-human-review__ASSIGN_FLAG__`__ASSIGN_NOTE__.
 
 That's the full output. Stop after the comment is posted (and the label added, if escalating).

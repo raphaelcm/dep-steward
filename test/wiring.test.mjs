@@ -37,6 +37,8 @@ case "$cmd" in
   api)
     case "$*" in
       *"-X PATCH"*) exit 0 ;;
+      # 'gh api user --jq .login' → the default escalation assignee.
+      "api user"*) echo "octomaintainer"; exit 0 ;;
       # The installer runs 'gh api .../rules/branches/<b> --jq <expr>'. The stub
       # ignores --jq, so it emits the POST-jq value directly: the comma-joined
       # required-check contexts (GH_REQUIRED_CONTEXTS), empty by default.
@@ -106,15 +108,23 @@ test('enables auto-merge on the repo', () => {
   );
 });
 
-test('writes the four automation files into the target repo', () => {
+test('writes the automation files + the /dep-steward-summary command into the target repo', () => {
   for (const f of [
     '.github/dependabot.yml',
     '.github/dependabot-review-prompt.md',
     '.github/workflows/dependabot-review.yml',
     '.github/dependabot-automerge/gate.cjs',
+    '.claude/commands/dep-steward-summary.md',
   ]) {
     assert.ok(existsSync(join(repoDir, f)), `expected ${f} to be written`);
   }
+});
+
+test('wires the default escalation assignee (from gh api user) into the escalate path', () => {
+  const prompt = readFileSync(join(repoDir, '.github/dependabot-review-prompt.md'), 'utf8');
+  const wf = readFileSync(join(repoDir, '.github/workflows/dependabot-review.yml'), 'utf8');
+  assert.match(prompt, /--add-assignee octomaintainer/);
+  assert.match(wf, /--add-label needs-human-review --add-assignee octomaintainer/);
 });
 
 test('reports required status checks from the effective-rules endpoint (regression: ruleset blind spot)', () => {

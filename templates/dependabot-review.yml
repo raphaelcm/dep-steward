@@ -139,7 +139,7 @@ jobs:
             echo "OIDC workflow validation refuses to run on the pull_request event. Replay from main:"
             echo "  gh workflow run dependabot-review.yml --repo $REPO -f pr_number=$PR_NUMBER"
           fi
-          gh pr edit "$PR_NUMBER" --repo "$REPO" --add-label needs-human-review
+          gh pr edit "$PR_NUMBER" --repo "$REPO" --add-label needs-human-review__ASSIGN_FLAG__
           exit 1
 
   auto-merge:

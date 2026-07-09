@@ -40,6 +40,8 @@ RENDER_ONLY=0
 OUT=''
 CI_NAME=''
 MODEL="$DEFAULT_MODEL"
+ASSIGNEE=''
+ASSIGNEE_EXPLICIT=0
 
 say()  { printf '%s\n' "$*"; }
 info() { printf '  %s\n' "$*"; }
@@ -58,7 +60,9 @@ Flags:
   --dry-run            show every change without making it
   --ci-name NAME       the CI workflow whose green status gates merges
   --model NAME         Claude model for the review job (default: claude-opus-4-8)
-  --render-only --out DIR   render the four files to DIR and stop (no gh calls)
+  --assignee HANDLE    GitHub user assigned when a PR is escalated, so GitHub
+                       notifies them (default: you; pass "" to disable)
+  --render-only --out DIR   render into DIR and stop (no gh calls)
   -h, --help           show this help
 
 Docs: https://github.com/raphaelcm/dep-steward
@@ -77,6 +81,8 @@ while [ $# -gt 0 ]; do
     --ci-name=*) CI_NAME="${1#--ci-name=}" ;;
     --model) MODEL="${2:-}"; shift ;;
     --model=*) MODEL="${1#--model=}" ;;
+    --assignee) ASSIGNEE="${2:-}"; ASSIGNEE_EXPLICIT=1; shift ;;
+    --assignee=*) ASSIGNEE="${1#--assignee=}"; ASSIGNEE_EXPLICIT=1 ;;
     -h|--help) usage ;;
     *) die "unknown argument: $1 (try --help)" ;;
   esac
@@ -140,6 +146,20 @@ for lf in $LOCKFILES; do
   if [ -z "$LOCKFILE_HUMAN" ]; then LOCKFILE_HUMAN="\`$lf\`"; else LOCKFILE_HUMAN="$LOCKFILE_HUMAN + \`$lf\`"; fi
 done
 
+# Escalation assignee → the flag + note rendered into the prompt and workflow.
+# Empty assignee renders nothing (opt-out). Computed here in code so only the
+# taken branch reaches the templates.
+compute_assign() {
+  if [ -n "$ASSIGNEE" ]; then
+    ASSIGN_FLAG=" --add-assignee $ASSIGNEE"
+    ASSIGN_NOTE=", which also assigns \`$ASSIGNEE\` so GitHub notifies them"
+  else
+    ASSIGN_FLAG=''
+    ASSIGN_NOTE=''
+  fi
+}
+compute_assign
+
 # ---- render helpers --------------------------------------------------------
 # CI name token for `gh run list --workflow X`: bare when safe, else quoted.
 ci_runlist_token() {
@@ -154,6 +174,8 @@ render_dependabot_yml() { cat "$SRC/templates/dependabot.yml"; }
 render_prompt() {
   sed -e "s|__WHITELIST_HUMAN__|$WHITELIST_HUMAN|g" \
       -e "s|__LOCKFILE_HUMAN__|$LOCKFILE_HUMAN|g" \
+      -e "s|__ASSIGN_FLAG__|$ASSIGN_FLAG|g" \
+      -e "s|__ASSIGN_NOTE__|$ASSIGN_NOTE|g" \
       "$SRC/templates/dependabot-review-prompt.md"
 }
 
@@ -163,8 +185,11 @@ render_workflow() {
       -e "s|__CI_RUNLIST__|$crt|g" \
       -e "s|__MODEL__|$MODEL|g" \
       -e "s|__GATE_PATH__|$GATE_PATH|g" \
+      -e "s|__ASSIGN_FLAG__|$ASSIGN_FLAG|g" \
       "$SRC/templates/dependabot-review.yml"
 }
+
+render_command() { cat "$SRC/templates/dep-steward-summary.md"; }
 
 render_gate() {
   bf=$(mktemp)
@@ -190,7 +215,8 @@ if [ "$RENDER_ONLY" -eq 1 ]; then
   emit render_prompt          "$OUT/.github/dependabot-review-prompt.md"
   emit render_workflow        "$OUT/.github/workflows/dependabot-review.yml"
   emit render_gate            "$OUT/$GATE_PATH"
-  say "Rendered to $OUT (lockfiles: $LOCKFILES; ci: $CI_NAME; model: $MODEL)"
+  emit render_command         "$OUT/.claude/commands/dep-steward-summary.md"
+  say "Rendered to $OUT (lockfiles: $LOCKFILES; ci: $CI_NAME; model: $MODEL; assignee: ${ASSIGNEE:-none})"
   exit 0
 fi
 
@@ -232,6 +258,12 @@ if [ -z "$CI_NAME" ]; then
 fi
 [ -n "$CI_NAME" ] || die "could not determine the CI workflow name — re-run with --ci-name \"<name>\" (the gate keys off this exact name; it cannot fire without it)"
 
+# ---- resolve the escalation assignee (default: you) ------------------------
+if [ "$ASSIGNEE_EXPLICIT" -eq 0 ]; then
+  ASSIGNEE=$(gh api user --jq '.login' 2>/dev/null || echo '')
+  compute_assign
+fi
+
 # ---- summary ---------------------------------------------------------------
 say ""
 say "dep-steward — installing into $NWO (default branch: $DEFAULT_BRANCH)"
@@ -239,6 +271,7 @@ info "lockfile(s):  $LOCKFILES"
 info "CI workflow:  $CI_NAME"
 info "review model: $MODEL"
 info "gate path:    $GATE_PATH"
+info "escalations:  $([ -n "$ASSIGNEE" ] && echo "assign @$ASSIGNEE + label" || echo "label only (no assignee)")"
 say ""
 
 # ---- render (to a temp tree first, for dry-run diffing) --------------------
@@ -247,8 +280,9 @@ emit render_dependabot_yml "$STAGE/.github/dependabot.yml"
 emit render_prompt          "$STAGE/.github/dependabot-review-prompt.md"
 emit render_workflow        "$STAGE/.github/workflows/dependabot-review.yml"
 emit render_gate            "$STAGE/$GATE_PATH"
+emit render_command         "$STAGE/.claude/commands/dep-steward-summary.md"
 
-FILES=".github/dependabot.yml .github/dependabot-review-prompt.md .github/workflows/dependabot-review.yml $GATE_PATH"
+FILES=".github/dependabot.yml .github/dependabot-review-prompt.md .github/workflows/dependabot-review.yml $GATE_PATH .claude/commands/dep-steward-summary.md"
 
 if [ "$DRY_RUN" -eq 1 ]; then
   say "[dry-run] files that would be written:"
@@ -375,4 +409,5 @@ say ""
 say "Done. Smoke-test against an existing Dependabot PR without waiting for Monday:"
 info "gh workflow run dependabot-review.yml --repo $NWO -f pr_number=<PR>"
 say ""
-say "Commit the four files in .github/ to activate the pipeline."
+say "In Claude Code, run /dep-steward-summary any time to see what it's handled and the time it saved."
+say "Commit the generated files (.github/ + .claude/commands/) to activate the pipeline."

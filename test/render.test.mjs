@@ -7,49 +7,49 @@ import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 /**
- * Render parity — the migration gate.
+ * Render determinism.
  *
- * install.sh --render-only, given the parameters Runsense actually runs (CI
- * workflow "CI"; npm + GitHub Actions; model claude-opus-4-7), must reproduce
- * the committed golden fixtures under test/fixtures/expected/runsense/ BYTE FOR
- * BYTE. Those goldens were verified once against Runsense's live production
- * files: identical for dependabot.yml, the prompt, and gate.cjs, and identical
- * for the workflow except the single intended delta — the gate's relocated
- * path (scripts/dev/... -> .github/dependabot-automerge/gate.cjs).
+ * install.sh --render-only, given a fixed reference parameter set (CI workflow
+ * "CI"; npm + GitHub Actions; default model; assignee "octocat"), must reproduce
+ * the committed fixtures under test/fixtures/expected/reference/ BYTE FOR BYTE.
+ * This locks the rendering logic — any drift in a template or a substitution
+ * fails here.
  *
- * So: if this test is green, the genericised installer still reproduces the
- * production pipeline, and the Runsense dogfood diff is exactly "relocate the
- * gate" and nothing else. This is the precondition for adopting dep-steward
- * anywhere, Runsense included.
+ * History: these fixtures began as a byte-for-byte reproduction of Runsense's
+ * live pipeline (that parity was the acceptance gate for the dogfood, PR #1617:
+ * everything identical except the gate's relocated path). The fixtures have
+ * since moved ahead of that snapshot with the escalate-assignee feature, so they
+ * are now a synthetic reference rather than a mirror of any one repo.
  */
 
 const REPO = dirname(dirname(fileURLToPath(import.meta.url)));
-const GOLDEN = join(REPO, 'test', 'fixtures', 'expected', 'runsense');
+const GOLDEN = join(REPO, 'test', 'fixtures', 'expected', 'reference');
 
 const FILES = [
   '.github/dependabot.yml',
   '.github/dependabot-review-prompt.md',
   '.github/workflows/dependabot-review.yml',
   '.github/dependabot-automerge/gate.cjs',
+  '.claude/commands/dep-steward-summary.md',
 ];
 
-function renderWithRunsenseParams() {
-  const fakeRepo = mkdtempSync(join(tmpdir(), 'ds-rs-repo-'));
+function renderReference() {
+  const fakeRepo = mkdtempSync(join(tmpdir(), 'ds-ref-repo-'));
   writeFileSync(join(fakeRepo, 'package.json'), '{}\n');
   writeFileSync(join(fakeRepo, 'package-lock.json'), '{}\n');
-  const out = mkdtempSync(join(tmpdir(), 'ds-rs-out-'));
+  const out = mkdtempSync(join(tmpdir(), 'ds-ref-out-'));
   execFileSync(
     'sh',
-    [join(REPO, 'install.sh'), '--render-only', '--out', out, '--ci-name', 'CI', '--model', 'claude-opus-4-7'],
+    [join(REPO, 'install.sh'), '--render-only', '--out', out, '--ci-name', 'CI', '--assignee', 'octocat'],
     { cwd: fakeRepo, env: { ...process.env, DEP_STEWARD_SRC: REPO }, stdio: 'pipe' },
   );
   return out;
 }
 
-const rendered = renderWithRunsenseParams();
+const rendered = renderReference();
 
 for (const f of FILES) {
-  test(`renders ${f} byte-identical to the golden fixture`, () => {
+  test(`renders ${f} byte-identical to the reference fixture`, () => {
     const got = readFileSync(join(rendered, f), 'utf8');
     const want = readFileSync(join(GOLDEN, f), 'utf8');
     assert.equal(got, want);
@@ -60,4 +60,11 @@ test('the rendered workflow points at the relocated gate path', () => {
   const wf = readFileSync(join(rendered, '.github/workflows/dependabot-review.yml'), 'utf8');
   assert.match(wf, /node \.github\/dependabot-automerge\/gate\.cjs/);
   assert.doesNotMatch(wf, /scripts\/dev\/dependabot-automerge-gate\.cjs/);
+});
+
+test('the escalate path assigns the configured maintainer', () => {
+  const prompt = readFileSync(join(rendered, '.github/dependabot-review-prompt.md'), 'utf8');
+  const wf = readFileSync(join(rendered, '.github/workflows/dependabot-review.yml'), 'utf8');
+  assert.match(prompt, /--add-label needs-human-review --add-assignee octocat/);
+  assert.match(wf, /--add-label needs-human-review --add-assignee octocat/);
 });

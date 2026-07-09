@@ -67,6 +67,7 @@ Files written into your repo (review and commit them like any change):
 | `.github/dependabot-review-prompt.md` | the reviewer's instructions |
 | `.github/dependabot.yml` | groups minor/patch bumps; majors stay individual |
 | `.github/dependabot-automerge/gate.cjs` | the deterministic gate (vanilla Node, zero deps) |
+| `.claude/commands/dep-steward-summary.md` | the `/dep-steward-summary` command (see below) |
 
 GitHub settings it configures (via `gh`):
 
@@ -76,6 +77,12 @@ GitHub settings it configures (via `gh`):
 - Checks branch protection and **advises** if CI isn't a required check (it never changes your protection rules).
 
 It does not touch your source, your existing CI workflow, or your git history.
+
+## Seeing what it's done: `/dep-steward-summary`
+
+The installer also drops a Claude Code command at `.claude/commands/dep-steward-summary.md`. Run **`/dep-steward-summary`** in Claude Code any time for a read-only readout: what dep-steward auto-merged, what it escalated and why, any security updates it landed, and an honest estimate of the time it saved — the counts are exact, and the per-PR minutes are stated as an assumption you can adjust. Pass a window if you like: `/dep-steward-summary 90d`.
+
+It's pull, not push — no standing noise; you look when you're curious.
 
 ## FAQ
 
@@ -97,18 +104,13 @@ The gate merges only PRs whose every changed file is on the dependency/workflow 
 **How will I know when a PR needs me? / What happens to an escalated PR?**
 When the reviewer judges a PR unsafe or uncertain — a breaking change that affects you, a changelog it can't read, a CVE, files outside the whitelist, or plain uncertainty — dep-steward:
 
-- adds the **`needs-human-review`** label to the PR, and
-- posts a **comment** explaining exactly why, with its structured decision block. Security advisories (CVEs) are flagged **PRIORITY** at the top of the comment.
+- **assigns you** (or whoever you set with `--assignee`) to the PR, so it lands in your GitHub notifications and your "Assigned" queue — the queue you already triage, no new surface, no chat or issue spam;
+- adds the **`needs-human-review`** label; and
+- posts a **comment** explaining exactly why, with its structured decision block. Security advisories (CVEs) are flagged **PRIORITY** at the top.
 
-The PR is then left open and untouched — the gate never merges an escalated PR. (If the reviewer ever fails to produce a verdict at all, its job goes **red** and still applies the label, so a broken review can't pass silently.)
+The PR is then left open and untouched — the gate never merges an escalated PR. (If the reviewer ever fails to produce a verdict at all, its job goes **red** and still assigns + labels, so a broken review can't pass silently.)
 
-This release does **not** push an active notification — no email, Slack, or `@`-mention. You find the PRs waiting on you by filtering open PRs on the label:
-
-```
-https://github.com/<owner>/<repo>/pulls?q=is%3Aopen+label%3Aneeds-human-review
-```
-
-Bookmark that (or save it as a view). Active escalation notifications are a planned enhancement, not part of the initial release.
+Default assignee is you (the person who ran the installer). Set a different maintainer with `--assignee HANDLE`, or pass `--assignee ""` to disable assignment (then you triage by the label filter `is:open label:needs-human-review`).
 
 **How do I stop major bumps from ever merging automatically?**
 It's conservative by default: a major bump merges only if the model affirmatively recommends it *and* finds no affected usage. To make majors always wait for a human, tell the reviewer to always escalate majors (edit `.github/dependabot-review-prompt.md`), or require human review on those PRs via branch protection.
