@@ -56,6 +56,18 @@ function runGate(env) {
   return { decision, reason, raw };
 }
 
+// Classify mode (GATE_MODE=classify): the review workflow's deliverable-
+// assertion asks the gate "is this branch a group?" so it escalates only the
+// singletons/majors that actually need a verdict, never a group PR the gate
+// merges on its own.
+function classifyGate(headBranch) {
+  const raw = execFileSync('node', [GATE], {
+    env: { ...process.env, GATE_MODE: 'classify', HEAD_BRANCH: headBranch },
+    encoding: 'utf8',
+  });
+  return raw.trim();
+}
+
 // `gh pr list --json author --jq '.[0].author.login'` returns `app/<slug>` for
 // GitHub Apps, not the `<slug>[bot]` form event payloads use. OK_NPM matches
 // what the workflow actually passes in production — `app/dependabot`.
@@ -297,3 +309,34 @@ test('docker whitelist is conservative: a k8s YAML image bump is NOT auto-merged
   });
   assert.equal(decision, 'skip');
 });
+
+// ---- Classify mode: group-ness for the deliverable-assertion. Same
+// ELIGIBLE_GROUP_PREFIXES as the merge path, so a group PR the gate can merge
+// without a verdict is never escalated to a human, while a singleton/major whose
+// review produced nothing still is. ----
+
+test('classify: a minor/patch group branch is group=true (assertion skips it)', () => {
+  assert.equal(classifyGate('dependabot/npm_and_yarn/npm-minor-patch-5475a7b965'), 'group=true');
+});
+
+test('classify: a singleton/major branch is group=false (missing verdict escalates)', () => {
+  assert.equal(classifyGate('dependabot/npm_and_yarn/twilio-6.0.2'), 'group=false');
+});
+
+test('classify: an empty or non-dependabot branch is group=false (conservative — escalate)', () => {
+  assert.equal(classifyGate(''), 'group=false');
+  assert.equal(classifyGate('feature/whatever'), 'group=false');
+});
+
+for (const [eco, branch] of [
+  ['npm', 'dependabot/npm_and_yarn/npm-minor-patch-a'],
+  ['cargo', 'dependabot/cargo/cargo-minor-patch-a'],
+  ['go modules (slug go_modules ≠ config gomod)', 'dependabot/go_modules/gomod-minor-patch-a'],
+  ['pip', 'dependabot/pip/pip-minor-patch-a'],
+  ['docker', 'dependabot/docker/docker-minor-patch-a'],
+  ['github-actions', 'dependabot/github_actions/actions-minor-patch-a'],
+]) {
+  test(`classify: ${eco} group branch is group=true`, () => {
+    assert.equal(classifyGate(branch), 'group=true');
+  });
+}
