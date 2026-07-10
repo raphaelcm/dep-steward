@@ -143,6 +143,8 @@ jobs:
             exit 0
           fi
           echo "No AUTOMERGE-DECISION-V1 comment on PR #$PR_NUMBER — the review produced nothing."
+          echo "Most common cause on a new repo: the Claude Code GitHub App is not installed"
+          echo "(the review run log will say so) — add it at https://github.com/apps/claude."
           CHANGED=$(gh pr diff "$PR_NUMBER" --repo "$REPO" --name-only)
           if grep -qxF '.github/workflows/dependabot-review.yml' <<<"$CHANGED"; then
             echo "Known cause: this PR modifies dependabot-review.yml itself, so claude-code-action's"

@@ -50,6 +50,11 @@ say()  { printf '%s\n' "$*"; }
 info() { printf '  %s\n' "$*"; }
 warn() { printf 'WARN: %s\n' "$*" >&2; }
 die()  { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+open_url() {
+  if command -v open >/dev/null 2>&1; then open "$1" >/dev/null 2>&1
+  elif command -v xdg-open >/dev/null 2>&1; then xdg-open "$1" >/dev/null 2>&1
+  fi
+}
 
 usage() {
   cat <<'USAGE'
@@ -361,6 +366,7 @@ if [ "$DRY_RUN" -eq 1 ]; then
   done
   say ""
   say "[dry-run] GitHub changes that would be made:"
+  info "REQUIRED (manual, web): install the Claude Code GitHub App on $NWO — https://github.com/apps/claude"
   info "gh label create $LABEL (if missing)"
   info "gh secret set $SECRET            (Actions store)"
   info "gh secret set $SECRET --app dependabot   (Dependabot store)"
@@ -389,6 +395,26 @@ else
   else
     warn "could not create label '$LABEL'"
   fi
+fi
+
+# ---- Claude GitHub App (required; not automatable) -------------------------
+# claude-code-action needs the Claude Code GitHub App installed on the repo, in
+# addition to the token: the token authorizes the Claude side, the App the GitHub
+# side. Installation is a web consent flow with no user-token API to perform or
+# verify it, so we surface it as a required step and open it when we can. Without
+# it, every review/autofix run fails with "Claude Code is not installed on this
+# repository".
+say ""
+say "REQUIRED — install the Claude Code GitHub App on $NWO. The token alone is not"
+say "enough; without the App, every review/autofix run fails with \"Claude Code is"
+say "not installed on this repository\". Grant it access to this repo:"
+info "https://github.com/apps/claude  ->  Configure  ->  add $NWO"
+if [ -t 0 ]; then
+  printf 'Open that page now? [Y/n] '
+  read -r ans
+  case "$ans" in ''|[Yy]*) open_url "https://github.com/apps/claude/installations/new" ;; esac
+  printf 'Press Enter once the App has access to %s... ' "$NWO"
+  read -r _
 fi
 
 # ---- secret in BOTH stores (the marquee gotcha) ----------------------------
