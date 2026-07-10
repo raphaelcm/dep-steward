@@ -26,7 +26,12 @@
 set -eu
 CDPATH=''
 
-DEFAULT_MODEL='claude-opus-4-8'
+# One Opus generation behind the newest on purpose: the very latest model is not
+# reliably reachable through the OAuth subscription tokens `claude setup-token`
+# mints. claude-opus-4-8 errored on the agent's first turn ($0 cost, is_error) for
+# a fresh subscription token, while claude-opus-4-7 runs fine. Bump ONLY after
+# confirming the new model is accessible via a subscription token, not just an API key.
+DEFAULT_MODEL='claude-opus-4-7'
 REPO_URL='https://github.com/raphaelcm/dep-steward'
 GATE_PATH='.github/dependabot-automerge/gate.cjs'
 AUTOFIX_BOUNDS_PATH='.github/dependabot-automerge/autofix-bounds.cjs'

