@@ -234,6 +234,19 @@ function decide(env) {
   };
 }
 
+// Classification mode, used by the review workflow's deliverable-assertion —
+// NOT the merge path. It answers only "is this branch a minor/patch group?"
+// from the same ELIGIBLE_GROUP_PREFIXES the merge path uses, so the two can
+// never disagree about which PRs the gate merges without a review verdict. It
+// is a pure branch-name match with no privilege — it authorizes nothing — so
+// running it from a PR checkout (as the review job does) is safe.
+if ((process.env.GATE_MODE || '') === 'classify') {
+  const headBranch = (process.env.HEAD_BRANCH || '').trim();
+  const isGroup = ELIGIBLE_GROUP_PREFIXES.some((pfx) => headBranch.startsWith(pfx));
+  process.stdout.write(`group=${isGroup}\n`);
+  process.exit(0);
+}
+
 const { decision, reason } = decide(process.env);
 process.stdout.write(`decision=${decision}\nreason=${reason}\n`);
 process.exit(0);

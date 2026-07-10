@@ -117,9 +117,14 @@ jobs:
         # branch's copy — which is every Dependabot PR that bumps an action
         # inside THIS file. We've seen a PR sit green-but-unprocessed for a week
         # that way: review SUCCESS, no comment, no label, gate correctly skipping.
-        # Invariant enforced here: every review run ends in exactly one of
-        # {V1 comment posted} or {red job + needs-human-review label} — for
-        # every silent-failure mode, not just the known one.
+        # The invariant is scoped to PRs the gate CANNOT merge without a verdict
+        # — singletons and majors. A minor/patch GROUP PR is the gate's own
+        # domain: it merges on CI-green with zero LLM input, so a missing verdict
+        # needs no human, and escalating one would assign you to a PR that
+        # auto-merges seconds later. gate.cjs (single source of truth for which
+        # branches are groups) classifies the branch and we skip the assertion
+        # for groups. For everything else a missing verdict ends in {red job +
+        # needs-human-review label}, for every silent-failure mode.
         if: ${{ !cancelled() }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -127,6 +132,11 @@ jobs:
           PR_NUMBER: ${{ inputs.pr_number || github.event.pull_request.number }}
         run: |
           set -euo pipefail
+          HEAD_BRANCH=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json headRefName --jq '.headRefName')
+          if [ "$(HEAD_BRANCH="$HEAD_BRANCH" GATE_MODE=classify node .github/dependabot-automerge/gate.cjs)" = "group=true" ]; then
+            echo "PR #$PR_NUMBER ($HEAD_BRANCH) is a minor/patch group — the gate merges it with no verdict; nothing to assert."
+            exit 0
+          fi
           COMMENTS=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json comments --jq '.comments[].body')
           if grep -qF '<!-- AUTOMERGE-DECISION-V1 -->' <<<"$COMMENTS"; then
             echo "V1 decision block found on PR #$PR_NUMBER — review deliverable present."
