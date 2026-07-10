@@ -81,6 +81,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Run Claude review
+        id: review
         # SHA-pinned: the moving @v1 tag silently shipped a breaking bot-gate
         # change that broke this workflow. Bump deliberately, not implicitly.
         uses: anthropics/claude-code-action@558b1d6cab4085c7753fe402c10bef0fbb92ac7a # v1.0.165
@@ -130,6 +131,9 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
           PR_NUMBER: ${{ inputs.pr_number || github.event.pull_request.number }}
+          # claude-code-action writes its full result (incl. the real error on a
+          # failed run) to this file; the run log only shows is_error, never why.
+          EXEC_FILE: ${{ steps.review.outputs.execution_file }}
         run: |
           set -euo pipefail
           HEAD_BRANCH=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json headRefName --jq '.headRefName')
@@ -142,9 +146,25 @@ jobs:
             echo "V1 decision block found on PR #$PR_NUMBER — review deliverable present."
             exit 0
           fi
-          echo "No AUTOMERGE-DECISION-V1 comment on PR #$PR_NUMBER — the review produced nothing."
-          echo "Most common cause on a new repo: the Claude Code GitHub App is not installed"
-          echo "(the review run log will say so) — add it at https://github.com/apps/claude."
+          echo "No AUTOMERGE-DECISION-V1 comment on PR #$PR_NUMBER — the review produced no verdict."
+          # Surface the agent's ACTUAL error instead of guessing. The #1 real cause —
+          # an invalid/expired CLAUDE_CODE_OAUTH_TOKEN — surfaces here as "401 Invalid
+          # bearer token"; without this it is invisible (the execution log is never
+          # uploaded), which is exactly the multi-hour rabbit hole this exists to end.
+          if [ -n "${EXEC_FILE:-}" ] && [ -f "$EXEC_FILE" ]; then
+            AGENT_ERR=$(jq -rs '[.. | objects | select(.is_error == true) | (.result // .error)] | map(select(. != null)) | .[0] // empty' "$EXEC_FILE" 2>/dev/null || true)
+            if [ -n "$AGENT_ERR" ]; then
+              echo "The review agent errored: $AGENT_ERR"
+              case "$AGENT_ERR" in
+                *'Invalid bearer token'*|*authentication*|*401*)
+                  echo "  -> CLAUDE_CODE_OAUTH_TOKEN is invalid or expired. Re-mint it with 'claude setup-token'"
+                  echo "     and re-run the dep-steward installer (it verifies the token before storing it)." ;;
+              esac
+            fi
+          fi
+          echo "If no agent error is shown above, the usual cause on a new repo is the Claude Code"
+          echo "GitHub App not being installed (the review run log will say so) — add it at"
+          echo "https://github.com/apps/claude."
           CHANGED=$(gh pr diff "$PR_NUMBER" --repo "$REPO" --name-only)
           if grep -qxF '.github/workflows/dependabot-review.yml' <<<"$CHANGED"; then
             echo "Known cause: this PR modifies dependabot-review.yml itself, so claude-code-action's"

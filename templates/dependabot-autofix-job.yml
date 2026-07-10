@@ -77,6 +77,7 @@
           } >> "$GITHUB_OUTPUT"
 
       - name: Run the Claude fixer (edits source in place; never pushes/merges)
+        id: fixer
         if: steps.pr.outputs.skip != 'true'
         # SHA-pinned, same as the review job — bump deliberately, not implicitly.
         uses: anthropics/claude-code-action@558b1d6cab4085c7753fe402c10bef0fbb92ac7a # v1.0.165
@@ -102,13 +103,29 @@
           PR_NUMBER: ${{ steps.pr.outputs.pr_number }}
           HEAD_BRANCH: ${{ steps.pr.outputs.head_branch }}
           BASE_SHA: ${{ steps.bump.outputs.base_sha }}
+          # The real error on a failed fixer run lives here, not in the run log.
+          EXEC_FILE: ${{ steps.fixer.outputs.execution_file }}
         run: |
           set -euo pipefail
           git add -A
           FIX_NAME_STATUS=$(git diff --cached --name-status "$BASE_SHA")
           FIX_NUMSTAT=$(git diff --cached --numstat "$BASE_SHA")
           if [ -z "$FIX_NAME_STATUS" ]; then
-            echo "The fixer made no edits — it escalated in its comment, or found nothing safe to do."
+            echo "The fixer made no edits."
+            # Distinguish "agent genuinely found nothing" from "agent never ran" (e.g.
+            # an invalid token). Without this, a 401 looks identical to a clean no-op.
+            if [ -n "${EXEC_FILE:-}" ] && [ -f "$EXEC_FILE" ]; then
+              AGENT_ERR=$(jq -rs '[.. | objects | select(.is_error == true) | (.result // .error)] | map(select(. != null)) | .[0] // empty' "$EXEC_FILE" 2>/dev/null || true)
+              if [ -n "$AGENT_ERR" ]; then
+                echo "The fixer agent errored (so it could not attempt a fix): $AGENT_ERR"
+                case "$AGENT_ERR" in
+                  *'Invalid bearer token'*|*authentication*|*401*)
+                    echo "  -> CLAUDE_CODE_OAUTH_TOKEN is invalid or expired. Re-mint it with 'claude setup-token'." ;;
+                esac
+              else
+                echo "It escalated in its comment, or found nothing safe to do."
+              fi
+            fi
             exit 0
           fi
           BUMP_PATHS=$(cat "$RUNNER_TEMP/bump_paths.txt")
