@@ -102,7 +102,6 @@
           PR_NUMBER: ${{ steps.pr.outputs.pr_number }}
           HEAD_BRANCH: ${{ steps.pr.outputs.head_branch }}
           BASE_SHA: ${{ steps.bump.outputs.base_sha }}
-          CI_NAME: __CI_NAME__
         run: |
           set -euo pipefail
           git add -A
@@ -129,12 +128,10 @@
           git commit -m "fix(deps): mechanical fix for the ${HEAD_BRANCH} bump [dep-steward autofix]"
           git push origin "HEAD:${HEAD_BRANCH}"
           echo "Pushed the fix ($REASON)."
-          # A GITHUB_TOKEN push does not re-trigger CI (recursion guard). Best-effort:
-          # dispatch CI if it supports workflow_dispatch; else the human re-runs it
-          # (the missing check blocks the merge until they do, so it can't be missed).
-          if gh workflow run "$CI_NAME" --repo "$REPO" --ref "$HEAD_BRANCH" 2>/dev/null; then
-            NOTE="CI was re-triggered automatically."
-          else
-            NOTE="Re-run CI on this PR before merging (your CI has no workflow_dispatch, so the fix commit didn't start it)."
-          fi
-          gh pr comment "$PR_NUMBER" --repo "$REPO" --body "dep-steward autofix pushed a mechanical fix for this bump ($REASON). ${NOTE} Then review and merge."
+          # A GITHUB_TOKEN push starts no CI run (GitHub's recursion guard), so the
+          # fix commit has no status and the PR's required check blocks the merge
+          # until a human runs CI on it — by closing/reopening the PR or pushing any
+          # commit (both are pull_request events from a human, not GITHUB_TOKEN).
+          # "Re-run" in the UI would only replay the pre-fix commit, so it can't be
+          # used here.
+          gh pr comment "$PR_NUMBER" --repo "$REPO" --body "dep-steward autofix pushed a mechanical fix for this bump ($REASON). GitHub doesn't run CI on a workflow-pushed commit, so to check the fix: **close and reopen this PR** (or push any commit to its branch). When CI is green, review and merge."

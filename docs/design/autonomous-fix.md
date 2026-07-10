@@ -30,9 +30,10 @@ build D (auto-merge) now.**
 - **The credential cost is entirely D's.** Removing the human is what forces the
   PAT *and* the adversarial reviewer *and* the new merge authorization — a much
   larger, credential-encumbered build for a marginal gain over B.
-- **Consequence of no PAT (accepted):** the fix commit won't auto-run CI. The
-  human re-runs CI (one click) before merging; or, when the adopter's CI exposes
-  `workflow_dispatch`, the job triggers it best-effort.
+- **Consequence of no PAT (accepted):** the fix commit won't auto-run CI (GitHub's
+  recursion guard). The human runs CI on the fix by closing/reopening the PR or
+  pushing any commit, then merges. ("Re-run" only replays the pre-fix commit, so
+  it does not help.)
 
 ### B — what gets built
 1. **`autofix` job**, opt-in (`--autofix` at install, default off), firing when CI
@@ -42,8 +43,9 @@ build D (auto-merge) now.**
 3. **Deterministic scope-limiter** (not a safety gate — the human is that): if the
    patch would exceed ~10 lines, add a dependency, or touch anything outside
    source, **decline and escalate** instead of pushing.
-4. **Push** the patch to the PR branch with `GITHUB_TOKEN`, comment what changed,
-   best-effort `workflow_dispatch` the CI, and **do not merge**.
+4. **Push** the patch to the PR branch with `GITHUB_TOKEN`, comment what changed
+   (and how to run CI on the fix — close/reopen the PR or push a commit), and
+   **do not merge**.
 5. **Wrinkle to handle:** Dependabot may force-push its branch and clobber the fix
    — detect and re-apply or escalate.
 

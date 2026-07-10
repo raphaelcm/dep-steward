@@ -93,7 +93,7 @@ When a dependency bump **breaks your CI** in a small, mechanical way — a renam
 - **The fix is bounds-limited** — a handful of lines, existing source files only, never the bumped manifest/lockfile, never anything under `.github/`. A larger or out-of-scope change is discarded and escalated to you instead.
 - **An autofixed PR can't be auto-merged.** Because the fix adds source changes, the gate's path whitelist refuses to auto-merge it — by construction it always waits for your review. So even a maximally prompt-injected "fix" can at most land a tiny, reviewed source edit on a PR branch, never on your default branch.
 
-**One caveat:** GitHub doesn't re-run CI for a commit pushed by a workflow (its recursion guard). Autofix re-triggers your CI automatically **if** your CI workflow allows `workflow_dispatch`; otherwise you click "re-run" on the PR — the missing check blocks the merge until you do, so nothing merges un-tested.
+**One caveat:** GitHub starts no CI run for a commit pushed by a workflow (its recursion guard), so the fix commit arrives with no CI status and the PR's required check blocks the merge until you run it. To run CI on the fix, **close and reopen the PR** (or push any commit to its branch) — both are `pull_request` events from your own account. (The "re-run" button only replays the *pre-fix* commit, so it doesn't help here.) Nothing merges un-tested.
 
 When autofix can't produce a clean, minimal fix — the break isn't clearly the bump's fault, it would need real code changes or a new dependency, or it's simply not confident — it escalates to you, exactly like the review job does.
 
