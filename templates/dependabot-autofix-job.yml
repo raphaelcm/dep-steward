@@ -1,0 +1,140 @@
+
+  autofix:
+    # Option B — when CI FAILS on a Dependabot PR, a Claude agent attempts a small
+    # mechanical fix and PUSHES it to the PR branch for a human to re-run CI and
+    # merge. It NEVER merges. Safety rests on three independent things:
+    #   1. the agent's tools are allow-listed (Edit/Write/gh/grep/Read/WebFetch, no
+    #      general Bash), so the PR's untrusted code is never EXECUTED here even
+    #      though this job holds a writable token;
+    #   2. the pushed change is bounds-limited by autofix-bounds.cjs (small,
+    #      source-only, not the bumped manifests, nothing under .github/);
+    #   3. a human authorizes every merge, so an injected "fix" can at most land a
+    #      tiny reviewed source edit on a PR branch — never on your default branch.
+    # Runs on workflow_run (base context: secrets present, token writable), which
+    # also sidesteps claude-code-action's OIDC self-modification refusal.
+    if: >
+      github.event_name == 'workflow_run' &&
+      github.event.workflow_run.event == 'pull_request' &&
+      github.event.workflow_run.conclusion == 'failure' &&
+      startsWith(github.event.workflow_run.head_branch, 'dependabot/')
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+      pull-requests: write
+      id-token: write
+    concurrency:
+      group: dependabot-autofix-${{ github.event.workflow_run.head_branch }}
+      cancel-in-progress: true
+    steps:
+      - name: Resolve the PR (and confirm it is Dependabot's)
+        id: pr
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+        run: |
+          set -euo pipefail
+          PR_NUMBER=$(gh pr list --repo "$REPO" --head "$HEAD_BRANCH" --state open --json number --jq '.[0].number // empty')
+          if [ -z "$PR_NUMBER" ]; then
+            echo "No open PR for $HEAD_BRANCH — nothing to do."; echo "skip=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          AUTHOR=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json author --jq '.author.login')
+          case "$AUTHOR" in
+            app/dependabot|dependabot[bot]) : ;;
+            *) echo "PR author is $AUTHOR, not Dependabot — nothing to do."; echo "skip=true" >> "$GITHUB_OUTPUT"; exit 0 ;;
+          esac
+          echo "pr_number=$PR_NUMBER" >> "$GITHUB_OUTPUT"
+          echo "head_branch=$HEAD_BRANCH" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout the PR branch (the code the fixer edits)
+        if: steps.pr.outputs.skip != 'true'
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ steps.pr.outputs.head_branch }}
+          fetch-depth: 0
+
+      - name: Snapshot the bump (its paths, and the pre-fix commit)
+        id: bump
+        if: steps.pr.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ steps.pr.outputs.pr_number }}
+        run: |
+          set -euo pipefail
+          gh pr diff "$PR_NUMBER" --repo "$REPO" --name-only > "$RUNNER_TEMP/bump_paths.txt"
+          echo "base_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Load the autofix prompt
+        id: load_prompt
+        if: steps.pr.outputs.skip != 'true'
+        run: |
+          {
+            echo 'prompt<<PROMPT_EOF_9Z3Q'
+            cat .github/dependabot-autofix-prompt.md
+            echo 'PROMPT_EOF_9Z3Q'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Run the Claude fixer (edits source in place; never pushes/merges)
+        if: steps.pr.outputs.skip != 'true'
+        # SHA-pinned, same as the review job — bump deliberately, not implicitly.
+        uses: anthropics/claude-code-action@558b1d6cab4085c7753fe402c10bef0fbb92ac7a # v1.0.165
+        env:
+          PR_NUMBER: ${{ steps.pr.outputs.pr_number }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          allowed_bots: "dependabot[bot]"
+          prompt: ${{ steps.load_prompt.outputs.prompt }}
+          # Edit/Write make the fix; gh/grep/Read/Glob/WebFetch investigate. NO
+          # general Bash, so the PR's untrusted code is never executed in this
+          # contents:write context — only the agent's own edits and gh metadata.
+          claude_args: >-
+            --max-turns 40 --model __MODEL__
+            --allowedTools "Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr checks:*),Bash(gh pr edit:*),Bash(gh pr view:*),Bash(gh release view:*),Bash(gh run view:*),Bash(gh run list:*),Bash(grep:*),Read,Grep,Glob,Edit,Write,WebFetch"
+
+      - name: Bounds-check the fix — push it, or discard and escalate
+        if: ${{ !cancelled() && steps.pr.outputs.skip != 'true' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ steps.pr.outputs.pr_number }}
+          HEAD_BRANCH: ${{ steps.pr.outputs.head_branch }}
+          BASE_SHA: ${{ steps.bump.outputs.base_sha }}
+          CI_NAME: __CI_NAME__
+        run: |
+          set -euo pipefail
+          git add -A
+          FIX_NAME_STATUS=$(git diff --cached --name-status "$BASE_SHA")
+          FIX_NUMSTAT=$(git diff --cached --numstat "$BASE_SHA")
+          if [ -z "$FIX_NAME_STATUS" ]; then
+            echo "The fixer made no edits — it escalated in its comment, or found nothing safe to do."
+            exit 0
+          fi
+          BUMP_PATHS=$(cat "$RUNNER_TEMP/bump_paths.txt")
+          export FIX_NAME_STATUS FIX_NUMSTAT BUMP_PATHS
+          OUT=$(node .github/dependabot-automerge/autofix-bounds.cjs)
+          echo "$OUT"
+          DECISION=$(echo "$OUT" | sed -n 's/^decision=//p')
+          REASON=$(echo "$OUT" | sed -n 's/^reason=//p')
+          if [ "$DECISION" != "push" ]; then
+            echo "Fix is out of bounds ($REASON) — discarding and escalating (the ephemeral runner is thrown away, so nothing is pushed)."
+            gh pr edit "$PR_NUMBER" --repo "$REPO" --add-label needs-human-review__ASSIGN_FLAG__
+            gh pr comment "$PR_NUMBER" --repo "$REPO" --body "dep-steward autofix drafted a change but it exceeded the safe bounds ($REASON), so it was discarded and left for a human."
+            exit 0
+          fi
+          git config user.name "dep-steward[bot]"
+          git config user.email "dep-steward@users.noreply.github.com"
+          git commit -m "fix(deps): mechanical fix for the ${HEAD_BRANCH} bump [dep-steward autofix]"
+          git push origin "HEAD:${HEAD_BRANCH}"
+          echo "Pushed the fix ($REASON)."
+          # A GITHUB_TOKEN push does not re-trigger CI (recursion guard). Best-effort:
+          # dispatch CI if it supports workflow_dispatch; else the human re-runs it
+          # (the missing check blocks the merge until they do, so it can't be missed).
+          if gh workflow run "$CI_NAME" --repo "$REPO" --ref "$HEAD_BRANCH" 2>/dev/null; then
+            NOTE="CI was re-triggered automatically."
+          else
+            NOTE="Re-run CI on this PR before merging (your CI has no workflow_dispatch, so the fix commit didn't start it)."
+          fi
+          gh pr comment "$PR_NUMBER" --repo "$REPO" --body "dep-steward autofix pushed a mechanical fix for this bump ($REASON). ${NOTE} Then review and merge."
