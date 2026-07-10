@@ -22,6 +22,7 @@ sh -c "$(curl -fsSL https://raw.githubusercontent.com/raphaelcm/dep-steward/main
 
 ### Prerequisites
 
+- **The [Claude Code GitHub App](https://github.com/apps/claude) installed on your repo** (open it → Configure → add the repo). `anthropics/claude-code-action` can't act on GitHub without it — the token below is necessary but *not sufficient*, and without the App every review/autofix run fails with "Claude Code is not installed on this repository". The installer opens the page and waits; there's no API to install or verify it for you.
 - **[GitHub CLI](https://cli.github.com) (`gh`), authenticated** with `repo` + `workflow` scopes (`gh auth login`). The installer uses it to write the label, secrets, and repo settings.
 - **A `CLAUDE_CODE_OAUTH_TOKEN`** — the OAuth token `anthropics/claude-code-action` uses, from a Claude Pro/Max subscription. If [Claude Code](https://claude.com/claude-code) is installed, the installer offers to mint one for you inline via `claude setup-token` and reads it from the prompt — no separate step; otherwise `export CLAUDE_CODE_OAUTH_TOKEN=…` beforehand. Minting is browser-interactive by design, so expect one paste — it can't be captured unattended.
 - **A CI workflow** whose green status should gate merges. The installer detects it or asks; pass `--ci-name "<name>"` to be explicit.
