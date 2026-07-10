@@ -26,6 +26,9 @@ const FILES = [
   '.github/dependabot-review-prompt.md',
   '.github/workflows/dependabot-review.yml',
   '.github/dependabot-automerge/gate.cjs',
+  // autofix is ON by default, so the reference render includes these too:
+  '.github/dependabot-automerge/autofix-bounds.cjs',
+  '.github/dependabot-autofix-prompt.md',
 ];
 
 // A representative multi-ecosystem repo, so the fixture exercises the catalog
@@ -99,28 +102,27 @@ function renderWith(extraArgs) {
   return out;
 }
 
-test('without --autofix: no autofix job, no leftover marker, no autofix files', () => {
+test('by default the autofix job and its two files render, all markers substituted', () => {
   const wf = readFileSync(join(rendered, '.github/workflows/dependabot-review.yml'), 'utf8');
-  assert.doesNotMatch(wf, /^ {2}autofix:/m);
-  assert.doesNotMatch(wf, /__AUTOFIX_JOB__/);
-  assert.ok(!existsSync(join(rendered, '.github/dependabot-automerge/autofix-bounds.cjs')));
-  assert.ok(!existsSync(join(rendered, '.github/dependabot-autofix-prompt.md')));
-});
-
-test('with --autofix: the autofix job and its two files render, all markers substituted', () => {
-  const out = renderWith(['--autofix']);
-  const wf = readFileSync(join(out, '.github/workflows/dependabot-review.yml'), 'utf8');
   assert.match(wf, /^ {2}autofix:/m);
   assert.match(wf, /workflow_run\.conclusion == 'failure'/);
   assert.doesNotMatch(wf, /__AUTOFIX_JOB__|__MODEL__|__CI_NAME__|__ASSIGN_FLAG__/);
-  assert.ok(existsSync(join(out, '.github/dependabot-automerge/autofix-bounds.cjs')));
-  const prompt = readFileSync(join(out, '.github/dependabot-autofix-prompt.md'), 'utf8');
+  assert.ok(existsSync(join(rendered, '.github/dependabot-automerge/autofix-bounds.cjs')));
+  const prompt = readFileSync(join(rendered, '.github/dependabot-autofix-prompt.md'), 'utf8');
   assert.match(prompt, /--add-label needs-human-review --add-assignee octocat/);
 });
 
-test('the rendered autofix job pushes for a human to merge — it never merges', () => {
-  const out = renderWith(['--autofix']);
+test('--no-autofix removes the job, its files, and leaves no marker', () => {
+  const out = renderWith(['--no-autofix']);
   const wf = readFileSync(join(out, '.github/workflows/dependabot-review.yml'), 'utf8');
+  assert.doesNotMatch(wf, /^ {2}autofix:/m);
+  assert.doesNotMatch(wf, /__AUTOFIX_JOB__/);
+  assert.ok(!existsSync(join(out, '.github/dependabot-automerge/autofix-bounds.cjs')));
+  assert.ok(!existsSync(join(out, '.github/dependabot-autofix-prompt.md')));
+});
+
+test('the rendered autofix job pushes for a human to merge — it never merges', () => {
+  const wf = readFileSync(join(rendered, '.github/workflows/dependabot-review.yml'), 'utf8');
   const autofixJob = wf.slice(wf.indexOf('\n  autofix:'));
   assert.ok(autofixJob.length > 0);
   assert.doesNotMatch(autofixJob, /gh pr merge/);

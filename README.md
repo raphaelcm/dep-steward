@@ -77,15 +77,15 @@ GitHub settings it configures (via `gh`):
 
 It does not touch your source, your existing CI workflow, or your git history.
 
-## Autofix (advanced, opt-in)
-
-Off by default. Enable it at install with `--autofix`:
-
-```
-sh -c "$(curl -fsSL https://raw.githubusercontent.com/raphaelcm/dep-steward/main/install.sh)" -- --autofix
-```
+## Autofix (on by default)
 
 When a dependency bump **breaks your CI** in a small, mechanical way — a renamed export, a changed signature, a moved default — a Claude agent makes the minimal fix, pushes it to the PR branch, and leaves it for **you** to re-run CI and merge. It turns "escalate, go diagnose and fix it yourself" into "here's an already-fixed PR, take a look." It needs **no extra credential** beyond the token the review job already uses.
+
+It's the one part of dep-steward that drafts changes to *your* source — always in a PR you review and merge, never on your default branch. If you'd rather no agent did that, turn it off at install:
+
+```
+sh -c "$(curl -fsSL https://raw.githubusercontent.com/raphaelcm/dep-steward/main/install.sh)" -- --no-autofix
+```
 
 **It never merges — you authorize every merge.** Three things keep that safe:
 
