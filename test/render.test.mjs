@@ -128,3 +128,26 @@ test('the rendered autofix job pushes for a human to merge — it never merges',
   assert.doesNotMatch(autofixJob, /gh pr merge/);
   assert.match(autofixJob, /git push origin/);
 });
+
+// ---- diagnosability: the frontier model, and real errors surfaced ----------
+
+test('both agent invocations run at the frontier Opus default', () => {
+  const wf = readFileSync(join(rendered, '.github/workflows/dependabot-review.yml'), 'utf8');
+  // A prior build downgraded to claude-opus-4-7 blaming the model for a $0/is_error
+  // first turn that was actually an invalid-token 401. Lock the frontier default so
+  // that misdiagnosis can't silently return.
+  const models = [...wf.matchAll(/--model (claude-opus-[\d-]+)/g)].map((m) => m[1]);
+  assert.deepEqual(models, ['claude-opus-4-8', 'claude-opus-4-8']);
+});
+
+test('a failed agent run surfaces its actual error, not a guess', () => {
+  const wf = readFileSync(join(rendered, '.github/workflows/dependabot-review.yml'), 'utf8');
+  // The review assertion and the autofix bounds-check both read claude-code-action's
+  // execution_file and print the agent's real error (e.g. "401 Invalid bearer token"),
+  // with a token-specific remedy. Without this the failure is opaque — the exact
+  // multi-hour rabbit hole this wiring exists to end.
+  assert.match(wf, /EXEC_FILE: \$\{\{ steps\.review\.outputs\.execution_file \}\}/);
+  assert.match(wf, /EXEC_FILE: \$\{\{ steps\.fixer\.outputs\.execution_file \}\}/);
+  assert.match(wf, /Invalid bearer token/);
+  assert.match(wf, /claude setup-token/);
+});

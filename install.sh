@@ -26,12 +26,13 @@
 set -eu
 CDPATH=''
 
-# One Opus generation behind the newest on purpose: the very latest model is not
-# reliably reachable through the OAuth subscription tokens `claude setup-token`
-# mints. claude-opus-4-8 errored on the agent's first turn ($0 cost, is_error) for
-# a fresh subscription token, while claude-opus-4-7 runs fine. Bump ONLY after
-# confirming the new model is accessible via a subscription token, not just an API key.
-DEFAULT_MODEL='claude-opus-4-7'
+# Frontier Opus by default. A prior build downgraded to claude-opus-4-7 on the theory
+# that claude-opus-4-8 was "unreachable via OAuth" — that was a misdiagnosis. The
+# $0-cost / is_error first-turn failure was an invalid/expired CLAUDE_CODE_OAUTH_TOKEN
+# returning "401 Invalid bearer token", identical across every model; the token was
+# the fault, not the model (which is why the installer now verifies the token below).
+# Keep the frontier default.
+DEFAULT_MODEL='claude-opus-4-8'
 REPO_URL='https://github.com/raphaelcm/dep-steward'
 GATE_PATH='.github/dependabot-automerge/gate.cjs'
 AUTOFIX_BOUNDS_PATH='.github/dependabot-automerge/autofix-bounds.cjs'
@@ -423,33 +424,76 @@ if [ -t 0 ]; then
 fi
 
 # ---- secret in BOTH stores (the marquee gotcha) ----------------------------
+# The single worst install outcome is storing a token that does not work: the
+# pipeline then fails three steps later, in CI, with an opaque "no verdict" — the
+# real "401 Invalid bearer token" buried in a runner file that is never uploaded.
+# (That exact rabbit hole cost hours to diagnose once.) So we VERIFY the token
+# authenticates before storing it, so a bad one fails HERE, legibly, at install
+# time. The check needs the `claude` CLI — the same tool that mints the token —
+# so when it is absent we can only say we couldn't check.
+# token_authenticates <token> -> 0 authenticates, 1 rejected (401), 2 cannot check.
+token_authenticates() {
+  command -v claude >/dev/null 2>&1 || return 2
+  _probe=$(CLAUDE_CODE_OAUTH_TOKEN="$1" claude -p 'reply with the single word OK' </dev/null 2>&1 || true)
+  case "$_probe" in
+    *'Invalid bearer token'*|*authentication_error*) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
 TOKEN="${CLAUDE_CODE_OAUTH_TOKEN:-}"
-if [ -z "$TOKEN" ] && [ -t 0 ]; then
-  # Fold token generation into the flow when Claude Code is installed. `claude
-  # setup-token` is interactive by design (browser OAuth) and prints the token
-  # for manual copy — it can't be captured silently — so we launch it inline
-  # and then read the token from the same prompt.
-  if command -v claude >/dev/null 2>&1; then
-    printf 'No CLAUDE_CODE_OAUTH_TOKEN set. Mint one now with claude setup-token? [Y/n] '
-    read -r ans
-    case "$ans" in
-      ''|[Yy]*)
-        say "Launching 'claude setup-token' — authorize in the browser, then copy the token it prints."
-        claude setup-token || warn "claude setup-token did not complete; you can still paste a token below"
-        printf 'Paste the token it printed (input hidden): '
-        ;;
-      *)
-        printf 'Paste your CLAUDE_CODE_OAUTH_TOKEN (input hidden): '
-        ;;
-    esac
-  else
-    info "Tip: with Claude Code installed, 'claude setup-token' mints this token (needs a Claude subscription)."
-    printf 'Paste your CLAUDE_CODE_OAUTH_TOKEN (input hidden): '
+# A token from the environment is verified too — a stale/expired paste is the most
+# common trap, and looks identical to a good one until CI rejects it hours later.
+if [ -n "$TOKEN" ]; then
+  token_authenticates "$TOKEN" && _rc=0 || _rc=$?
+  if [ "${_rc:-0}" -eq 1 ]; then
+    warn "CLAUDE_CODE_OAUTH_TOKEN from the environment is invalid (401 Invalid bearer token) — ignoring it."
+    TOKEN=''
   fi
-  stty -echo 2>/dev/null || true
-  read -r TOKEN
-  stty echo 2>/dev/null || true
-  printf '\n'
+fi
+
+if [ -z "$TOKEN" ] && [ -t 0 ]; then
+  # `claude setup-token` is interactive by design (browser OAuth) and prints the
+  # token for manual copy, so we launch it inline and read the token back here.
+  # Up to 3 attempts: mint or paste, then verify; a rejected token re-prompts
+  # instead of being silently stored to fail opaquely in CI later.
+  _tries=0
+  while [ "$_tries" -lt 3 ]; do
+    _tries=$((_tries + 1))
+    if command -v claude >/dev/null 2>&1; then
+      printf 'Mint a token now with claude setup-token? [Y/n] '
+      read -r ans
+      case "$ans" in
+        ''|[Yy]*)
+          say "Launching 'claude setup-token' — authorize in the browser, then copy the token it prints."
+          claude setup-token || warn "claude setup-token did not complete; you can still paste a token below"
+          printf 'Paste the token it printed (input hidden): '
+          ;;
+        *)
+          printf 'Paste your CLAUDE_CODE_OAUTH_TOKEN (input hidden): '
+          ;;
+      esac
+    else
+      info "Tip: with Claude Code installed, 'claude setup-token' mints this token (needs a Claude subscription)."
+      printf 'Paste your CLAUDE_CODE_OAUTH_TOKEN (input hidden): '
+    fi
+    stty -echo 2>/dev/null || true
+    read -r TOKEN
+    stty echo 2>/dev/null || true
+    printf '\n'
+    [ -z "$TOKEN" ] && { warn "no token entered."; continue; }
+    token_authenticates "$TOKEN" && _rc=0 || _rc=$?
+    if [ "${_rc:-0}" -eq 0 ]; then
+      info "token verified — it authenticates."
+      break
+    elif [ "${_rc:-0}" -eq 2 ]; then
+      info "can't verify locally without the claude CLI — trusting the pasted token."
+      break
+    else
+      warn "that token failed to authenticate (401 Invalid bearer token). Try again."
+      TOKEN=''
+    fi
+  done
 fi
 if [ -n "$TOKEN" ]; then
   if printf '%s' "$TOKEN" | gh secret set "$SECRET" --repo "$NWO" --body - >/dev/null; then

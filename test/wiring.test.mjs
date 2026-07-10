@@ -49,11 +49,31 @@ esac
 exit 0
 `;
 
+// Stub for `claude`. The installer now VERIFIES the token with `claude -p` before
+// storing it, so the harness must supply a deterministic, offline claude (a real
+// one would make a network call with a fake token). Emits "OK" (authenticates) by
+// default, or the 401 signature when CLAUDE_STUB_FAIL is set — so we can test that
+// a bad token is rejected, not stored.
+const FAKE_CLAUDE = `#!/bin/sh
+case "$1" in
+  -p)
+    if [ -n "\${CLAUDE_STUB_FAIL:-}" ]; then
+      echo 'Failed to authenticate. API Error: 401 {"type":"error","error":{"type":"authentication_error","message":"Invalid bearer token"}}'
+    else
+      echo 'OK'
+    fi
+    exit 0 ;;
+esac
+exit 0
+`;
+
 function runInstaller(extraEnv = {}) {
   const bin = mkdtempSync(join(tmpdir(), 'ds-bin-'));
   const ghLog = join(bin, 'gh.log');
   writeFileSync(join(bin, 'gh'), FAKE_GH);
   chmodSync(join(bin, 'gh'), 0o755);
+  writeFileSync(join(bin, 'claude'), FAKE_CLAUDE);
+  chmodSync(join(bin, 'claude'), 0o755);
 
   const repoDir = mkdtempSync(join(tmpdir(), 'ds-target-'));
   writeFileSync(join(repoDir, 'package.json'), '{}\n');
@@ -137,4 +157,15 @@ test('reports required status checks from the effective-rules endpoint (regressi
   const { stdout } = runInstaller({ GH_REQUIRED_CONTEXTS: 'CI' });
   assert.match(stdout, /Required status checks on 'main': CI/);
   assert.doesNotMatch(stdout, /No status checks are required/);
+});
+
+test('a token that fails verification is never stored (no opaque bad-token installs)', () => {
+  // With the `claude` probe returning 401, the env-provided token is invalid.
+  // Non-interactively the installer must store NOTHING rather than poison both
+  // secret stores with a token that fails three steps later, opaquely, in CI.
+  const { log: badLog } = runInstaller({ CLAUDE_STUB_FAIL: '1' });
+  assert.doesNotMatch(badLog, /secret set CLAUDE_CODE_OAUTH_TOKEN/,
+    `a token rejected by the probe must not be written to either store. gh log:\n${badLog}`);
+  // Contrast: the default run (probe returns OK) DOES set it in both stores —
+  // proven by the 'sets the secret ...' tests above, which share this harness.
 });
