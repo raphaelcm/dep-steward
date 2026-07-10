@@ -34,9 +34,15 @@ build D (auto-merge) now.**
   recursion guard). The human runs CI on the fix by closing/reopening the PR or
   pushing any commit, then merges. ("Re-run" only replays the pre-fix commit, so
   it does not help.)
+- **On by default (`--no-autofix` opts out).** The original opt-in-default-off call
+  was inherited from D, which needed a credential and reopened the trust model —
+  gone for B. Autofix is purely additive (on a broken bump you get a drafted fix or
+  a plain escalate, never worse) and every change is human-reviewed, so there is no
+  safety reason to gate it. The only thing to consent to is that it drafts source in
+  a PR; `--no-autofix` exists for adopters who'd rather it didn't.
 
 ### B — what gets built
-1. **`autofix` job**, opt-in (`--autofix` at install, default off), firing when CI
+1. **`autofix` job**, on by default (`--no-autofix` to disable), firing when CI
    concludes **red** on a Dependabot PR.
 2. **Fixer** — one LLM call (Claude token from the Dependabot secret store): given
    the CI failure + the diff, emit a minimal mechanical patch or decline.

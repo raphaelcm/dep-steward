@@ -44,7 +44,7 @@ CI_NAME=''
 MODEL="$DEFAULT_MODEL"
 ASSIGNEE=''
 ASSIGNEE_EXPLICIT=0
-AUTOFIX=0
+AUTOFIX=1
 
 say()  { printf '%s\n' "$*"; }
 info() { printf '  %s\n' "$*"; }
@@ -65,9 +65,9 @@ Flags:
   --model NAME         Claude model for the review job (default: claude-opus-4-8)
   --assignee HANDLE    GitHub user assigned when a PR is escalated, so GitHub
                        notifies them (default: you; pass "" to disable)
-  --autofix            (advanced) when CI fails on a bump, let a Claude agent push
-                       a small mechanical fix for you to re-run CI and merge; needs
-                       no extra credential. Default: off.
+  --no-autofix         turn OFF autofix (it's ON by default): don't let a Claude
+                       agent push mechanical fixes for CI-breaking bumps; baseline
+                       review + auto-merge only.
   --render-only --out DIR   render into DIR and stop (no gh calls)
   -h, --help           show this help
 
@@ -81,6 +81,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --dry-run) DRY_RUN=1 ;;
     --autofix) AUTOFIX=1 ;;
+    --no-autofix) AUTOFIX=0 ;;
     --render-only) RENDER_ONLY=1 ;;
     --out) OUT="${2:-}"; shift ;;
     --out=*) OUT="${1#--out=}" ;;
