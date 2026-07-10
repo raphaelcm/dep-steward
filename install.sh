@@ -29,6 +29,8 @@ CDPATH=''
 DEFAULT_MODEL='claude-opus-4-8'
 REPO_URL='https://github.com/raphaelcm/dep-steward'
 GATE_PATH='.github/dependabot-automerge/gate.cjs'
+AUTOFIX_BOUNDS_PATH='.github/dependabot-automerge/autofix-bounds.cjs'
+AUTOFIX_PROMPT_PATH='.github/dependabot-autofix-prompt.md'
 LABEL='needs-human-review'
 SECRET='CLAUDE_CODE_OAUTH_TOKEN'
 
@@ -42,6 +44,7 @@ CI_NAME=''
 MODEL="$DEFAULT_MODEL"
 ASSIGNEE=''
 ASSIGNEE_EXPLICIT=0
+AUTOFIX=0
 
 say()  { printf '%s\n' "$*"; }
 info() { printf '  %s\n' "$*"; }
@@ -62,6 +65,9 @@ Flags:
   --model NAME         Claude model for the review job (default: claude-opus-4-8)
   --assignee HANDLE    GitHub user assigned when a PR is escalated, so GitHub
                        notifies them (default: you; pass "" to disable)
+  --autofix            (advanced) when CI fails on a bump, let a Claude agent push
+                       a small mechanical fix for you to re-run CI and merge; needs
+                       no extra credential. Default: off.
   --render-only --out DIR   render into DIR and stop (no gh calls)
   -h, --help           show this help
 
@@ -74,6 +80,7 @@ USAGE
 while [ $# -gt 0 ]; do
   case "$1" in
     --dry-run) DRY_RUN=1 ;;
+    --autofix) AUTOFIX=1 ;;
     --render-only) RENDER_ONLY=1 ;;
     --out) OUT="${2:-}"; shift ;;
     --out=*) OUT="${1#--out=}" ;;
@@ -225,12 +232,14 @@ render_prompt() {
 
 render_workflow() {
   crt=$(ci_runlist_token "$CI_NAME")
-  sed -e "s|__CI_NAME__|$CI_NAME|g" \
-      -e "s|__CI_RUNLIST__|$crt|g" \
-      -e "s|__MODEL__|$MODEL|g" \
-      -e "s|__GATE_PATH__|$GATE_PATH|g" \
-      -e "s|__ASSIGN_FLAG__|$ASSIGN_FLAG|g" \
-      "$SRC/templates/dependabot-review.yml"
+  frag=''
+  if [ "$AUTOFIX" -eq 1 ]; then frag=$(cat "$SRC/templates/dependabot-autofix-job.yml"); fi
+  inject '#__AUTOFIX_JOB__' "$frag" < "$SRC/templates/dependabot-review.yml" \
+    | sed -e "s|__CI_NAME__|$CI_NAME|g" \
+          -e "s|__CI_RUNLIST__|$crt|g" \
+          -e "s|__MODEL__|$MODEL|g" \
+          -e "s|__GATE_PATH__|$GATE_PATH|g" \
+          -e "s|__ASSIGN_FLAG__|$ASSIGN_FLAG|g"
 }
 
 render_gate() {
@@ -238,6 +247,11 @@ render_gate() {
     | inject '//__WL_EXACT__' "$WL_EXACT" \
     | inject '//__WL_REGEX__' "$WL_REGEX"
 }
+
+# autofix (--autofix only): the fixer prompt takes the same escalate flag as the
+# review prompt; the bounds script is static (rendered verbatim).
+render_autofix_prompt() { sed -e "s|__ASSIGN_FLAG__|$ASSIGN_FLAG|g" "$SRC/templates/dependabot-autofix-prompt.md"; }
+render_autofix_bounds() { cat "$SRC/templates/autofix-bounds.cjs"; }
 
 # write one rendered file to a destination path (creating parent dirs)
 emit() { # emit <renderer-fn> <dest-path>
@@ -253,7 +267,11 @@ if [ "$RENDER_ONLY" -eq 1 ]; then
   emit render_prompt          "$OUT/.github/dependabot-review-prompt.md"
   emit render_workflow        "$OUT/.github/workflows/dependabot-review.yml"
   emit render_gate            "$OUT/$GATE_PATH"
-  say "Rendered to $OUT (ecosystems: $ACTIVE; ci: $CI_NAME; model: $MODEL; assignee: ${ASSIGNEE:-none})"
+  if [ "$AUTOFIX" -eq 1 ]; then
+    emit render_autofix_prompt "$OUT/$AUTOFIX_PROMPT_PATH"
+    emit render_autofix_bounds "$OUT/$AUTOFIX_BOUNDS_PATH"
+  fi
+  say "Rendered to $OUT (ecosystems: $ACTIVE; ci: $CI_NAME; model: $MODEL; assignee: ${ASSIGNEE:-none}; autofix: $([ "$AUTOFIX" -eq 1 ] && echo on || echo off))"
   exit 0
 fi
 
@@ -309,6 +327,7 @@ info "CI workflow:  $CI_NAME"
 info "review model: $MODEL"
 info "gate path:    $GATE_PATH"
 info "escalations:  $([ -n "$ASSIGNEE" ] && echo "assign @$ASSIGNEE + label" || echo "label only (no assignee)")"
+info "autofix:      $([ "$AUTOFIX" -eq 1 ] && echo "on — Claude pushes small mechanical fixes for you to merge" || echo "off")"
 say ""
 
 # ---- render (to a temp tree first, for dry-run diffing) --------------------
@@ -319,6 +338,11 @@ emit render_workflow        "$STAGE/.github/workflows/dependabot-review.yml"
 emit render_gate            "$STAGE/$GATE_PATH"
 
 FILES=".github/dependabot.yml .github/dependabot-review-prompt.md .github/workflows/dependabot-review.yml $GATE_PATH"
+if [ "$AUTOFIX" -eq 1 ]; then
+  emit render_autofix_prompt "$STAGE/$AUTOFIX_PROMPT_PATH"
+  emit render_autofix_bounds "$STAGE/$AUTOFIX_BOUNDS_PATH"
+  FILES="$FILES $AUTOFIX_PROMPT_PATH $AUTOFIX_BOUNDS_PATH"
+fi
 
 if [ "$DRY_RUN" -eq 1 ]; then
   say "[dry-run] files that would be written:"

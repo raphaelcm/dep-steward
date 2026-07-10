@@ -1,13 +1,57 @@
 # Autonomous fix + adversarial review (FIX-AND-MERGE) — design
 
-**Status:** proposal / design. Not implemented. This document is the thing to
-argue with before any code.
+**Status:** DECIDED 2026-07-10 — build **B** (Claude fixes, human merges); **D**
+(adversarial review + auto-merge) is deferred. See the Decision section.
 
 **One line:** when a routine dependency bump breaks CI in a small, mechanical
 way, one Claude writes the fix, a *second, independently-scoped* Claude tries to
 refute it, and the deterministic gate merges only if the fix survives — so the
 maintainer never touches a trivial breakage, and an attacker who controls the
 dependency still cannot get malicious code merged.
+
+---
+
+## Decision (2026-07-10): build B, defer D
+
+The §10 CI-retrigger spike ran on a throwaway repo and confirmed the constraint
+empirically: **a commit pushed by a workflow with `GITHUB_TOKEN` does not
+re-trigger CI** — GitHub's recursion guard (0 CI runs on the pushed branch; the
+push itself succeeded). Re-triggering CI on the fix therefore needs a
+non-`GITHUB_TOKEN` identity (a PAT or a GitHub App) that every adopter must
+provision — which breaks the zero-setup promise for anyone who enables the feature.
+
+**Decision: ship B (Claude fixes, you merge) with no extra credential; do not
+build D (auto-merge) now.**
+
+- **B keeps the structural injection-safety guarantee intact.** Nothing
+  auto-merges; the human authorizes every source-touching merge and IS the
+  review. So B needs *none* of D's machinery below — no adversarial reviewer, no
+  `FIX-VERDICT-V1`, no second gate authorization for source changes, no PAT.
+- **The credential cost is entirely D's.** Removing the human is what forces the
+  PAT *and* the adversarial reviewer *and* the new merge authorization — a much
+  larger, credential-encumbered build for a marginal gain over B.
+- **Consequence of no PAT (accepted):** the fix commit won't auto-run CI (GitHub's
+  recursion guard). The human runs CI on the fix by closing/reopening the PR or
+  pushing any commit, then merges. ("Re-run" only replays the pre-fix commit, so
+  it does not help.)
+
+### B — what gets built
+1. **`autofix` job**, opt-in (`--autofix` at install, default off), firing when CI
+   concludes **red** on a Dependabot PR.
+2. **Fixer** — one LLM call (Claude token from the Dependabot secret store): given
+   the CI failure + the diff, emit a minimal mechanical patch or decline.
+3. **Deterministic scope-limiter** (not a safety gate — the human is that): if the
+   patch would exceed ~10 lines, add a dependency, or touch anything outside
+   source, **decline and escalate** instead of pushing.
+4. **Push** the patch to the PR branch with `GITHUB_TOKEN`, comment what changed
+   (and how to run CI on the fix — close/reopen the PR or push a commit), and
+   **do not merge**.
+5. **Wrinkle to handle:** Dependabot may force-push its branch and clobber the fix
+   — detect and re-apply or escalate.
+
+Everything from §4 onward is **D** and is **not being built now** — preserved as
+the deferred design for if a central GitHub App is ever added and we choose to
+remove the human.
 
 ---
 

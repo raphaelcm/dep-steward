@@ -77,6 +77,26 @@ GitHub settings it configures (via `gh`):
 
 It does not touch your source, your existing CI workflow, or your git history.
 
+## Autofix (advanced, opt-in)
+
+Off by default. Enable it at install with `--autofix`:
+
+```
+sh -c "$(curl -fsSL https://raw.githubusercontent.com/raphaelcm/dep-steward/main/install.sh)" -- --autofix
+```
+
+When a dependency bump **breaks your CI** in a small, mechanical way — a renamed export, a changed signature, a moved default — a Claude agent makes the minimal fix, pushes it to the PR branch, and leaves it for **you** to re-run CI and merge. It turns "escalate, go diagnose and fix it yourself" into "here's an already-fixed PR, take a look." It needs **no extra credential** beyond the token the review job already uses.
+
+**It never merges — you authorize every merge.** Three things keep that safe:
+
+- **The agent's tools are allow-listed** (edit/read/`grep`/`gh`, no general shell), so your PR's untrusted code is never *executed* while the job holds a writable token.
+- **The fix is bounds-limited** — a handful of lines, existing source files only, never the bumped manifest/lockfile, never anything under `.github/`. A larger or out-of-scope change is discarded and escalated to you instead.
+- **An autofixed PR can't be auto-merged.** Because the fix adds source changes, the gate's path whitelist refuses to auto-merge it — by construction it always waits for your review. So even a maximally prompt-injected "fix" can at most land a tiny, reviewed source edit on a PR branch, never on your default branch.
+
+**One caveat:** GitHub starts no CI run for a commit pushed by a workflow (its recursion guard), so the fix commit arrives with no CI status and the PR's required check blocks the merge until you run it. To run CI on the fix, **close and reopen the PR** (or push any commit to its branch) — both are `pull_request` events from your own account. (The "re-run" button only replays the *pre-fix* commit, so it doesn't help here.) Nothing merges un-tested.
+
+When autofix can't produce a clean, minimal fix — the break isn't clearly the bump's fault, it would need real code changes or a new dependency, or it's simply not confident — it escalates to you, exactly like the review job does.
+
 ## Seeing what it's done: `/dep-steward-summary`
 
 `/dep-steward-summary` is a Claude Code command that gives a read-only readout: what dep-steward auto-merged, what it escalated and why, any security updates it landed, and an honest time-saved estimate (counts exact; per-PR minutes an assumption you can adjust). Pass a window if you like: `/dep-steward-summary 90d`.

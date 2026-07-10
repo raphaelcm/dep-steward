@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, writeFileSync, readFileSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -83,4 +83,46 @@ test("the gate keys off Dependabot's branch slugs, not the config names", () => 
   assert.match(gate, /'dependabot\/github_actions\/actions-minor-patch-'/);
   // And an identity one for good measure.
   assert.match(gate, /'dependabot\/cargo\/cargo-minor-patch-'/);
+});
+
+// ---- --autofix opt-in: the job and its files appear iff the flag is set ----
+
+function renderWith(extraArgs) {
+  const fakeRepo = mkdtempSync(join(tmpdir(), 'ds-af-repo-'));
+  for (const m of REFERENCE_MANIFESTS) writeFileSync(join(fakeRepo, m), '\n');
+  const out = mkdtempSync(join(tmpdir(), 'ds-af-out-'));
+  execFileSync(
+    'sh',
+    [join(REPO, 'install.sh'), '--render-only', '--out', out, '--ci-name', 'CI', '--assignee', 'octocat', ...extraArgs],
+    { cwd: fakeRepo, env: { ...process.env, DEP_STEWARD_SRC: REPO }, stdio: 'pipe' },
+  );
+  return out;
+}
+
+test('without --autofix: no autofix job, no leftover marker, no autofix files', () => {
+  const wf = readFileSync(join(rendered, '.github/workflows/dependabot-review.yml'), 'utf8');
+  assert.doesNotMatch(wf, /^ {2}autofix:/m);
+  assert.doesNotMatch(wf, /__AUTOFIX_JOB__/);
+  assert.ok(!existsSync(join(rendered, '.github/dependabot-automerge/autofix-bounds.cjs')));
+  assert.ok(!existsSync(join(rendered, '.github/dependabot-autofix-prompt.md')));
+});
+
+test('with --autofix: the autofix job and its two files render, all markers substituted', () => {
+  const out = renderWith(['--autofix']);
+  const wf = readFileSync(join(out, '.github/workflows/dependabot-review.yml'), 'utf8');
+  assert.match(wf, /^ {2}autofix:/m);
+  assert.match(wf, /workflow_run\.conclusion == 'failure'/);
+  assert.doesNotMatch(wf, /__AUTOFIX_JOB__|__MODEL__|__CI_NAME__|__ASSIGN_FLAG__/);
+  assert.ok(existsSync(join(out, '.github/dependabot-automerge/autofix-bounds.cjs')));
+  const prompt = readFileSync(join(out, '.github/dependabot-autofix-prompt.md'), 'utf8');
+  assert.match(prompt, /--add-label needs-human-review --add-assignee octocat/);
+});
+
+test('the rendered autofix job pushes for a human to merge — it never merges', () => {
+  const out = renderWith(['--autofix']);
+  const wf = readFileSync(join(out, '.github/workflows/dependabot-review.yml'), 'utf8');
+  const autofixJob = wf.slice(wf.indexOf('\n  autofix:'));
+  assert.ok(autofixJob.length > 0);
+  assert.doesNotMatch(autofixJob, /gh pr merge/);
+  assert.match(autofixJob, /git push origin/);
 });
