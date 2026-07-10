@@ -496,8 +496,39 @@ else
   info "checks adds defense in depth (nobody merges around a red build). Set it in Settings → Rules."
 fi
 
+# ---- offer to commit + push (so "done" means live) -------------------------
+# The installer stages the generated files but doesn't commit by default — some
+# adopters want to review first. Offer to do it so "done" can actually mean live.
+ACTIVATED=0
+if [ -t 0 ] && [ -n "$FILES" ]; then
+  say ""
+  printf 'Commit and push these files now to activate the pipeline? [Y/n] '
+  read -r ans
+  case "$ans" in
+    ''|[Yy]*)
+      # Stage only the generated files, not unrelated working-tree changes.
+      # shellcheck disable=SC2086
+      git add $FILES 2>/dev/null || true
+      if git commit -m "Add dep-steward: Claude-reviewed Dependabot automation" >/dev/null 2>&1; then
+        if git push >/dev/null 2>&1; then
+          ACTIVATED=1
+          info "committed and pushed — the pipeline is live."
+        else
+          warn "committed, but 'git push' failed (no upstream, or rejected). Push it yourself: git push"
+        fi
+      else
+        warn "nothing new to commit — if not yet pushed: git add -A && git commit -m 'Add dep-steward' && git push"
+      fi
+      ;;
+    *) info "OK — commit + push when you're ready: git add -A && git commit -m 'Add dep-steward' && git push" ;;
+  esac
+fi
+
 # ---- done ------------------------------------------------------------------
 say ""
-say "Done. Commit the generated files under .github/ to activate the pipeline, then"
-say "smoke-test against an existing Dependabot PR without waiting for Monday:"
-info "gh workflow run dependabot-review.yml --repo $NWO -f pr_number=<PR>"
+if [ "$ACTIVATED" -eq 1 ]; then
+  say "Done — pushed and live. Dependabot scans on the new config and opens its first PRs shortly."
+else
+  say "Done. Commit + push the files under .github/ to activate the pipeline:"
+  info "git add -A && git commit -m 'Add dep-steward' && git push"
+fi
