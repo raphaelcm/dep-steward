@@ -151,3 +151,18 @@ test('a failed agent run surfaces its actual error, not a guess', () => {
   assert.match(wf, /Invalid bearer token/);
   assert.match(wf, /claude setup-token/);
 });
+
+test('both prompt-loads bake in the literal PR number, never cat the raw prompt', () => {
+  const wf = readFileSync(join(rendered, '.github/workflows/dependabot-review.yml'), 'utf8');
+  // Claude Code 2.1.207+ (bundled by recent claude-code-action releases) rejects an
+  // allowlisted Bash command that contains a shell expansion ("Contains expansion").
+  // So `gh pr diff $PR_NUMBER` must be substituted to `gh pr diff <n>` before the agent
+  // sees it, or every gh call is denied and the review times out with no verdict. Both
+  // the review and autofix prompt-loads substitute; neither cats the raw prompt.
+  assert.ok(wf.includes('sed "s/\\$PR_NUMBER/$PR_NUMBER/g" .github/dependabot-review-prompt.md'),
+    'review prompt-load must substitute the literal PR number');
+  assert.ok(wf.includes('sed "s/\\$PR_NUMBER/$PR_NUMBER/g" .github/dependabot-autofix-prompt.md'),
+    'autofix prompt-load must substitute the literal PR number');
+  assert.doesNotMatch(wf, /cat \.github\/dependabot-(review|autofix)-prompt\.md/,
+    'no prompt-load may cat the raw prompt — that leaves $PR_NUMBER unexpanded → denied');
+});
