@@ -69,10 +69,15 @@
       - name: Load the autofix prompt
         id: load_prompt
         if: steps.pr.outputs.skip != 'true'
+        env:
+          # Bake the LITERAL PR number in — same reason as the review job: Claude Code
+          # 2.1.207+ denies allowlisted Bash commands that contain a `$VAR` expansion,
+          # so the agent must see `gh pr comment 123`, not `gh pr comment $PR_NUMBER`.
+          PR_NUMBER: ${{ steps.pr.outputs.pr_number }}
         run: |
           {
             echo 'prompt<<PROMPT_EOF_9Z3Q'
-            cat .github/dependabot-autofix-prompt.md
+            sed "s/\$PR_NUMBER/$PR_NUMBER/g" .github/dependabot-autofix-prompt.md
             echo 'PROMPT_EOF_9Z3Q'
           } >> "$GITHUB_OUTPUT"
 
