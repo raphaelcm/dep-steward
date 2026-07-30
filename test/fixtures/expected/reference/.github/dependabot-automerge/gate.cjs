@@ -27,10 +27,14 @@
  *   - PR_COMMENTS_JSON (singleton path only): JSON array as produced by
  *     `gh pr view <n> --json comments --jq '.comments'`; empty / missing on
  *     group-PR runs.
+ *   - ALLOWED_MERGE_METHODS: comma-separated subset of `merge,squash,rebase`
+ *     that this repo actually permits, resolved by the workflow from BOTH
+ *     restriction layers (repo settings and the default branch's ruleset).
  *
- * Output (stdout): `decision=merge|skip` then `reason=<text>`. Exit is always
- * 0 — the decision is the contract, not the exit code (keeps `set -e`
- * callers simple).
+ * Output (stdout): `decision=merge|skip`, `reason=<text>`, and `method=` (the
+ * merge method, emitted on every call so the caller never computes it). Exit
+ * is always 0 — the decision is the contract, not the exit code (keeps
+ * `set -e` callers simple).
  */
 
 // One prefix per configured ecosystem: `dependabot/<branch-slug>/<group-name>-`.
@@ -122,6 +126,65 @@ function isWhitelistedPath(p) {
     if (re.test(p)) return true;
   }
   return false;
+}
+
+// ---- merge method ---------------------------------------------------------
+// The method is a deterministic function of (changed paths, what this repo
+// allows), so it lives here with the rest of the deterministic logic rather
+// than in the workflow's bash, where it could only be tested by grepping YAML.
+//
+// Preference is ordered, not fixed, because a repo can forbid any of the three
+// methods and the gate must pick the best one that is actually available:
+//
+//   workflow-touching PRs -> merge, then rebase, then squash.
+//     GITHUB_TOKEN can never hold the `workflows` permission, so an
+//     App-authored NEW commit that edits a workflow file is refused. A merge
+//     COMMIT authors no new commit — it preserves Dependabot's own — which is
+//     why it is the one method known to have worked here. A rebase keeps
+//     Dependabot as the author, but GitHub's docs say it "always updates the
+//     committer information and creates new commit SHAs", so it may be refused
+//     for the same reason; second, not first. A squash always produces an
+//     App-authored commit, so it is last and is expected to fail.
+//
+//   everything else -> squash, then rebase, then merge. Squash is the repo
+//     default and the shape every other PR lands in.
+//
+// Both restriction layers matter and they are independent: the repo-level
+// `mergeCommitAllowed`/`rebaseMergeAllowed`/`squashMergeAllowed` settings, AND
+// the default branch's ruleset, whose `pull_request` rule carries its own
+// `allowed_merge_methods`. Reading only the first is how a downstream install
+// concluded its repo forbade merge commits repo-wide and hardcoded `rebase`
+// around a restriction that lived in the ruleset and later went away. The
+// workflow resolves the intersection; this function just picks from it.
+const WORKFLOW_PATH_RE = /^\.github\/workflows\//;
+const PREF_WORKFLOW = ['merge', 'rebase', 'squash'];
+const PREF_DEFAULT = ['squash', 'rebase', 'merge'];
+const KNOWN_METHODS = new Set(['merge', 'squash', 'rebase']);
+
+// "We could not tell" and "nothing is allowed" are DIFFERENT answers and must
+// not collapse into one, so the empty string is reserved for the first: absent
+// or blank ALLOWED_MERGE_METHODS means the workflow's query failed. A repo that
+// genuinely permits nothing sends a non-empty value naming no known method
+// (the workflow sends `none`), which yields an empty list here.
+// Returns null for "unknown", or an array (possibly empty) for a real answer.
+function parseAllowedMethods(raw) {
+  const text = (raw || '').trim();
+  if (text === '') return null;
+  return text
+    .split(',')
+    .map((s) => s.trim().toLowerCase())
+    .filter((s) => KNOWN_METHODS.has(s));
+}
+
+// Returns the method name, or 'none' when the repo permits nothing — the caller
+// escalates on 'none' rather than passing an invalid flag to `gh`.
+// On "unknown" we take the head of the preference list and let GitHub refuse if
+// it must. That refusal reaches the workflow's escalate(), which reports the
+// real error — better than silently picking a method that may be wrong.
+function mergeMethodFor(changedPaths, allowedMethods) {
+  const pref = changedPaths.some((p) => WORKFLOW_PATH_RE.test(p)) ? PREF_WORKFLOW : PREF_DEFAULT;
+  if (allowedMethods === null) return pref[0];
+  return pref.find((m) => allowedMethods.includes(m)) || 'none';
 }
 
 function extractDecisionBlock(body) {
@@ -279,5 +342,14 @@ if ((process.env.GATE_MODE || '') === 'classify') {
 }
 
 const { decision, reason } = decide(process.env);
-process.stdout.write(`decision=${decision}\nreason=${reason}\n`);
+// `method=` is emitted on EVERY call, including `decision=skip`, so the caller
+// never has to compute it and the two can never disagree.
+const method = mergeMethodFor(
+  (process.env.CHANGED_PATHS || '')
+    .split('\n')
+    .map((s) => s.trim())
+    .filter(Boolean),
+  parseAllowedMethods(process.env.ALLOWED_MERGE_METHODS),
+);
+process.stdout.write(`decision=${decision}\nreason=${reason}\nmethod=${method}\n`);
 process.exit(0);

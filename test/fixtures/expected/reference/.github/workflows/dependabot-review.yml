@@ -26,6 +26,15 @@ name: Dependabot PR review
 #    actually be merged. The job checks out the DEFAULT branch (never the PR
 #    head) and runs no PR code — only `gh` metadata + the gate.
 #
+#    Once the gate authorizes, the job ARMS GitHub's native auto-merge rather
+#    than merging imperatively. A synchronous merge is a time-of-check /
+#    time-of-use race, and this job only wakes on a head change or a comment,
+#    so a refusal is never retried. Arming hands the timing to GitHub instead.
+#    A later `skip` disarms, so the armed state and the authorization can never
+#    disagree. Any failure after authorization is escalated (label + assignee +
+#    comment + red job), because a merge that fails silently is
+#    indistinguishable from one that never ran.
+#
 #  Two triggers handle the sequencing race between CI completion and the LLM
 #  posting its decision comment: whichever fires later (CI finishing or the
 #  comment appearing) wakes the gate. The gate re-derives all inputs each
@@ -60,6 +69,12 @@ jobs:
     permissions:
       contents: read
       pull-requests: write
+      # The prompt orders `gh pr checks` (Checks API) and `gh run view --log-failed`
+      # (Actions API), and both are allow-listed below — but a job-level permissions
+      # block makes every unlisted scope `none`, so without these two the agent 403s
+      # and reviews the PR blind.
+      checks: read
+      actions: read
       # Required by anthropics/claude-code-action for its OIDC flow.
       id-token: write
     concurrency:
@@ -91,7 +106,7 @@ jobs:
         id: review
         # SHA-pinned: the moving @v1 tag silently shipped a breaking bot-gate
         # change that broke this workflow. Bump deliberately, not implicitly.
-        uses: anthropics/claude-code-action@558b1d6cab4085c7753fe402c10bef0fbb92ac7a # v1.0.165
+        uses: anthropics/claude-code-action@be7b93b1907a4abad570368f3c74b6fe3807510b # v1.0.183
         env:
           PR_NUMBER: ${{ inputs.pr_number || github.event.pull_request.number }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -118,6 +133,33 @@ jobs:
           claude_args: >-
             --max-turns 60 --model claude-opus-4-8
             --allowedTools "Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr checks:*),Bash(gh pr edit:*),Bash(gh pr view:*),Bash(gh release view:*),Bash(gh run view:*),Bash(gh run list:*),Bash(grep:*),Read,Grep,Glob,WebFetch,Write"
+
+      - name: Diagnose the review agent (tool calls + denials + error)
+        # claude-code-action writes the full turn-by-turn log to execution_file but
+        # NEVER surfaces it — the run log shows only is_error, never WHY. This prints
+        # what the agent actually tried, which tool calls were DENIED, and its final
+        # error, so a failure is legible instead of an opaque escalation. It runs on
+        # every review, not just failing ones: a DENIED tool call is how a review
+        # silently degrades while still reporting success (that is how the 2.1.207
+        # tool-permission breakage was found, and how a missing `checks: read` looks).
+        if: ${{ !cancelled() }}
+        env:
+          EXEC_FILE: ${{ steps.review.outputs.execution_file }}
+        run: |
+          set -uo pipefail
+          if [ -z "${EXEC_FILE:-}" ] || [ ! -f "$EXEC_FILE" ]; then
+            echo "No execution file at '${EXEC_FILE:-<empty>}' — the action produced no run log (agent may not have started)."
+            exit 0
+          fi
+          echo "===== result summary ====="
+          jq -rs '[.. | objects | select(.type? == "result")] | (.[0] // {}) | {is_error, subtype, num_turns, permission_denials_count, total_cost_usd, result}' "$EXEC_FILE" 2>/dev/null || echo "(jq failed)"
+          echo "===== tool calls the agent attempted ====="
+          jq -rs '[.. | objects | select(.type? == "tool_use")] | .[] | "TRY [" + (.name // "?") + "] " + (((.input.command // .input.file_path // .input.pattern // (.input|tostring)) | tostring)[0:220])' "$EXEC_FILE" 2>/dev/null || echo "(none / jq failed)"
+          echo "===== tool results that were errors/denials ====="
+          jq -rs '[.. | objects | select(.type? == "tool_result" and .is_error? == true)] | .[] | "ERR " + (((.content | if type=="array" then (map(.text? // (.|tostring)) | join(" ")) else (.|tostring) end) | tostring)[0:300])' "$EXEC_FILE" 2>/dev/null || echo "(none / jq failed)"
+          echo "===== raw denial/permission lines (fallback) ====="
+          grep -aoiE '(permission[^"]{0,90}|denied[^"]{0,90}|not allowed[^"]{0,90}|requested permission[^"]{0,130})' "$EXEC_FILE" 2>/dev/null | sort -u | head -20 || true
+          echo "=========================================="
 
       - name: Assert the review deliverable exists (V1 block posted)
         # claude-code-action can exit 0 without running at all: its OIDC token
@@ -273,6 +315,73 @@ jobs:
           echo "ci_conclusion=$CI_CONCLUSION" >> "$GITHUB_OUTPUT"
           echo "CI conclusion for $HEAD_SHA: $CI_CONCLUSION"
 
+      - name: Resolve the merge methods this repo actually allows
+        if: steps.pr.outputs.skip != 'true'
+        id: methods
+        # A capability probe: reads settings, writes one output, touches nothing.
+        # Two INDEPENDENT layers can forbid a merge method, and reading only the
+        # first is a real trap — a downstream install once concluded its repo
+        # banned merge commits repo-wide and hardcoded `rebase` around a
+        # restriction that actually lived in the ruleset, and later went away.
+        #   1. repo settings: mergeCommitAllowed / rebaseMergeAllowed / squashMergeAllowed
+        #   2. the default branch's ruleset: the `pull_request` rule's own
+        #      `allowed_merge_methods` (absent = the rule imposes no restriction)
+        # The gate gets the INTERSECTION. Either query failing leaves the value
+        # empty, which the gate reads as "could not tell" and handles by trying
+        # its first choice — a refusal there is loud, via escalate() below.
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -uo pipefail
+          # The `ok:` prefix is load-bearing: it separates "the query worked and
+          # the answer is nothing" from "the query failed". Both would otherwise
+          # be the empty string, and conflating them is how a gate ends up
+          # confidently acting on a setting it never actually read.
+          REPO_RAW=$(gh repo view "$REPO" \
+            --json mergeCommitAllowed,rebaseMergeAllowed,squashMergeAllowed \
+            --jq '"ok:" + ([(if .mergeCommitAllowed then "merge" else empty end),
+                            (if .squashMergeAllowed then "squash" else empty end),
+                            (if .rebaseMergeAllowed then "rebase" else empty end)] | join(","))' \
+            2>/dev/null || echo "")
+          if [ -z "$REPO_RAW" ]; then
+            echo "Could not read this repo's merge settings — leaving the method unknown; the gate takes its first choice and escalates if GitHub refuses."
+            echo "allowed_merge_methods=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          REPO_METHODS="${REPO_RAW#ok:}"
+          # Both trigger payloads carry `repository`, but an empty value here
+          # would silently skip the ruleset layer entirely — reading one of the
+          # two restriction layers and believing it is the whole answer is the
+          # exact failure this step exists to prevent. So re-derive rather than
+          # trust the payload shape.
+          [ -n "$DEFAULT_BRANCH" ] || DEFAULT_BRANCH=$(gh repo view "$REPO" \
+            --json defaultBranchRef --jq '.defaultBranchRef.name' 2>/dev/null || echo "")
+          # No `pull_request` rule, a rule that sets no allowed_merge_methods, or
+          # a failed query all mean the same thing HERE — do not narrow — so
+          # collapsing them is safe, unlike above.
+          RULE_METHODS=$(gh api "repos/$REPO/rules/branches/$DEFAULT_BRANCH" \
+            --jq '[.[] | select(.type=="pull_request")
+                       | .parameters.allowed_merge_methods // empty] | first // [] | join(",")' \
+            2>/dev/null || echo "")
+          if [ -z "$RULE_METHODS" ]; then
+            ALLOWED="$REPO_METHODS"
+          else
+            ALLOWED=''
+            for m in merge squash rebase; do
+              case ",$REPO_METHODS," in *",$m,"*) ;; *) continue ;; esac
+              case ",$RULE_METHODS," in *",$m,"*) ;; *) continue ;; esac
+              ALLOWED="${ALLOWED:+$ALLOWED,}$m"
+            done
+          fi
+          # A real "nothing allowed" answer must stay distinguishable from a
+          # failed query, so send a non-empty token the gate reads as an empty
+          # set rather than as silence.
+          [ -n "$ALLOWED" ] || ALLOWED=none
+          echo "allowed_merge_methods=$ALLOWED" >> "$GITHUB_OUTPUT"
+          echo "Repo allows: '$REPO_METHODS'; ruleset allows: '${RULE_METHODS:-(unrestricted)}'; effective: '$ALLOWED'"
+
       - name: Deterministic auto-merge gate
         if: steps.pr.outputs.skip != 'true'
         env:
@@ -281,6 +390,7 @@ jobs:
           PR_NUMBER: ${{ steps.pr.outputs.pr_number }}
           HEAD_BRANCH: ${{ steps.pr.outputs.head_branch }}
           CI_CONCLUSION: ${{ steps.ci.outputs.ci_conclusion }}
+          ALLOWED_MERGE_METHODS: ${{ steps.methods.outputs.allowed_merge_methods }}
         run: |
           set -euo pipefail
           PR_JSON=$(gh pr view "$PR_NUMBER" --repo "$REPO" \
@@ -291,28 +401,107 @@ jobs:
           CHANGED_PATHS=$(gh pr diff "$PR_NUMBER" --repo "$REPO" --name-only)
 
           export HEAD_BRANCH CI_CONCLUSION PR_AUTHOR PR_STATE CHANGED_PATHS PR_COMMENTS_JSON
+          export ALLOWED_MERGE_METHODS
           GATE_OUT=$(node .github/dependabot-automerge/gate.cjs)
           echo "$GATE_OUT"
           DECISION=$(echo "$GATE_OUT" | sed -n 's/^decision=//p')
           REASON=$(echo "$GATE_OUT" | sed -n 's/^reason=//p')
+          # The merge method is deterministic logic over the changed paths and
+          # what this repo allows, so gate.cjs owns it. This step never computes it.
+          METHOD=$(echo "$GATE_OUT" | sed -n 's/^method=//p')
 
-          if [ "$DECISION" = "merge" ]; then
-            # GitHub refuses an App-authored commit that updates workflow files
-            # (GITHUB_TOKEN can never hold the `workflows` permission, and the
-            # check began firing on squash merges of workflow-touching PRs
-            # (e.g. an actions/checkout major bump). A true merge commit
-            # preserves Dependabot's own authored commits, so the workflow
-            # change is attributed to Dependabot, not the App. Method is
-            # computed here from the changed paths, deterministically.
-            MERGE_METHOD="--squash"
-            if grep -q '^\.github/workflows/' <<<"$CHANGED_PATHS"; then
-              MERGE_METHOD="--merge"
-              echo "PR touches .github/workflows/ — merging with a merge commit instead of squash."
-            fi
-            echo "Auto-merging PR #$PR_NUMBER ($REASON)"
-            gh pr merge "$PR_NUMBER" --repo "$REPO" "$MERGE_METHOD" --delete-branch
-          else
+          if [ "$DECISION" != "merge" ]; then
             echo "Not auto-merging PR #$PR_NUMBER — left for human review ($REASON)"
+            # Arming is a latch, and the gate is re-derived on every wake, so a
+            # later `skip` MUST revoke an earlier `merge`. Otherwise a singleton
+            # whose LLM posts a superseding `escalate` verdict, or whose CI goes
+            # red on a new push, stays armed to merge itself while gate.cjs is
+            # saying no.
+            #
+            # Fails CLOSED. A failed or empty query yields "unknown", which
+            # disarms rather than skipping: leaving a PR armed when we cannot
+            # tell is the outcome that merges against the gate's wishes. The
+            # `|| true` is on the query, so `set -e` cannot abort the step
+            # before the disarm runs.
+            ARMED_BY=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json autoMergeRequest \
+              --jq '.autoMergeRequest.enabledBy.login // "none"' 2>/dev/null || echo "unknown")
+            # An empty answer is "we could not tell", not "nobody armed it": the
+            # jq default only covers a well-formed response, so a truncated or
+            # empty one has to be normalised here or the case below reads it as
+            # `none` and skips the disarm.
+            [ -n "$ARMED_BY" ] || ARMED_BY="unknown"
+            # `case` patterns are GLOBS, so an unquoted github-actions[bot] is a
+            # character class matching `github-actionsb`/`github-actionso`/... and
+            # NOT the literal login. Quoting makes it literal.
+            case "$ARMED_BY" in
+              none)
+                ;;
+              'app/github-actions'|'github-actions[bot]'|unknown)
+                echo "Auto-merge was armed (by '$ARMED_BY') but the gate now says skip — disarming."
+                gh pr merge "$PR_NUMBER" --repo "$REPO" --disable-auto || true
+                ;;
+              *)
+                # A person armed this deliberately. Revoking a human's explicit
+                # action silently is worse than leaving it: say so loudly and
+                # let them decide.
+                echo "::warning::PR #$PR_NUMBER is armed for auto-merge by '$ARMED_BY' (a human), but the gate says skip ($REASON). Leaving their auto-merge in place."
+                ;;
+            esac
+            exit 0
+          fi
+
+          # Past this line the gate has AUTHORIZED the merge, so every remaining
+          # failure is an execution failure, not a policy decision, and it gets
+          # escalated to a human instead of dying as a red job on a workflow
+          # nobody watches. A merge that fails silently is indistinguishable
+          # from one that never ran — which is how a PR sits for days with green
+          # CI and a correct `decision=merge` behind it.
+          escalate() {
+            echo "::error::dep-steward could not merge PR #$PR_NUMBER: $1"
+            BODY=$(printf '%s\n' \
+              '## dep-steward could not complete the merge' \
+              '' \
+              'The deterministic gate **authorized** this merge:' \
+              '' \
+              '```' \
+              "$REASON" \
+              '```' \
+              '' \
+              'Execution then failed:' \
+              '' \
+              '```' \
+              "$1" \
+              '```' \
+              '' \
+              'This is an execution failure, not a policy decision. The gate said yes and GitHub refused.')
+            gh pr comment "$PR_NUMBER" --repo "$REPO" --body "$BODY" || true
+            gh pr edit "$PR_NUMBER" --repo "$REPO" --add-label needs-human-review --add-assignee octocat || true
+            exit 1
+          }
+
+          if [ "$METHOD" = "none" ]; then
+            escalate "this repository permits no merge method (checked both the repo settings and the default branch's ruleset), so there is nothing to arm. Enable at least one of merge/squash/rebase."
+          fi
+
+          # Arm GitHub's native auto-merge rather than merging imperatively.
+          #
+          # A synchronous merge is a time-of-check/time-of-use race: the gate
+          # reads CI, then asks GitHub to merge, and anything that changes
+          # mergeability in between turns into a refusal with no retry, because
+          # this job only wakes on a head change or a comment. `gh`'s own error
+          # text for the classic version of this ("the head branch is not up to
+          # date with the base branch") says to add `--auto`.
+          #
+          # `--auto` is declarative WHERE IT MATTERS. gh downgrades it to an
+          # immediate merge when the PR is already mergeable, which is the common
+          # case, and merging now is the wanted outcome there anyway. Its value is
+          # the other case: when something is still pending or blocked, GitHub
+          # holds the request and merges the moment every requirement is
+          # satisfied, instead of the step failing with no retry. Re-arming an
+          # already-armed PR is a no-op, so repeated wakes are safe.
+          echo "Arming auto-merge on PR #$PR_NUMBER, method $METHOD ($REASON)"
+          if ! ARM_OUT=$(gh pr merge "$PR_NUMBER" --repo "$REPO" --auto "--$METHOD" --delete-branch 2>&1); then
+            escalate "enabling auto-merge (--$METHOD) failed: $ARM_OUT"
           fi
 
   autofix:
@@ -338,6 +527,14 @@ jobs:
     permissions:
       contents: write
       pull-requests: write
+      # The prompt orders `gh pr checks` (Checks API) and `gh run view --log-failed`
+      # (Actions API), and both are allow-listed below — but a job-level permissions
+      # block makes every unlisted scope `none`, so without these two the agent 403s
+      # and reviews the PR blind. Worse here than in the review job: this job fires
+      # ONLY on a CI failure, so reading that failure is its whole first step.
+      checks: read
+      actions: read
+      # Required by anthropics/claude-code-action for its OIDC flow.
       id-token: write
     concurrency:
       group: dependabot-autofix-${{ github.event.workflow_run.head_branch }}
@@ -401,7 +598,7 @@ jobs:
         id: fixer
         if: steps.pr.outputs.skip != 'true'
         # SHA-pinned, same as the review job — bump deliberately, not implicitly.
-        uses: anthropics/claude-code-action@558b1d6cab4085c7753fe402c10bef0fbb92ac7a # v1.0.165
+        uses: anthropics/claude-code-action@be7b93b1907a4abad570368f3c74b6fe3807510b # v1.0.183
         env:
           PR_NUMBER: ${{ steps.pr.outputs.pr_number }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

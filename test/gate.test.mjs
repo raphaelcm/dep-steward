@@ -53,7 +53,8 @@ function runGate(env) {
   const raw = execFileSync('node', [GATE], { env: { ...process.env, ...env }, encoding: 'utf8' });
   const decision = /^decision=(\w+)$/m.exec(raw)?.[1] ?? '';
   const reason = /^reason=(.*)$/m.exec(raw)?.[1] ?? '';
-  return { decision, reason, raw };
+  const method = /^method=(\w+)$/m.exec(raw)?.[1] ?? '';
+  return { decision, reason, method, raw };
 }
 
 // Classify mode (GATE_MODE=classify): the review workflow's deliverable-
@@ -308,6 +309,71 @@ test('docker whitelist is conservative: a k8s YAML image bump is NOT auto-merged
     CHANGED_PATHS: 'k8s/deploy.yaml',
   });
   assert.equal(decision, 'skip');
+});
+
+// ---- Merge method: derived from the changed paths AND what this repo allows ----
+//
+// The method used to be computed in the workflow's bash, where the only way to
+// test it was grepping YAML, and a downstream install consequently hardcoded
+// `rebase` around a repo-specific restriction that later went away. It is
+// deterministic logic over two inputs, so it lives in the gate and is tested here.
+//
+// Preference is ORDERED, not fixed:
+//   workflow-touching -> merge, rebase, squash. GITHUB_TOKEN can never hold the
+//     `workflows` permission, so an App-authored NEW commit editing a workflow
+//     file is refused. A merge commit authors none; a rebase rewrites SHAs and
+//     may be refused for the same reason; a squash always is.
+//   everything else   -> squash, rebase, merge (squash is the repo default).
+
+const ALL_METHODS = 'merge,squash,rebase';
+const WF_PATHS = '.github/workflows/ci.yml';
+const WF_BRANCH = 'dependabot/github_actions/actions-minor-patch-a';
+
+for (const [label, changedPaths, headBranch, allowed, want] of [
+  ['workflow-touching + everything allowed prefers a merge commit', WF_PATHS, WF_BRANCH, ALL_METHODS, 'merge'],
+  ['workflow-touching without merge commits falls to rebase', WF_PATHS, WF_BRANCH, 'squash,rebase', 'rebase'],
+  ['workflow-touching with only squash left takes squash', WF_PATHS, WF_BRANCH, 'squash', 'squash'],
+  ['a routine bump prefers squash', 'package.json', OK_NPM.HEAD_BRANCH, ALL_METHODS, 'squash'],
+  ['a routine bump without squash falls to rebase', 'package.json', OK_NPM.HEAD_BRANCH, 'merge,rebase', 'rebase'],
+  ['a routine bump with only merge commits takes merge', 'package.json', OK_NPM.HEAD_BRANCH, 'merge', 'merge'],
+  ['a mixed PR touching any workflow file uses the workflow preference', 'package.json\n.github/workflows/ci.yml', WF_BRANCH, ALL_METHODS, 'merge'],
+]) {
+  test(`method: ${label}`, () => {
+    const { method } = runGate({
+      ...BASE, HEAD_BRANCH: headBranch, CHANGED_PATHS: changedPaths, ALLOWED_MERGE_METHODS: allowed,
+    });
+    assert.equal(method, want);
+  });
+}
+
+test('method: a repo that allows nothing yields "none", so the caller escalates instead of passing an invalid flag', () => {
+  const { method } = runGate({ ...OK_NPM, ALLOWED_MERGE_METHODS: 'none' });
+  assert.equal(method, 'none');
+});
+
+test('method: an unreadable setting is NOT "nothing allowed" — it takes the first choice and lets GitHub refuse loudly', () => {
+  // The empty string is reserved for "the workflow could not read the setting".
+  // Collapsing that into "nothing is allowed" would strand every PR on a
+  // transient API blip; collapsing it the other way would act on a setting we
+  // never read. Both cases must stay distinguishable, so this asserts the
+  // fallback while the test above asserts the real empty set.
+  assert.equal(runGate({ ...OK_NPM, ALLOWED_MERGE_METHODS: '' }).method, 'squash');
+  const { method } = runGate({ ...BASE, HEAD_BRANCH: WF_BRANCH, CHANGED_PATHS: WF_PATHS, ALLOWED_MERGE_METHODS: '' });
+  assert.equal(method, 'merge');
+});
+
+test('method: unknown method names are ignored, not trusted', () => {
+  const { method } = runGate({ ...OK_NPM, ALLOWED_MERGE_METHODS: 'fast-forward,squash' });
+  assert.equal(method, 'squash');
+});
+
+test('method= is emitted on a skip too, so the caller never computes it', () => {
+  // The caller reads `method=` unconditionally. If the gate only printed it
+  // alongside `decision=merge`, the refusal path would silently parse an empty
+  // METHOD and the disarm branch would run with it.
+  const { decision, method } = runGate({ ...OK_NPM, CI_CONCLUSION: 'failure', ALLOWED_MERGE_METHODS: ALL_METHODS });
+  assert.equal(decision, 'skip');
+  assert.equal(method, 'squash');
 });
 
 // ---- Classify mode: group-ness for the deliverable-assertion. Same

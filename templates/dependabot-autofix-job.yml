@@ -22,6 +22,14 @@
     permissions:
       contents: write
       pull-requests: write
+      # The prompt orders `gh pr checks` (Checks API) and `gh run view --log-failed`
+      # (Actions API), and both are allow-listed below — but a job-level permissions
+      # block makes every unlisted scope `none`, so without these two the agent 403s
+      # and reviews the PR blind. Worse here than in the review job: this job fires
+      # ONLY on a CI failure, so reading that failure is its whole first step.
+      checks: read
+      actions: read
+      # Required by anthropics/claude-code-action for its OIDC flow.
       id-token: write
     concurrency:
       group: dependabot-autofix-${{ github.event.workflow_run.head_branch }}
@@ -85,7 +93,7 @@
         id: fixer
         if: steps.pr.outputs.skip != 'true'
         # SHA-pinned, same as the review job — bump deliberately, not implicitly.
-        uses: anthropics/claude-code-action@558b1d6cab4085c7753fe402c10bef0fbb92ac7a # v1.0.165
+        uses: anthropics/claude-code-action@be7b93b1907a4abad570368f3c74b6fe3807510b # v1.0.183
         env:
           PR_NUMBER: ${{ steps.pr.outputs.pr_number }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

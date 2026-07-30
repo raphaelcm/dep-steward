@@ -52,7 +52,13 @@ sh -c "$(curl -fsSL https://raw.githubusercontent.com/raphaelcm/dep-steward/main
         • singleton / MAJOR PR  → merge only if the model's block says
           recommendation=merge AND our_usage_affected=false
         • anything else / uncertain → leave it, label needs-human-review
+      it ARMS GitHub's native auto-merge rather than merging on the spot,
+      and DISARMS again if a later wake-up says no.
 ```
+
+**Arming, not merging.** Once the gate authorizes, it turns on GitHub's own auto-merge instead of merging immediately. A synchronous merge is a race — the gate reads CI, asks GitHub to merge, and anything that changes mergeability in between becomes a refusal with no retry, because the job only wakes on a new commit or a new comment. Arming hands the timing to GitHub, which merges the moment every requirement is met. Because arming is a latch and the gate re-derives everything on every wake-up, a later refusal **disarms**: a PR whose CI goes red, or whose review posts a superseding `escalate`, cannot stay armed to merge itself. If a human armed it, dep-steward says so and leaves their decision alone. And once the gate has said yes, any failure to execute is escalated to you — labelled, assigned, commented, red — because a merge that fails silently is indistinguishable from one that never ran.
+
+**The merge method is read off your repo, not assumed.** GitHub lets you forbid merge commits, squashes, or rebases in two independent places: the repository's own settings, and the default branch's ruleset. dep-steward reads both, intersects them, and picks the best method you actually allow — preferring a merge commit for PRs that touch `.github/workflows/` (a workflow edit needs a commit Dependabot authored, which only a merge commit preserves) and a squash for everything else. If you permit no method at all, it escalates instead of guessing.
 
 The whitelist + CI checks are **load-bearing**: even a maximally injection-compromised model cannot cause a merge that touches your `src/` or that breaks tests, because the gate applies those checks itself, ignoring anything the model says about them. See [SECURITY.md](SECURITY.md).
 
@@ -167,6 +173,7 @@ node --test test/*.test.mjs
 - `test/gate.test.mjs` — the gate's decision logic (rendered fresh from the templates, so it tests what actually ships).
 - `test/render.test.mjs` — render parity: the installer reproduces a known-good reference pipeline byte-for-byte.
 - `test/wiring.test.mjs` — the installer sets both secret stores, creates the label, and enables auto-merge (stubbed `gh`).
+- `test/permissions.test.mjs` — each agent job grants every GitHub scope the commands in its own prompt need, derived from the rendered workflow and prompt rather than hardcoded.
 
 ## License
 
