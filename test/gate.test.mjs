@@ -53,8 +53,9 @@ function runGate(env) {
   const raw = execFileSync('node', [GATE], { env: { ...process.env, ...env }, encoding: 'utf8' });
   const decision = /^decision=(\w+)$/m.exec(raw)?.[1] ?? '';
   const reason = /^reason=(.*)$/m.exec(raw)?.[1] ?? '';
+  const code = /^code=(\w+)$/m.exec(raw)?.[1] ?? '';
   const method = /^method=(\w+)$/m.exec(raw)?.[1] ?? '';
-  return { decision, reason, method, raw };
+  return { decision, reason, code, method, raw };
 }
 
 // Classify mode (GATE_MODE=classify): the review workflow's deliverable-
@@ -309,6 +310,94 @@ test('docker whitelist is conservative: a k8s YAML image bump is NOT auto-merged
     CHANGED_PATHS: 'k8s/deploy.yaml',
   });
   assert.equal(decision, 'skip');
+});
+
+// ---- Refusal codes: telling "not yet" from "never" ----
+//
+// `reason` is prose for a human reading the log; `code` is the stable identifier
+// the workflow branches on to decide whether a refusal reaches a person. They are
+// separate so the caller never re-parses prose to make that call.
+//
+// The distinction that matters: a refusal that will resolve on its own (CI still
+// running, review not posted yet) MUST stay silent, because the gate wakes on
+// every CI completion and every bot comment. One that never will has to reach
+// someone, or the PR is refused forever with nobody told.
+
+for (const [label, env, want] of [
+  ['a clean group PR', OK_NPM, 'ok_group'],
+  ['a clean singleton', OK_SINGLETON, 'ok_singleton'],
+  ['CI still running', { ...OK_NPM, CI_CONCLUSION: 'pending' }, 'ci_pending'],
+  ['CI not queried yet (empty)', { ...OK_NPM, CI_CONCLUSION: '' }, 'ci_pending'],
+  ['CI in progress', { ...OK_NPM, CI_CONCLUSION: 'in_progress' }, 'ci_pending'],
+  ['CI red', { ...OK_NPM, CI_CONCLUSION: 'failure' }, 'ci_failed'],
+  ['CI cancelled', { ...OK_NPM, CI_CONCLUSION: 'cancelled' }, 'ci_indeterminate'],
+  ['CI timed out', { ...OK_NPM, CI_CONCLUSION: 'timed_out' }, 'ci_indeterminate'],
+  ['CI awaiting approval', { ...OK_NPM, CI_CONCLUSION: 'action_required' }, 'ci_indeterminate'],
+  ['a source file in the diff', { ...OK_NPM, CHANGED_PATHS: 'package.json\nsrc/index.ts' }, 'paths_not_whitelisted'],
+  ['not a Dependabot PR', { ...OK_NPM, PR_AUTHOR: 'mallory' }, 'author_not_dependabot'],
+  ['the PR is closed', { ...OK_NPM, PR_STATE: 'MERGED' }, 'pr_not_open'],
+  ['an empty diff', { ...OK_NPM, CHANGED_PATHS: '' }, 'no_changed_paths'],
+  ['no verdict posted yet', { ...OK_NPM, HEAD_BRANCH: 'dependabot/npm_and_yarn/twilio-6.0.2' }, 'verdict_missing'],
+  ['the reviewer said escalate', {
+    ...OK_SINGLETON,
+    PR_COMMENTS_JSON: JSON.stringify([decisionComment({ ...VALID_DECISION, recommendation: 'escalate' })]),
+  }, 'verdict_escalate'],
+  ['the reviewer found affected usage', {
+    ...OK_SINGLETON,
+    PR_COMMENTS_JSON: JSON.stringify([decisionComment({ ...VALID_DECISION, our_usage_affected: true })]),
+  }, 'usage_affected'],
+]) {
+  test(`code: ${label} -> ${want}`, () => {
+    assert.equal(runGate(env).code, want);
+  });
+}
+
+// The three verdict-parsing failures all collapse to ONE code, because the
+// caller's question is the same for all of them: a trusted commenter posted
+// something the gate cannot read, and it never will be readable without a human.
+for (const [label, body] of [
+  ['malformed JSON inside the block', ['<!-- AUTOMERGE-DECISION-V1 -->', '{ not json', '<!-- /AUTOMERGE-DECISION-V1 -->'].join('\n')],
+  ['an unclosed block (truncated comment)', ['<!-- AUTOMERGE-DECISION-V1 -->', '{"recommendation":"merge"'].join('\n')],
+]) {
+  test(`code: ${label} -> verdict_malformed`, () => {
+    const { decision, code } = runGate({
+      ...OK_SINGLETON,
+      PR_COMMENTS_JSON: JSON.stringify([commentJson({ body })]),
+    });
+    assert.equal(decision, 'skip');
+    assert.equal(code, 'verdict_malformed');
+  });
+}
+
+test('code: a well-formed block missing a required field is verdict_malformed, not verdict_missing', () => {
+  // These must not collapse. `verdict_missing` is transient (the review may still
+  // be running) and is already owned by the review job's deliverable-assertion;
+  // `verdict_malformed` is terminal and owned by nobody. Treating this as
+  // "missing" would route a permanent failure into the silent branch.
+  const { code } = runGate({
+    ...OK_SINGLETON,
+    PR_COMMENTS_JSON: JSON.stringify([decisionComment({ recommendation: 'merge' })]),
+  });
+  assert.equal(code, 'verdict_malformed');
+});
+
+test('code: every refusal carries one, and it is never empty', () => {
+  // An empty code would fall through the workflow's `case` into silence, which
+  // is the failure this whole mechanism exists to prevent — so a new refusal
+  // path that forgets its code has to fail here rather than go quiet in prod.
+  for (const env of [
+    OK_NPM,
+    { ...OK_NPM, CI_CONCLUSION: 'failure' },
+    { ...OK_NPM, PR_AUTHOR: 'mallory' },
+    { ...OK_NPM, PR_STATE: 'CLOSED' },
+    { ...OK_NPM, CHANGED_PATHS: '' },
+    { ...OK_NPM, CHANGED_PATHS: 'src/x.ts' },
+    { ...OK_NPM, HEAD_BRANCH: 'dependabot/npm_and_yarn/twilio-6.0.2' },
+    OK_SINGLETON,
+  ]) {
+    const { code } = runGate(env);
+    assert.match(code, /^[a-z_]+$/, `empty or malformed code for ${JSON.stringify(env.HEAD_BRANCH)}`);
+  }
 });
 
 // ---- Merge method: derived from the changed paths AND what this repo allows ----

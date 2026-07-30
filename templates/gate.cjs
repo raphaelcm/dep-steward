@@ -31,10 +31,16 @@
  *     that this repo actually permits, resolved by the workflow from BOTH
  *     restriction layers (repo settings and the default branch's ruleset).
  *
- * Output (stdout): `decision=merge|skip`, `reason=<text>`, and `method=` (the
- * merge method, emitted on every call so the caller never computes it). Exit
- * is always 0 — the decision is the contract, not the exit code (keeps
- * `set -e` callers simple).
+ * Output (stdout): `decision=merge|skip`, `reason=<text>`, `code=<stable-id>`,
+ * and `method=` (the merge method, emitted on every call so the caller never
+ * computes it). Exit is always 0 — the decision is the contract, not the exit
+ * code (keeps `set -e` callers simple).
+ *
+ * `reason` is prose for a human reading the log; `code` is the stable
+ * identifier the workflow branches on. They are separate because the caller
+ * needs to distinguish "not yet" from "never" — a refusal that will resolve
+ * itself must stay silent, and one that never will has to reach a person — and
+ * re-parsing prose to decide that is how a notifier goes wrong.
  */
 
 // One prefix per configured ecosystem: `dependabot/<branch-slug>/<group-name>-`.
@@ -219,6 +225,24 @@ function findLatestDecision(commentsJson) {
   return { decision: parsed };
 }
 
+// CI conclusions, in three classes. The split exists because the caller must
+// tell "not yet" from "never", and `gh run list` reports both plus a middle
+// group that is neither.
+//
+//   PENDING       nothing has concluded yet. Always silent — the gate will be
+//                 woken again when it does.
+//   INDETERMINATE concluded, but not with a verdict about the code: a run
+//                 someone cancelled, one that timed out, one awaiting manual
+//                 approval. A new push re-runs CI and re-wakes the gate, so
+//                 these resolve themselves more often than not. Deliberately
+//                 NOT escalatable: a new code defaults to silence rather than
+//                 noise, and a false ping teaches you to ignore the label.
+//                 Documented as a known gap; revisit if one is seen stranding
+//                 a PR in practice.
+//   anything else is a real failure -> `ci_failed`.
+const CI_PENDING = new Set(['', 'pending', 'queued', 'in_progress', 'waiting', 'requested']);
+const CI_INDETERMINATE = new Set(['cancelled', 'timed_out', 'action_required', 'neutral', 'skipped', 'stale']);
+
 function decide(env) {
   const headBranch = (env.HEAD_BRANCH || '').trim();
   const ciConclusion = (env.CI_CONCLUSION || '').trim();
@@ -230,17 +254,30 @@ function decide(env) {
     .filter(Boolean);
 
   // Common preconditions — apply to every path, before any branch logic.
+  // The first two and `no_changed_paths` are ANOMALIES, not stuck PRs: they
+  // mean the gate is looking at something it has no business acting on. They
+  // stay silent on purpose — paging a human about someone else's PR, or about
+  // one already closed, is noise that trains you to ignore the label.
   if (!DEPENDABOT_AUTHORS.has(prAuthor)) {
-    return { decision: 'skip', reason: `author is "${prAuthor}", not dependabot` };
+    return { decision: 'skip', code: 'author_not_dependabot', reason: `author is "${prAuthor}", not dependabot` };
   }
   if (prState !== 'OPEN') {
-    return { decision: 'skip', reason: `PR state is ${prState || '(empty)'}, not OPEN` };
+    return { decision: 'skip', code: 'pr_not_open', reason: `PR state is ${prState || '(empty)'}, not OPEN` };
   }
   if (ciConclusion !== 'success') {
-    return { decision: 'skip', reason: `CI conclusion is ${ciConclusion || '(empty)'}, not success` };
+    const ciCode = CI_PENDING.has(ciConclusion)
+      ? 'ci_pending'
+      : CI_INDETERMINATE.has(ciConclusion)
+        ? 'ci_indeterminate'
+        : 'ci_failed';
+    return {
+      decision: 'skip',
+      code: ciCode,
+      reason: `CI conclusion is ${ciConclusion || '(empty)'}, not success`,
+    };
   }
   if (changedPaths.length === 0) {
-    return { decision: 'skip', reason: 'no changed paths reported (anomalous PR)' };
+    return { decision: 'skip', code: 'no_changed_paths', reason: 'no changed paths reported (anomalous PR)' };
   }
   // Whitelist is the load-bearing injection-safety gate: it rejects any PR
   // that changes a file outside the dependency/workflow surface, regardless
@@ -248,8 +285,14 @@ function decide(env) {
   // paths so that an injection-compromised LLM cannot smuggle source changes.
   const offending = changedPaths.filter((p) => !isWhitelistedPath(p));
   if (offending.length > 0) {
+    // Terminal on sight: the paths cannot change without a new push, and if one
+    // came the gate would be re-run anyway. Nothing else sees this — the review
+    // job's deliverable-assertion SKIPS group PRs by design, and autofix needs a
+    // CI failure, so a group PR with green CI touching a source file falls
+    // between all three notifiers.
     return {
       decision: 'skip',
+      code: 'paths_not_whitelisted',
       reason: `changed path(s) outside whitelist: ${offending.join(', ')}`,
     };
   }
@@ -259,6 +302,7 @@ function decide(env) {
   if (matchedPrefix) {
     return {
       decision: 'merge',
+      code: 'ok_group',
       reason: `minor/patch group "${matchedPrefix}", CI success, ${changedPaths.length} whitelisted path(s)`,
     };
   }
@@ -266,33 +310,47 @@ function decide(env) {
   // Singleton / major path: require a valid V1 decision from a trusted commenter.
   const decisionResult = findLatestDecision(env.PR_COMMENTS_JSON);
   if (decisionResult.error) {
+    // Terminal, and NOTHING else catches it. The review job's assertion greps
+    // only for the OPENING marker, so a comment carrying the marker with
+    // truncated or malformed JSON inside passes that check green — review
+    // SUCCESS, no label, no assignee — while the gate refuses that same comment
+    // on every wake, forever. The PR looks reviewed and never merges.
     return {
       decision: 'skip',
+      code: 'verdict_malformed',
       reason: `singleton/major: ${decisionResult.error}`,
     };
   }
   if (!decisionResult.decision) {
+    // NOT terminal on sight: the review may still be running. When it truly
+    // never posts, the review job's deliverable-assertion labels, assigns, and
+    // goes red — so this one already has an owner and must not double-notify.
     return {
       decision: 'skip',
+      code: 'verdict_missing',
       reason:
         'singleton/major: no AUTOMERGE-DECISION-V1 block found in trusted commenter comments (LLM review may still be running, or no recommendation was posted)',
     };
   }
   const llmDecision = decisionResult.decision;
   if (llmDecision.recommendation !== 'merge') {
+    // The reviewer decided a human is needed and labels the PR itself.
     return {
       decision: 'skip',
+      code: 'verdict_escalate',
       reason: `singleton/major: LLM recommendation is "${llmDecision.recommendation}", not "merge"`,
     };
   }
   if (llmDecision.our_usage_affected !== false) {
     return {
       decision: 'skip',
+      code: 'usage_affected',
       reason: 'singleton/major: LLM reports our_usage_affected=true (escalate for human review)',
     };
   }
   return {
     decision: 'merge',
+    code: 'ok_singleton',
     reason: `singleton/major "${headBranch}", LLM merge recommendation + our_usage_affected=false, CI success, ${changedPaths.length} whitelisted path(s)`,
   };
 }
@@ -310,7 +368,7 @@ if ((process.env.GATE_MODE || '') === 'classify') {
   process.exit(0);
 }
 
-const { decision, reason } = decide(process.env);
+const { decision, reason, code } = decide(process.env);
 // `method=` is emitted on EVERY call, including `decision=skip`, so the caller
 // never has to compute it and the two can never disagree.
 const method = mergeMethodFor(
@@ -320,5 +378,7 @@ const method = mergeMethodFor(
     .filter(Boolean),
   parseAllowedMethods(process.env.ALLOWED_MERGE_METHODS),
 );
-process.stdout.write(`decision=${decision}\nreason=${reason}\nmethod=${method}\n`);
+// `code=` follows `reason=` so the existing `sed -n 's/^decision=//p'` parsing
+// and gate.test.mjs's /^decision=(\w+)$/m both stay valid.
+process.stdout.write(`decision=${decision}\nreason=${reason}\ncode=${code}\nmethod=${method}\n`);
 process.exit(0);

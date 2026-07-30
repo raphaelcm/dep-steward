@@ -33,6 +33,12 @@ So a prompt-injected diff can at most flip the model's recommendation from `esca
 - **The agent jobs are granted only the read scopes their prompts require.** Each agent job's `permissions:` block is checked against the commands its prompt actually orders (`test/permissions.test.mjs`), so a scope is neither missing — which made the reviewer 403 on CI and review blind — nor quietly over-granted.
 - **CI is assumed required.** The gate trusts CI-green as authoritative. Make your CI check a required status check via branch protection so a human cannot merge around a red build either; the installer detects this and advises if it isn't set.
 
+## A refused PR is not a fixed PR
+
+The gate refusing is a safety outcome, not a resolution. A dependency the gate will not merge stays un-updated, and if that bump carried a security fix, you are still exposed — the difference is only that nothing unsafe was merged on your behalf.
+
+This matters because a silently-refused PR is indistinguishable from a dependency nobody needed to update. dep-steward therefore notifies you when a refusal can never resolve on its own (a path outside the whitelist, an unparseable review verdict), and stays quiet when it is merely "not yet" (CI still running, review not yet posted). Refusals it classifies as neither — a cancelled or timed-out CI run, an anomalous PR it should not act on — are **left silent by design**, so they will not reach you. Treat `is:open label:needs-human-review` as the list of PRs dep-steward has told you about, not as proof that everything else is healthy.
+
 ## Residual risks you own
 
 - **A genuinely benign-looking malicious minor/patch bump.** Group PRs merge on CI-green without a model review. This is the standard trade-off of any Dependabot auto-merge; the mitigation is a good test suite as your required CI, plus Dependabot's own compromised-version signals.

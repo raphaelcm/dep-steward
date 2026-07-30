@@ -217,6 +217,22 @@ compute_assign() {
 }
 compute_assign
 
+# Which gate refusal codes escalate to a human. `ci_failed` belongs to exactly
+# ONE owner, decided here rather than at runtime: when CI goes red, the autofix
+# job and the auto-merge gate wake from the SAME workflow_run event and run in
+# parallel, so if both could escalate you would be paged about a red build the
+# fixer is already fixing. With autofix on, autofix owns it (and escalates
+# deterministically when it declines, rather than relying on the agent to label
+# itself). With autofix off, nothing else is watching CI, so the gate owns it.
+# Only the taken branch is rendered — the workflow carries no conditional.
+if [ "$AUTOFIX" -eq 1 ]; then
+  ESCALATABLE_CODES='paths_not_whitelisted|verdict_malformed'
+  ESCALATABLE_NOTE='ci_failed is absent: the autofix job owns it. It wakes on this same event and escalates itself when it cannot fix the build.'
+else
+  ESCALATABLE_CODES='paths_not_whitelisted|verdict_malformed|ci_failed'
+  ESCALATABLE_NOTE='ci_failed IS here: autofix is off, so no other job is watching CI and a red build would otherwise strand silently.'
+fi
+
 # ---- render helpers --------------------------------------------------------
 # CI name token for `gh run list --workflow X`: bare when safe, else quoted.
 ci_runlist_token() {
@@ -246,11 +262,15 @@ render_workflow() {
   crt=$(ci_runlist_token "$CI_NAME")
   frag=''
   if [ "$AUTOFIX" -eq 1 ]; then frag=$(cat "$SRC/templates/dependabot-autofix-job.yml"); fi
+  # ESCALATABLE_CODES contains `|` (it renders a shell `case` pattern), so that
+  # one substitution needs a delimiter the value cannot contain.
   inject '#__AUTOFIX_JOB__' "$frag" < "$SRC/templates/dependabot-review.yml" \
     | sed -e "s|__CI_NAME__|$CI_NAME|g" \
           -e "s|__CI_RUNLIST__|$crt|g" \
           -e "s|__MODEL__|$MODEL|g" \
           -e "s|__GATE_PATH__|$GATE_PATH|g" \
+          -e "s|__ESCALATABLE_NOTE__|$ESCALATABLE_NOTE|g" \
+          -e "s,__ESCALATABLE_CODES__,$ESCALATABLE_CODES,g" \
           -e "s|__ASSIGN_FLAG__|$ASSIGN_FLAG|g"
 }
 
