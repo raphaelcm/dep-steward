@@ -127,17 +127,41 @@
             echo "The fixer made no edits."
             # Distinguish "agent genuinely found nothing" from "agent never ran" (e.g.
             # an invalid token). Without this, a 401 looks identical to a clean no-op.
+            DETAIL='It found nothing it could safely fix.'
             if [ -n "${EXEC_FILE:-}" ] && [ -f "$EXEC_FILE" ]; then
               AGENT_ERR=$(jq -rs '[.. | objects | select(.is_error == true) | (.result // .error)] | map(select(. != null)) | .[0] // empty' "$EXEC_FILE" 2>/dev/null || true)
               if [ -n "$AGENT_ERR" ]; then
                 echo "The fixer agent errored (so it could not attempt a fix): $AGENT_ERR"
+                DETAIL="The fixer could not run, so the build was never diagnosed: $AGENT_ERR"
                 case "$AGENT_ERR" in
                   *'Invalid bearer token'*|*authentication*|*401*)
-                    echo "  -> CLAUDE_CODE_OAUTH_TOKEN is invalid or expired. Re-mint it with 'claude setup-token'." ;;
+                    echo "  -> CLAUDE_CODE_OAUTH_TOKEN is invalid or expired. Re-mint it with 'claude setup-token'."
+                    DETAIL="$DETAIL (CLAUDE_CODE_OAUTH_TOKEN looks invalid or expired — re-mint it with \`claude setup-token\` and re-run the installer.)" ;;
                 esac
-              else
-                echo "It escalated in its comment, or found nothing safe to do."
               fi
+            fi
+            # This job is the ONLY thing watching a red Dependabot build — the
+            # auto-merge gate deliberately stays quiet on ci_failed when autofix
+            # is on, precisely so you are not paged about a build being fixed.
+            # So when the fixer declines, the notification has to happen HERE and
+            # DETERMINISTICALLY. It used to depend on the agent choosing to label
+            # the PR itself, which its prompt asks for but nothing enforces: an
+            # agent that errored, or simply did not, left a red PR with nobody
+            # told. That is "covered sometimes", which is worse than not covered.
+            #
+            # Idempotent: this job wakes on every failing CI run, so re-label
+            # without re-commenting once the PR is already flagged.
+            if gh pr view "$PR_NUMBER" --repo "$REPO" --json labels --jq '.labels[].name' 2>/dev/null | grep -qxF 'needs-human-review'; then
+              echo "PR #$PR_NUMBER is already labelled needs-human-review — not commenting again."
+            else
+              echo "::warning::CI is failing on PR #$PR_NUMBER and autofix could not fix it — escalating."
+              gh pr comment "$PR_NUMBER" --repo "$REPO" --body "$(printf '%s\n' \
+                '## CI is failing and dep-steward could not fix it' \
+                '' \
+                "$DETAIL" \
+                '' \
+                'The deterministic gate will not merge a PR with a red build, so this one waits for a person.')" || true
+              gh pr edit "$PR_NUMBER" --repo "$REPO" --add-label needs-human-review__ASSIGN_FLAG__ || true
             fi
             exit 0
           fi

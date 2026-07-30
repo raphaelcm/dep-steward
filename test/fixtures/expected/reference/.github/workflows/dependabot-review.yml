@@ -393,11 +393,14 @@ jobs:
           ALLOWED_MERGE_METHODS: ${{ steps.methods.outputs.allowed_merge_methods }}
         run: |
           set -euo pipefail
+          # `labels` rides along on the query we already make — it costs nothing
+          # and is what keeps the escalation below idempotent.
           PR_JSON=$(gh pr view "$PR_NUMBER" --repo "$REPO" \
-            --json state,author,comments --jq '{state, author, comments}')
+            --json state,author,comments,labels --jq '{state, author, comments, labels}')
           PR_STATE=$(echo "$PR_JSON" | jq -r '.state')
           PR_AUTHOR=$(echo "$PR_JSON" | jq -r '.author.login')
           PR_COMMENTS_JSON=$(echo "$PR_JSON" | jq -c '.comments')
+          PR_LABELS=$(echo "$PR_JSON" | jq -r '.labels[].name')
           CHANGED_PATHS=$(gh pr diff "$PR_NUMBER" --repo "$REPO" --name-only)
 
           export HEAD_BRANCH CI_CONCLUSION PR_AUTHOR PR_STATE CHANGED_PATHS PR_COMMENTS_JSON
@@ -406,9 +409,21 @@ jobs:
           echo "$GATE_OUT"
           DECISION=$(echo "$GATE_OUT" | sed -n 's/^decision=//p')
           REASON=$(echo "$GATE_OUT" | sed -n 's/^reason=//p')
+          # `reason` is prose for the log; `code` is the stable identifier this
+          # step branches on. Re-parsing prose to decide whether to page someone
+          # is how a notifier goes wrong.
+          CODE=$(echo "$GATE_OUT" | sed -n 's/^code=//p')
           # The merge method is deterministic logic over the changed paths and
           # what this repo allows, so gate.cjs owns it. This step never computes it.
           METHOD=$(echo "$GATE_OUT" | sed -n 's/^method=//p')
+
+          # Label + assign + comment. Both callers below share it; they differ in
+          # whether the job then goes red, which is the real distinction between
+          # "dep-steward broke" and "dep-steward is correctly stuck".
+          notify_human() { # $1 = markdown body
+            gh pr comment "$PR_NUMBER" --repo "$REPO" --body "$1" || true
+            gh pr edit "$PR_NUMBER" --repo "$REPO" --add-label needs-human-review --add-assignee octocat || true
+          }
 
           if [ "$DECISION" != "merge" ]; then
             echo "Not auto-merging PR #$PR_NUMBER — left for human review ($REASON)"
@@ -447,6 +462,58 @@ jobs:
                 echo "::warning::PR #$PR_NUMBER is armed for auto-merge by '$ARMED_BY' (a human), but the gate says skip ($REASON). Leaving their auto-merge in place."
                 ;;
             esac
+
+            # Most refusals mean "not yet" — CI still running, review not posted —
+            # and the gate will be woken again. Those must stay silent. A few mean
+            # "never": nothing that can happen without a human will change the
+            # answer, so the gate would refuse this PR forever and tell no one.
+            # That is the defect this branch closes.
+            #
+            # An ALLOW-LIST, not a deny-list, so a code added later defaults to
+            # SILENCE. Wrong-silent is recoverable; wrong-noisy trains you to
+            # ignore the label, which costs you the next real one.
+            #
+            # Deliberately absent, each for a reason:
+            #   verdict_missing    the review job's assertion already labels,
+            #                      assigns and goes red — double-notifying is noise
+            #   verdict_escalate / usage_affected
+            #                      the reviewer labels the PR itself, by design
+            #   ci_pending         transient by definition
+            #   ci_indeterminate   cancelled / timed out / awaiting approval: a new
+            #                      push re-runs CI and re-wakes the gate, so these
+            #                      usually resolve themselves. Known gap, on
+            #                      purpose; revisit if one is seen stranding a PR.
+            #   author_not_dependabot / pr_not_open / no_changed_paths
+            #                      anomalies, not stuck PRs — the gate is looking at
+            #                      something it should not act on, and paging about
+            #                      someone else's PR or an already-closed one is
+            #                      exactly the noise that devalues the label
+            #
+            # ci_failed is absent: the autofix job owns it. It wakes on this same event and escalates itself when it cannot fix the build.
+            case "$CODE" in
+              paths_not_whitelisted|verdict_malformed)
+                # Fires once per PR, not once per wake: this job runs on every CI
+                # completion and every bot comment, so without the label check a
+                # stuck PR would collect a comment each time.
+                if grep -qxF 'needs-human-review' <<<"$PR_LABELS"; then
+                  echo "PR #$PR_NUMBER is already labelled needs-human-review — not commenting again ($CODE)."
+                else
+                  echo "::warning::PR #$PR_NUMBER cannot merge without a human ($CODE): $REASON"
+                  notify_human "$(printf '%s\n' \
+                    '## dep-steward cannot merge this PR on its own' \
+                    '' \
+                    'The deterministic gate refused it, and this refusal will not resolve by itself:' \
+                    '' \
+                    '```' \
+                    "$REASON" \
+                    '```' \
+                    '' \
+                    "Reason code: \`$CODE\`" \
+                    '' \
+                    'Nothing further will happen to this PR until a person acts. The gate will keep refusing it on every wake-up, and this notice is posted once.')"
+                fi
+                ;;
+            esac
             exit 0
           fi
 
@@ -458,7 +525,7 @@ jobs:
           # CI and a correct `decision=merge` behind it.
           escalate() {
             echo "::error::dep-steward could not merge PR #$PR_NUMBER: $1"
-            BODY=$(printf '%s\n' \
+            notify_human "$(printf '%s\n' \
               '## dep-steward could not complete the merge' \
               '' \
               'The deterministic gate **authorized** this merge:' \
@@ -473,9 +540,10 @@ jobs:
               "$1" \
               '```' \
               '' \
-              'This is an execution failure, not a policy decision. The gate said yes and GitHub refused.')
-            gh pr comment "$PR_NUMBER" --repo "$REPO" --body "$BODY" || true
-            gh pr edit "$PR_NUMBER" --repo "$REPO" --add-label needs-human-review --add-assignee octocat || true
+              'This is an execution failure, not a policy decision. The gate said yes and GitHub refused.')"
+            # Red, unlike the stuck-PR notice above: there the gate worked
+            # correctly and the PR needs a person; here dep-steward itself failed
+            # after authorizing, which is a malfunction and should look like one.
             exit 1
           }
 
@@ -632,17 +700,41 @@ jobs:
             echo "The fixer made no edits."
             # Distinguish "agent genuinely found nothing" from "agent never ran" (e.g.
             # an invalid token). Without this, a 401 looks identical to a clean no-op.
+            DETAIL='It found nothing it could safely fix.'
             if [ -n "${EXEC_FILE:-}" ] && [ -f "$EXEC_FILE" ]; then
               AGENT_ERR=$(jq -rs '[.. | objects | select(.is_error == true) | (.result // .error)] | map(select(. != null)) | .[0] // empty' "$EXEC_FILE" 2>/dev/null || true)
               if [ -n "$AGENT_ERR" ]; then
                 echo "The fixer agent errored (so it could not attempt a fix): $AGENT_ERR"
+                DETAIL="The fixer could not run, so the build was never diagnosed: $AGENT_ERR"
                 case "$AGENT_ERR" in
                   *'Invalid bearer token'*|*authentication*|*401*)
-                    echo "  -> CLAUDE_CODE_OAUTH_TOKEN is invalid or expired. Re-mint it with 'claude setup-token'." ;;
+                    echo "  -> CLAUDE_CODE_OAUTH_TOKEN is invalid or expired. Re-mint it with 'claude setup-token'."
+                    DETAIL="$DETAIL (CLAUDE_CODE_OAUTH_TOKEN looks invalid or expired — re-mint it with \`claude setup-token\` and re-run the installer.)" ;;
                 esac
-              else
-                echo "It escalated in its comment, or found nothing safe to do."
               fi
+            fi
+            # This job is the ONLY thing watching a red Dependabot build — the
+            # auto-merge gate deliberately stays quiet on ci_failed when autofix
+            # is on, precisely so you are not paged about a build being fixed.
+            # So when the fixer declines, the notification has to happen HERE and
+            # DETERMINISTICALLY. It used to depend on the agent choosing to label
+            # the PR itself, which its prompt asks for but nothing enforces: an
+            # agent that errored, or simply did not, left a red PR with nobody
+            # told. That is "covered sometimes", which is worse than not covered.
+            #
+            # Idempotent: this job wakes on every failing CI run, so re-label
+            # without re-commenting once the PR is already flagged.
+            if gh pr view "$PR_NUMBER" --repo "$REPO" --json labels --jq '.labels[].name' 2>/dev/null | grep -qxF 'needs-human-review'; then
+              echo "PR #$PR_NUMBER is already labelled needs-human-review — not commenting again."
+            else
+              echo "::warning::CI is failing on PR #$PR_NUMBER and autofix could not fix it — escalating."
+              gh pr comment "$PR_NUMBER" --repo "$REPO" --body "$(printf '%s\n' \
+                '## CI is failing and dep-steward could not fix it' \
+                '' \
+                "$DETAIL" \
+                '' \
+                'The deterministic gate will not merge a PR with a red build, so this one waits for a person.')" || true
+              gh pr edit "$PR_NUMBER" --repo "$REPO" --add-label needs-human-review --add-assignee octocat || true
             fi
             exit 0
           fi

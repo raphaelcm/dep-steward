@@ -220,6 +220,68 @@ test('the merge method comes from the repo, resolved across BOTH restriction lay
   assert.match(wf, /"ok:" \+/);
 });
 
+// ---- a refusal that can never resolve reaches a human ----------------------
+
+test('a terminal refusal escalates; a transient one stays silent', () => {
+  const wf = readFileSync(join(rendered, '.github/workflows/dependabot-review.yml'), 'utf8');
+  const gateStep = wf.slice(wf.indexOf('Deterministic auto-merge gate'), wf.indexOf('\n  autofix:'));
+  // The gate wakes on every CI completion and every bot comment, so most
+  // refusals mean "not yet" and must stay quiet. These two mean "never": the
+  // gate would refuse the PR forever and tell nobody.
+  assert.match(gateStep, /CODE=\$\(echo "\$GATE_OUT" \| sed -n 's\/\^code=\/\/p'\)/,
+    'the workflow must branch on the stable code, never on the prose reason');
+  assert.match(gateStep, /case "\$CODE" in\s*\n\s*paths_not_whitelisted\|verdict_malformed\)/);
+  // An allow-list, so a code added later defaults to silence. These must NOT
+  // appear as escalation targets — each already has an owner, or is transient.
+  const caseArm = /case "\$CODE" in\s*\n\s*([a-z_|]+)\)/.exec(gateStep)?.[1] ?? '';
+  for (const silent of ['ci_pending', 'ci_indeterminate', 'verdict_missing', 'verdict_escalate',
+    'usage_affected', 'author_not_dependabot', 'pr_not_open', 'no_changed_paths']) {
+    assert.ok(!caseArm.split('|').includes(silent), `${silent} must not escalate — it is transient or already owned`);
+  }
+});
+
+test('the stuck notice fires once per PR, not once per wake-up', () => {
+  const wf = readFileSync(join(rendered, '.github/workflows/dependabot-review.yml'), 'utf8');
+  const gateStep = wf.slice(wf.indexOf('Deterministic auto-merge gate'), wf.indexOf('\n  autofix:'));
+  // Without the label check a stuck PR collects one comment per CI run forever,
+  // which is how a notification channel gets muted.
+  assert.match(gateStep, /--json state,author,comments,labels/, 'labels must ride along on the existing query');
+  assert.match(gateStep, /grep -qxF 'needs-human-review' <<<"\$PR_LABELS"/);
+});
+
+test('a correct refusal notifies without reddening the job; a malfunction reddens', () => {
+  const wf = readFileSync(join(rendered, '.github/workflows/dependabot-review.yml'), 'utf8');
+  const gateStep = wf.slice(wf.indexOf('Deterministic auto-merge gate'), wf.indexOf('\n  autofix:'));
+  // The gate refusing is dep-steward working correctly, so it warns. Failing
+  // AFTER authorizing is dep-steward malfunctioning, so it errors and exits 1.
+  assert.match(gateStep, /::warning::PR #\$PR_NUMBER cannot merge without a human/);
+  assert.match(gateStep, /::error::dep-steward could not merge PR/);
+  assert.match(gateStep, /notify_human\(\) \{/, 'both paths share one label+assign+comment helper');
+});
+
+test('autofix ON keeps ci_failed off the gate\'s list — one owner, no double-page', () => {
+  // When CI goes red the autofix job and the gate wake from the SAME
+  // workflow_run event and run in parallel. If both escalated you would be paged
+  // about a build the fixer is already fixing.
+  const wf = readFileSync(join(rendered, '.github/workflows/dependabot-review.yml'), 'utf8');
+  const caseArm = /case "\$CODE" in\s*\n\s*([a-z_|]+)\)/.exec(wf)?.[1] ?? '';
+  assert.ok(!caseArm.split('|').includes('ci_failed'), 'with autofix on, autofix owns ci_failed');
+  // ...and autofix must then actually escalate when it declines, deterministically.
+  const autofixJob = wf.slice(wf.indexOf('\n  autofix:'));
+  assert.match(autofixJob, /The fixer made no edits/);
+  assert.match(autofixJob, /--add-label needs-human-review --add-assignee octocat/);
+  assert.match(autofixJob, /::warning::CI is failing on PR #\$PR_NUMBER and autofix could not fix it/);
+});
+
+test('--no-autofix moves ci_failed ONTO the gate\'s list — nothing else is watching CI', () => {
+  const out = renderWith(['--no-autofix']);
+  const wf = readFileSync(join(out, '.github/workflows/dependabot-review.yml'), 'utf8');
+  const caseArm = /case "\$CODE" in\s*\n\s*([a-z_|]+)\)/.exec(wf)?.[1] ?? '';
+  assert.ok(caseArm.split('|').includes('ci_failed'),
+    'with autofix off no job watches CI, so a red build would strand silently');
+  assert.doesNotMatch(wf, /^ {2}autofix:/m);
+});
+
 test('both prompt-loads bake in the literal PR number, never cat the raw prompt', () => {
   const wf = readFileSync(join(rendered, '.github/workflows/dependabot-review.yml'), 'utf8');
   // Claude Code 2.1.207+ (bundled by recent claude-code-action releases) rejects an

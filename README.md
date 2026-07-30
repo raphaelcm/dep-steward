@@ -150,6 +150,12 @@ When the reviewer judges a PR unsafe or uncertain — a breaking change that aff
 
 The PR is then left open and untouched — the gate never merges an escalated PR. (If the reviewer ever fails to produce a verdict at all, its job goes **red** and still assigns + labels, so a broken review can't pass silently.)
 
+**The gate escalates too, when its own refusal can never resolve.** Most of the time it refuses because it's *not yet* time — CI is still running, the review hasn't posted — and it stays quiet, because it will be woken again. But some refusals are permanent: the PR changes a file outside the whitelist, or the reviewer posted a verdict block that can't be parsed. Nothing about those changes without a person, so the gate would otherwise refuse the same PR forever and tell nobody. It now assigns, labels and comments once, naming the reason. That notice fires **once per PR**, not once per wake-up.
+
+This is deliberately an allow-list of permanent reasons, so anything new stays silent by default: being paged about a PR that fixes itself is what teaches you to ignore the label, and then you miss the real one.
+
+**Who tells you about a red build?** Exactly one job, so you're never paged twice for the same failure. With autofix on (the default) it's the autofix job — it tries a fix first, and assigns + labels + comments when it can't. With `--no-autofix` nothing else is watching CI, so the gate takes that job over.
+
 Default assignee is you (the person who ran the installer). Set a different maintainer with `--assignee HANDLE`, or pass `--assignee ""` to disable assignment (then you triage by the label filter `is:open label:needs-human-review`).
 
 **A review job went red / a PR got no verdict — how do I tell why?**
@@ -173,6 +179,7 @@ node --test test/*.test.mjs
 - `test/gate.test.mjs` — the gate's decision logic (rendered fresh from the templates, so it tests what actually ships).
 - `test/render.test.mjs` — render parity: the installer reproduces a known-good reference pipeline byte-for-byte.
 - `test/wiring.test.mjs` — the installer sets both secret stores, creates the label, and enables auto-merge (stubbed `gh`).
+- `test/workflow-shell.test.mjs` — every `run:` block in the rendered workflow parses as POSIX shell (`sh -n`). Nothing else parses the shell the templates generate.
 - `test/permissions.test.mjs` — each agent job grants every GitHub scope the commands in its own prompt need, derived from the rendered workflow and prompt rather than hardcoded.
 
 ## License
