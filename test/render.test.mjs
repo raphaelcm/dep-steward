@@ -152,6 +152,74 @@ test('a failed agent run surfaces its actual error, not a guess', () => {
   assert.match(wf, /claude setup-token/);
 });
 
+test('both agent jobs run the same SHA-pinned action version', () => {
+  const wf = readFileSync(join(rendered, '.github/workflows/dependabot-review.yml'), 'utf8');
+  // A moving @v1 tag once shipped a breaking bot-gate change silently, so the
+  // action is SHA-pinned. The two jobs drifting apart would mean one of them
+  // quietly runs a different agent runtime than the one we tested.
+  const pins = [...wf.matchAll(/claude-code-action@([0-9a-f]{40}) # (v[\d.]+)/g)].map((m) => `${m[1]} ${m[2]}`);
+  assert.equal(pins.length, 2, 'expected exactly two pinned action references');
+  assert.equal(pins[0], pins[1], `review and autofix pin different versions: ${pins.join(' vs ')}`);
+});
+
+// ---- the gate arms auto-merge; it never merges imperatively ----------------
+
+test('the auto-merge job ARMS GitHub auto-merge rather than merging synchronously', () => {
+  const wf = readFileSync(join(rendered, '.github/workflows/dependabot-review.yml'), 'utf8');
+  // A synchronous merge is a time-of-check/time-of-use race, and this job only
+  // wakes on a head change or a comment, so a refusal is never retried. Arming
+  // hands the timing to GitHub. Regression guard: no bare imperative merge.
+  assert.match(wf, /gh pr merge "\$PR_NUMBER" --repo "\$REPO" --auto "--\$METHOD" --delete-branch/);
+  assert.doesNotMatch(wf, /gh pr merge "\$PR_NUMBER" --repo "\$REPO" "\$MERGE_METHOD"/,
+    'the imperative merge is the race this design replaced');
+  assert.doesNotMatch(wf, /MERGE_METHOD=/,
+    'the merge method is gate.cjs output now — computing it in shell puts it where no test can see it');
+});
+
+test('a later refusal DISARMS an earlier arm, and fails closed when it cannot tell', () => {
+  const wf = readFileSync(join(rendered, '.github/workflows/dependabot-review.yml'), 'utf8');
+  // Arming is a latch and the gate re-derives on every wake, so a later `skip`
+  // must revoke an earlier `merge` — otherwise a PR whose CI went red stays
+  // armed to merge itself while the gate says no.
+  assert.match(wf, /--disable-auto/);
+  assert.match(wf, /ARMED_BY=\$\(gh pr view .*--json autoMergeRequest/s);
+  // An unreadable answer must disarm, not skip the disarm.
+  assert.match(wf, /\|\| echo "unknown"/);
+  assert.match(wf, /\[ -n "\$ARMED_BY" \] \|\| ARMED_BY="unknown"/);
+  // `case` patterns are globs: an UNQUOTED github-actions[bot] is a character
+  // class matching `github-actionsb`, not the literal login, so the disarm
+  // would silently never fire for the identity that does the arming.
+  assert.match(wf, /'app\/github-actions'\|'github-actions\[bot\]'\|unknown\)/);
+});
+
+test('every failure after the gate authorizes escalates to a human, never a silent red job', () => {
+  const wf = readFileSync(join(rendered, '.github/workflows/dependabot-review.yml'), 'utf8');
+  // Past authorization, a failure is an EXECUTION failure, not a policy
+  // decision. A merge that fails silently is indistinguishable from one that
+  // never ran, which is how a green PR sits for days.
+  const gateStep = wf.slice(wf.indexOf('Deterministic auto-merge gate'), wf.indexOf('\n  autofix:'));
+  assert.match(gateStep, /escalate\(\) \{/);
+  assert.match(gateStep, /--add-label needs-human-review --add-assignee octocat/);
+  assert.match(gateStep, /escalate "enabling auto-merge \(--\$METHOD\) failed/);
+  assert.match(gateStep, /if \[ "\$METHOD" = "none" \]/,
+    'a repo permitting no merge method must escalate, not pass `--none` to gh');
+});
+
+test('the merge method comes from the repo, resolved across BOTH restriction layers', () => {
+  const wf = readFileSync(join(rendered, '.github/workflows/dependabot-review.yml'), 'utf8');
+  // Merge methods can be forbidden by repo settings AND, independently, by the
+  // default branch's ruleset. A downstream install read only the first,
+  // concluded its repo banned merge commits repo-wide, and hardcoded `rebase`
+  // around a restriction that lived in the ruleset and later went away.
+  assert.match(wf, /mergeCommitAllowed,rebaseMergeAllowed,squashMergeAllowed/);
+  assert.match(wf, /allowed_merge_methods/);
+  assert.match(wf, /rules\/branches\/\$DEFAULT_BRANCH/);
+  assert.match(wf, /ALLOWED_MERGE_METHODS: \$\{\{ steps\.methods\.outputs\.allowed_merge_methods \}\}/);
+  assert.match(wf, /METHOD=\$\(echo "\$GATE_OUT" \| sed -n 's\/\^method=\/\/p'\)/);
+  // "could not read it" must stay distinguishable from "nothing is allowed".
+  assert.match(wf, /"ok:" \+/);
+});
+
 test('both prompt-loads bake in the literal PR number, never cat the raw prompt', () => {
   const wf = readFileSync(join(rendered, '.github/workflows/dependabot-review.yml'), 'utf8');
   // Claude Code 2.1.207+ (bundled by recent claude-code-action releases) rejects an
