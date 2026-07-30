@@ -22,11 +22,18 @@ import { fileURLToPath } from 'node:url';
  *
  * Caught for real: refactoring `BODY=$(printf …)` into
  * `notify_human "$(printf …)"` added the opening quote and not the closing one.
- * Every line after it parsed inside an unterminated string; `sh -n` reports it
+ * Every line after it parsed inside an unterminated string; `bash -n` reports it
  * in milliseconds.
  *
- * `sh -n` (parse, do not execute) is the whole mechanism — no YAML parser, no
- * dependency, and it runs the same POSIX shell the runner does.
+ * `bash -n` (parse, do not execute) is the whole mechanism — no YAML parser and
+ * no dependency.
+ *
+ * BASH, not `sh`, because that is what actually runs these blocks: GitHub's
+ * default shell for `run:` on Linux runners is `bash -e {0}`, and the workflow
+ * uses bash herestrings (`<<<`) deliberately. Checking with `sh -n` looks
+ * equivalent on macOS, where /bin/sh IS bash — and then fails on Ubuntu, where
+ * /bin/sh is dash and rejects every `<<<`. The lint has to match the shell the
+ * code runs under, or it reports on a language nobody is writing.
  */
 
 const REPO = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -84,7 +91,7 @@ function parses(script) {
   const f = join(mkdtempSync(join(tmpdir(), 'ds-shcheck-')), 'step.sh');
   writeFileSync(f, stripActionsExpressions(script));
   try {
-    execFileSync('sh', ['-n', f], { stdio: 'pipe' });
+    execFileSync('bash', ['-n', f], { stdio: 'pipe' });
     return { ok: true };
   } catch (e) {
     return { ok: false, err: `${e.stderr ?? ''}`.trim() };
@@ -105,7 +112,7 @@ for (const [variant, args] of [['default', []], ['--no-autofix', ['--no-autofix'
   for (const { stepName, script } of blocks) {
     test(`${variant}: shell parses — ${stepName}`, () => {
       const { ok, err } = parses(script);
-      assert.ok(ok, `\`${stepName}\` does not parse as POSIX shell:\n${err}`);
+      assert.ok(ok, `\`${stepName}\` does not parse under bash:\n${err}`);
     });
   }
 }

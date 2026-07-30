@@ -179,7 +179,7 @@ node --test test/*.test.mjs
 - `test/gate.test.mjs` — the gate's decision logic (rendered fresh from the templates, so it tests what actually ships).
 - `test/render.test.mjs` — render parity: the installer reproduces a known-good reference pipeline byte-for-byte.
 - `test/wiring.test.mjs` — the installer sets both secret stores, creates the label, and enables auto-merge (stubbed `gh`).
-- `test/workflow-shell.test.mjs` — every `run:` block in the rendered workflow parses as POSIX shell (`sh -n`). Nothing else parses the shell the templates generate.
+- `test/workflow-shell.test.mjs` — every `run:` block in the rendered workflow parses under `bash -n` (the shell GitHub actually runs `run:` blocks with). Nothing else parses the shell the templates generate.
 - `test/permissions.test.mjs` — each agent job grants every GitHub scope the commands in its own prompt need, derived from the rendered workflow and prompt rather than hardcoded.
 
 ## License
