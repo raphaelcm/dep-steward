@@ -1,0 +1,26 @@
+{
+  "name": "dep-steward",
+  "owner": {
+    "name": "raphaelcm",
+    "url": "https://github.com/raphaelcm"
+  },
+  "metadata": {
+    "description": "The dep-steward plugin: Claude-reviewed, injection-safe Dependabot automation for GitHub repositories.",
+    "version": "1.0.0"
+  },
+  "plugins": [
+    {
+      "name": "dep-steward",
+      "source": "./",
+      "description": "Install, inspect, and remove the dep-steward Dependabot pipeline: Dependabot auto-updates your dependencies, a Claude agent auto-reviews each PR, and a deterministic gate auto-merges only when it is safe.",
+      "category": "development",
+      "keywords": [
+        "dependabot",
+        "dependencies",
+        "automation",
+        "github-actions",
+        "security"
+      ]
+    }
+  ]
+}

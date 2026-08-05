@@ -2,6 +2,8 @@
 
 **Claude-reviewed, injection-safe Dependabot automation for GitHub — auto-update, auto-review, and auto-merge-when-safe, installed in one line.**
 
+**[Security model](SECURITY.md)** · Available as a [Claude Code plugin](#claude-code-plugin)
+
 A steward is entrusted to manage something with care and judgment on your behalf. `dep-steward` does that for your dependency updates: a Claude cloud agent reviews every Dependabot PR — reading changelogs, enumerating breaking changes, and grepping *your* code for affected usage — and a **fully deterministic gate** decides the merge. The gate re-checks everything the model claims, so a prompt-injected dependency diff can never cause an unsafe merge.
 
 This is not blind merging. `dep-steward` configures Dependabot to **auto-update** your dependencies on a schedule, **auto-reviews** every PR it opens with a Claude agent, and **auto-merges only when it's safe**: routine minor/patch bumps sail through once CI is green, while major bumps get a real, changelog-grounded review and are escalated to you the moment anything is uncertain.
@@ -104,19 +106,32 @@ sh -c "$(curl -fsSL https://raw.githubusercontent.com/raphaelcm/dep-steward/main
 
 When autofix can't produce a clean, minimal fix — the break isn't clearly the bump's fault, it would need real code changes or a new dependency, or it's simply not confident — it escalates to you, exactly like the review job does.
 
-## Seeing what it's done: `/dep-steward-summary`
+## Claude Code plugin
 
-`/dep-steward-summary` is a Claude Code command that gives a read-only readout: what dep-steward auto-merged, what it escalated and why, any security updates it landed, and an honest time-saved estimate (counts exact; per-PR minutes an assumption you can adjust). Pass a window if you like: `/dep-steward-summary 90d`.
+This repo is also a [Claude Code plugin](https://code.claude.com/docs/en/plugins), and its own single-plugin marketplace. Install it once and you get three commands everywhere:
 
-It's a **personal, install-once** tool — it summarizes whatever repo you're in, so it belongs in *your* Claude command library, not in any one repo. The per-repo installer deliberately does **not** write to your `~/.claude/` (a repo-setup tool has no business editing your personal config). Install it yourself, once:
+```
+/plugin marketplace add raphaelcm/dep-steward
+/plugin install dep-steward@dep-steward
+```
+
+| Command | What it does |
+|---|---|
+| `/dep-steward:install` | Preflights the prerequisites in whatever repo you're in, shows you the `--dry-run` plan, then installs. Hands off cleanly for the two steps that need a browser (minting the token, granting the GitHub App). |
+| `/dep-steward:summary` | Read-only readout: what was auto-merged, what was escalated and why, any security updates it landed, and an honest time-saved estimate. Takes a window: `/dep-steward:summary 90d`. |
+| `/dep-steward:uninstall` | Removes the pipeline from a repo — the four files, the label, and the token from **both** secret stores (forgetting the second one is the usual half-uninstall). |
+
+These are **personal, install-once** tools: they act on whatever repo you're currently in. The per-repo installer deliberately does **not** write to your `~/.claude/` — a repo-setup tool has no business editing your personal config.
+
+**Without the plugin?** The summary command is a plain file you can drop into any Claude command library:
 
 ```sh
 mkdir -p ~/.claude/commands
-curl -fsSL https://raw.githubusercontent.com/raphaelcm/dep-steward/main/templates/dep-steward-summary.md \
+curl -fsSL https://raw.githubusercontent.com/raphaelcm/dep-steward/main/skills/summary/SKILL.md \
   > ~/.claude/commands/dep-steward-summary.md
 ```
 
-Now it's in your `/` menu everywhere — Claude Desktop and the CLI both read that library. (Prefer a repo-shared copy for your team instead? Drop the same file at `.claude/commands/dep-steward-summary.md` in the repo; it'll show in the `/` menu for anyone working in that repo.) It's pull, not push — no standing noise.
+That puts `/dep-steward-summary` in your `/` menu everywhere. (Prefer a repo-shared copy for your team? Drop the same file at `.claude/commands/dep-steward-summary.md` in the repo; it'll show for anyone working there.) It's pull, not push — no standing noise.
 
 ## FAQ
 
@@ -165,7 +180,7 @@ The review job's final step prints the agent's *actual* error, read from `claude
 It's conservative by default: a major bump merges only if the model affirmatively recommends it *and* finds no affected usage. To make majors always wait for a human, tell the reviewer to always escalate majors (edit `.github/dependabot-review-prompt.md`), or require human review on those PRs via branch protection.
 
 **How do I uninstall?**
-Delete the four files above, remove the `needs-human-review` label, and delete the `CLAUDE_CODE_OAUTH_TOKEN` secret from both stores. No other footprint.
+Delete the four files above, remove the `needs-human-review` label, and delete the `CLAUDE_CODE_OAUTH_TOKEN` secret from both stores. No other footprint. `/dep-steward:uninstall` walks it for you, including the second secret store people forget.
 
 ## Development
 
@@ -181,6 +196,14 @@ node --test test/*.test.mjs
 - `test/wiring.test.mjs` — the installer sets both secret stores, creates the label, and enables auto-merge (stubbed `gh`).
 - `test/workflow-shell.test.mjs` — every `run:` block in the rendered workflow parses under `bash -n` (the shell GitHub actually runs `run:` blocks with). Nothing else parses the shell the templates generate.
 - `test/permissions.test.mjs` — each agent job grants every GitHub scope the commands in its own prompt need, derived from the rendered workflow and prompt rather than hardcoded.
+- `test/plugin.test.mjs` — the plugin and marketplace manifests parse and agree, every skill carries a description, and the README's raw-file links resolve on disk.
+
+Working on the plugin locally:
+
+```sh
+claude --plugin-dir .      # load it without installing
+claude plugin validate .   # check both manifests
+```
 
 ## License
 
