@@ -108,11 +108,11 @@ When autofix can't produce a clean, minimal fix — the break isn't clearly the 
 
 ## Claude Code plugin
 
-This repo is also a [Claude Code plugin](https://code.claude.com/docs/en/plugins). Two commands install it, from this repo alone, and its three commands are then available in every repo you work in:
+This repo is also a [Claude Code plugin](https://code.claude.com/docs/en/plugins), submitted to [Anthropic's community plugin marketplace](https://github.com/anthropics/claude-plugins-community) and currently in review. Once listed, two commands put its three commands in every repo you work in:
 
 ```
-/plugin marketplace add raphaelcm/dep-steward
-/plugin install dep-steward@dep-steward
+/plugin marketplace add anthropics/claude-plugins-community
+/plugin install dep-steward@claude-community
 ```
 
 | Command | What it does |
