@@ -108,7 +108,7 @@ When autofix can't produce a clean, minimal fix — the break isn't clearly the 
 
 ## Claude Code plugin
 
-This repo is also a [Claude Code plugin](https://code.claude.com/docs/en/plugins), and its own single-plugin marketplace. Install it once and you get three commands everywhere:
+This repo is also a [Claude Code plugin](https://code.claude.com/docs/en/plugins). Two commands install it, from this repo alone, and its three commands are then available in every repo you work in:
 
 ```
 /plugin marketplace add raphaelcm/dep-steward
