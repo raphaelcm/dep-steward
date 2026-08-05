@@ -27,7 +27,7 @@ test('the Pages tree is complete: page, .nojekyll, favicon, og-image', () => {
 test('every asset the page references resolves on disk', () => {
   // Relative href/src (favicon), plus og/twitter images cited by absolute URL —
   // the URL's basename must be a real file in docs/ or the preview 404s.
-  const rel = [...html.matchAll(/(?:href|src)="(?!https?:|#|mailto:)([^"]+)"/g)].map((m) => m[1]);
+  const rel = [...html.matchAll(/(?:href|src)="(?!https?:|#|mailto:|data:)([^"]+)"/g)].map((m) => m[1]);
   assert.ok(rel.length > 0, 'expected at least one relative asset (the favicon)');
   for (const p of rel) {
     assert.ok(existsSync(join(REPO, 'docs', p)), `page references "${p}", which is not in docs/`);
