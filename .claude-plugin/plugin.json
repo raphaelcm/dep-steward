@@ -1,7 +1,7 @@
 {
   "name": "dep-steward",
   "description": "Claude-reviewed, injection-safe Dependabot automation: install the pipeline into a repo, see what it has handled for you, and remove it cleanly.",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "author": {
     "name": "raphaelcm",
     "url": "https://github.com/raphaelcm"
