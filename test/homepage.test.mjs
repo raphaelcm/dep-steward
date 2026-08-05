@@ -63,8 +63,8 @@ test('the commands the page advertises are the skills that exist', () => {
 });
 
 test('the page carries the plugin install lines', () => {
-  assert.ok(text.includes('/plugin marketplace add raphaelcm/dep-steward'), 'marketplace add line');
-  assert.ok(text.includes('/plugin install dep-steward@dep-steward'), 'plugin install line');
+  assert.ok(text.includes('/plugin marketplace add anthropics/claude-plugins-community'), 'marketplace add line');
+  assert.ok(text.includes('/plugin install dep-steward@claude-community'), 'plugin install line');
 });
 
 test('the page is self-contained: no external stylesheets, scripts, or images', () => {
