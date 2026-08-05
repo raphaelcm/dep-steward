@@ -7,16 +7,15 @@ import { fileURLToPath } from 'node:url';
 /**
  * Claude Code plugin packaging.
  *
- * This repo is both a plugin and its own single-plugin marketplace, so users
- * install it with:
- *   /plugin marketplace add raphaelcm/dep-steward
- *   /plugin install dep-steward@dep-steward
+ * This repo is a plugin, distributed through Anthropic's community plugin
+ * marketplace (anthropics/claude-plugins-community), which pins it by commit
+ * SHA. There is deliberately no marketplace manifest here.
  *
  * Every assertion here fails an install for every user, silently, at a moment
- * nothing else is watching: a manifest that does not parse, a marketplace entry
- * naming a plugin that is not this one, or a skill with no description (which
- * loads but never surfaces). `claude plugin validate` catches these locally but
- * needs the CLI, so the same invariants are pinned here where CI already runs.
+ * nothing else is watching: a manifest that does not parse, or a skill with no
+ * description (which loads but never surfaces). `claude plugin validate`
+ * catches these locally but needs the CLI, so the same invariants are pinned
+ * here where CI already runs.
  */
 
 const REPO = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -33,20 +32,6 @@ test('plugin.json is valid and identifies the plugin', () => {
   // release, so the bump is part of a ritual that exists. Users only receive a
   // plugin update when this field moves, so it must move with the tag.
   assert.match(m.version, /^\d+\.\d+\.\d+$/, 'version must be semver, bumped with the release tag');
-});
-
-test('marketplace.json lists this repo as its own plugin', () => {
-  const mk = readJSON('.claude-plugin', 'marketplace.json');
-  const plugin = readJSON('.claude-plugin', 'plugin.json');
-
-  assert.equal(mk.name, 'dep-steward', 'marketplace name — users type @dep-steward when installing');
-  assert.ok(mk.owner?.name, 'owner is a required marketplace field');
-  assert.ok(Array.isArray(mk.plugins) && mk.plugins.length === 1, 'exactly one plugin: this repo');
-
-  const [entry] = mk.plugins;
-  assert.equal(entry.name, plugin.name, 'entry name must match plugin.json, or the install resolves nothing');
-  assert.equal(entry.source, './', 'the plugin IS the marketplace repo root');
-  assert.ok(entry.description?.length > 20, 'description shows in the plugin browser');
 });
 
 test('every skill has frontmatter with a description', () => {
