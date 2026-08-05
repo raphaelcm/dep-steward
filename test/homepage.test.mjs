@@ -62,9 +62,12 @@ test('the commands the page advertises are the skills that exist', () => {
   }
 });
 
-test('the page carries the plugin install lines', () => {
-  assert.ok(text.includes('/plugin marketplace add anthropics/claude-plugins-community'), 'marketplace add line');
-  assert.ok(text.includes('/plugin install dep-steward@claude-community'), 'plugin install line');
+test('the page names the marketplace but instructs no command that fails before listing', () => {
+  // Until dep-steward appears in the community catalog, any /plugin install
+  // line on the page is an instruction that errors for whoever runs it.
+  assert.ok(html.includes('https://github.com/anthropics/claude-plugins-community'), 'links the community marketplace');
+  assert.ok(!text.includes('/plugin install dep-steward@'), 'no not-yet-working install command');
+  assert.ok(!text.includes('/plugin marketplace add raphaelcm/'), 'no self-marketplace command');
 });
 
 test('the page is self-contained: no external stylesheets, scripts, or images', () => {
