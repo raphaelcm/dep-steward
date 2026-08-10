@@ -22,14 +22,21 @@
     permissions:
       contents: write
       pull-requests: write
-      # The prompt orders `gh pr checks` (Checks API) and `gh run view --log-failed`
-      # (Actions API), and both are allow-listed below — but a job-level permissions
-      # block makes every unlisted scope `none`, so without these two the agent 403s
-      # and reviews the PR blind. Worse here than in the review job: this job fires
-      # ONLY on a CI failure, so reading that failure is its whole first step.
+      # The prompt's first step is reading the failing CI run (`gh pr checks`,
+      # then `gh run view --log-failed`) — this job fires ONLY on a CI
+      # failure, so that read is its whole reason to exist. These two grants
+      # reach the agent ONLY because the fixer step passes
+      # `github_token: secrets.GITHUB_TOKEN` below; without that input,
+      # claude-code-action mints its own Claude-App token via OIDC, which
+      # cannot read the Checks/Actions APIs, and the fixer diagnoses blind.
+      # A job-level permissions block sets every unlisted scope to `none`,
+      # so these must stay in step with what the agent's allow-list needs
+      # (permissions.test.mjs enforces the mapping).
       checks: read
       actions: read
-      # Required by anthropics/claude-code-action for its OIDC flow.
+      # For claude-code-action's OIDC flow (unused when github_token is
+      # passed, harmless to grant, and required again if that input is ever
+      # dropped).
       id-token: write
     concurrency:
       group: dependabot-autofix-${{ github.event.workflow_run.head_branch }}
@@ -93,13 +100,21 @@
         id: fixer
         if: steps.pr.outputs.skip != 'true'
         # SHA-pinned, same as the review job — bump deliberately, not implicitly.
-        uses: anthropics/claude-code-action@be7b93b1907a4abad570368f3c74b6fe3807510b # v1.0.183
+        uses: anthropics/claude-code-action@1623c36729ac1cd5895198cded705a287de7db79 # v1.0.187
         env:
           PR_NUMBER: ${{ steps.pr.outputs.pr_number }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           allowed_bots: "dependabot[bot]"
+          # The fixer's `gh` runs on THIS token, so the job's checks:/actions:
+          # read grants reach it and `gh run view --log-failed` works. Its
+          # comments post as github-actions[bot], which is safe HERE: autofix
+          # comments carry no AUTOMERGE-DECISION-V1 block and nothing needs to
+          # wake on them. Do NOT copy this input to the review step — the
+          # review comment must come from the App identity or the gate's
+          # issue_comment wake-up never fires (see the workflow header).
+          github_token: ${{ secrets.GITHUB_TOKEN }}
           prompt: ${{ steps.load_prompt.outputs.prompt }}
           # Edit/Write make the fix; gh/grep/Read/Glob/WebFetch investigate. NO
           # general Bash, so the PR's untrusted code is never executed in this

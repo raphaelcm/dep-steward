@@ -7,22 +7,42 @@ import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 /**
- * Job permissions vs. what the agents are actually told to do.
+ * Which token the agent actually holds, and what that token can read.
  *
- * The failure this locks: a job-level `permissions:` block sets every UNLISTED
- * scope to `none`. The review and autofix prompts both order `gh pr checks`
- * (Checks API) and `gh run view --log-failed` (Actions API), and both commands
- * are allow-listed in `--allowedTools` — but neither job granted `checks: read`
- * or `actions: read`. The agent 403s on the CI it was ordered to read and
- * reviews the PR blind, while the job still reports success.
+ * claude-code-action gives the agent's `gh` the workflow's GITHUB_TOKEN ONLY
+ * when the step passes the `github_token` input. Without it, the action mints
+ * its own Claude-App installation token via OIDC ("Using GITHUB_TOKEN from
+ * OIDC" in its log) and the agent runs on THAT — a token that cannot read the
+ * Checks or Actions APIs, whatever the job's `permissions:` block says.
  *
- * Byte-parity (render.test.mjs) cannot catch this: it would have locked the bug
- * in. So this asserts a SEMANTIC invariant derived from two artifacts — the
- * workflow's allow-list and the prompt the job loads — rather than a hardcoded
- * list of scopes. Hardcoding "the review job grants checks: read" would pass
- * forever while a newly allow-listed command went un-scoped.
+ * The failure this locks: the review prompt ordered `gh pr checks` and
+ * `gh run view --log-failed`, both were allow-listed, and the jobs granted
+ * `checks: read` + `actions: read` on the theory that job grants cure agent
+ * 403s. They never reach an agent without the passthrough. The review agent
+ * 403'd on every CI read for weeks — reporting "CI status: could not read"
+ * and escalating over missing evidence — while every job stayed green
+ * (observed on Runsense-ai/runsense#2335, runs 31356783516/31356783466).
  *
- * Everything below runs over the RENDERED tree, which is what an adopter ships.
+ * So the invariant is conditional on the passthrough:
+ *   - an agent step WITHOUT `github_token` must not allow-list any command
+ *     whose scopes the App token lacks (it would 403 on every call);
+ *   - an agent step WITH `github_token` must have every allow-listed
+ *     command's scope granted by the job's `permissions:` block (a job-level
+ *     block makes every unlisted scope `none`).
+ *
+ * And the passthrough itself is a contract, not a preference:
+ *   - the REVIEW step must never take it. Its comment must be posted by the
+ *     Claude App identity, because a comment created with GITHUB_TOKEN fires
+ *     no workflow triggers (GitHub's recursion guard) and the auto-merge
+ *     job's issue_comment wake-up would silently die — any review finishing
+ *     after CI would strand its PR until the next push.
+ *   - the AUTOFIX step must take it. Reading the failing run log is that
+ *     job's entire first step, and its comments carry no decision block, so
+ *     nothing needs to wake on them.
+ *
+ * Byte-parity (render.test.mjs) cannot catch any of this: it would have
+ * locked the original bug in. Everything below runs over the RENDERED tree,
+ * which is what an adopter ships.
  */
 
 const REPO = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -50,14 +70,14 @@ const LEVEL = { none: 0, read: 1, write: 2 };
 
 // ---- what each allow-listed command needs ---------------------------------
 // An UNMAPPED command throws rather than being skipped: a silently-ignored
-// entry makes the "every needed scope is granted" assertion vacuous for it,
-// which is precisely how the original defect survived.
+// entry makes every assertion here vacuous for it, which is precisely how the
+// original defect survived.
 //
 // Judgment recorded deliberately: `gh pr checks` reads `statusCheckRollup`,
 // which merges check runs (`checks`) AND legacy commit statuses (`statuses`).
 // `statuses: read` is omitted — the installer requires an Actions workflow by
 // construction, and the gate's authoritative CI signal is
-// `gh run list --workflow`, so the model's check view is advisory. If a repo
+// `gh run list --workflow`, so the fixer's check view is advisory. If a repo
 // ever gates on a non-Actions commit status, this is the line to revisit.
 const GH_SCOPES = {
   'pr view': { 'pull-requests': 'read' },
@@ -77,6 +97,13 @@ const GH_SCOPES = {
 const NON_GH_SCOPES = {
   grep: {},
 };
+
+// Scopes the Claude App installation token cannot read, per the 403s observed
+// live (GraphQL statusCheckRollup and REST /actions/runs both refused with
+// "Resource not accessible by integration"). An agent WITHOUT the passthrough
+// runs on that token, so an allow-listed command needing one of these is a
+// dead tool that fails on every call.
+const APP_TOKEN_LACKS = new Set(['checks', 'actions']);
 
 // ---- a line-oriented parser for `jobs:` and their `permissions:` blocks ----
 // No YAML dependency (the project is zero-dependency by charter), so this is
@@ -142,6 +169,14 @@ function allowlistedTools(jobBody) {
   for (const [, sub] of m[1].matchAll(/Bash\(gh ([a-z]+ [a-z]+):\*\)/g)) tools.push({ kind: 'gh', name: sub });
   for (const [, cmd] of m[1].matchAll(/Bash\((?!gh )([a-z-]+):\*\)/g)) tools.push({ kind: 'other', name: cmd });
   return tools;
+}
+
+// Does this job hand the agent the workflow's token? Matches the action INPUT
+// key `github_token:` (10-space `with:` indentation), never the step-level
+// `GH_TOKEN:` env — the env is set on both agent steps and reaches only the
+// workflow's own shell, not the agent.
+function hasTokenPassthrough(jobBody) {
+  return /^\s{10}github_token:\s*\$\{\{\s*secrets\.GITHUB_TOKEN\s*\}\}\s*$/m.test(jobBody);
 }
 
 // The prompt the job loads, discovered from the job body rather than mapped by
@@ -219,23 +254,40 @@ for (const [name, j] of AGENT_JOBS) {
   });
 }
 
-// ---- 4. every scope an allow-listed command needs is granted --------------
+// ---- 4. the token the agent holds can serve every allow-listed command ----
 
 for (const [name, j] of AGENT_JOBS) {
-  test(`${name}: grants every scope its allow-listed commands need (superset, not equality)`, () => {
-    // Superset, deliberately: `id-token: write` is required by the action's OIDC
-    // flow and maps to no command, so demanding equality would fail on a
-    // legitimate grant.
-    const need = scopesNeededBy(allowlistedTools(j.body));
-    const got = j.permissions;
-    for (const [scope, level] of Object.entries(need)) {
-      assert.ok(
-        LEVEL[got[scope] ?? 'none'] >= LEVEL[level],
-        `${name} needs ${scope}: ${level} (a job-level permissions block makes every unlisted scope none) ` +
-          `but grants ${got[scope] ?? 'none'}`,
-      );
-    }
-  });
+  if (hasTokenPassthrough(j.body)) {
+    test(`${name}: passes github_token, so the job must grant every scope its allow-listed commands need`, () => {
+      // Superset, deliberately: `id-token: write` maps to no command (it serves
+      // the action's OIDC fallback), so demanding equality would fail on a
+      // legitimate grant.
+      const need = scopesNeededBy(allowlistedTools(j.body));
+      const got = j.permissions;
+      for (const [scope, level] of Object.entries(need)) {
+        assert.ok(
+          LEVEL[got[scope] ?? 'none'] >= LEVEL[level],
+          `${name} needs ${scope}: ${level} (a job-level permissions block makes every unlisted scope none) ` +
+            `but grants ${got[scope] ?? 'none'}`,
+        );
+      }
+    });
+  } else {
+    test(`${name}: no github_token, so no allow-listed command may need a scope the App token lacks`, () => {
+      // Without the passthrough the agent's gh runs on the Claude App token,
+      // and the job's permissions block is irrelevant to it. A command needing
+      // checks/actions here is the original blind-review defect coming back:
+      // it 403s on every call and the model reports blindness as risk.
+      const need = scopesNeededBy(allowlistedTools(j.body));
+      for (const scope of Object.keys(need)) {
+        assert.ok(
+          !APP_TOKEN_LACKS.has(scope),
+          `${name} allow-lists a command needing "${scope}", which the Claude App token cannot read — ` +
+            'either drop the tool or pass github_token (and read the identity contract in the workflow header first)',
+        );
+      }
+    });
+  }
 }
 
 // ---- 5. every allow-listed tool is in the scope table ---------------------
@@ -244,16 +296,43 @@ test('every allow-listed tool has a scope mapping (an unmapped one fails loudly,
   for (const [, j] of AGENT_JOBS) scopesNeededBy(allowlistedTools(j.body)); // throws if unmapped
 });
 
-// ---- 6. the regression itself --------------------------------------------
+// ---- 6. the identity contract, hardcoded on purpose -----------------------
 
-for (const name of ['review', 'autofix']) {
-  test(`${name} grants checks:read + actions:read — the agent was ordered to read CI it had no permission to see`, () => {
-    assert.equal(JOBS[name].permissions.checks, 'read');
-    assert.equal(JOBS[name].permissions.actions, 'read');
+test('review does NOT pass github_token — its App-posted comment is what wakes the gate', () => {
+  // A comment created with GITHUB_TOKEN fires no workflow triggers (GitHub's
+  // recursion guard), so passing the token here would silently sever the
+  // auto-merge job's issue_comment wake-up: any review finishing after CI
+  // strands its PR until the next push. The two-trigger design depends on the
+  // review comment coming from the Claude App identity.
+  assert.equal(hasTokenPassthrough(JOBS.review.body), false);
+});
+
+test('autofix DOES pass github_token — reading the failing run log is its first step', () => {
+  // The fixer fires only on a CI failure; `gh run view --log-failed` is its
+  // whole diagnosis. The App token cannot read the Actions API, so without
+  // the passthrough the fixer investigates blind and "found nothing it could
+  // safely fix" every time. Its comments carry no decision block, so the
+  // github-actions[bot] identity costs nothing here.
+  assert.equal(hasTokenPassthrough(JOBS.autofix.body), true);
+});
+
+// ---- 7. the review job's grants, hardcoded on purpose ---------------------
+
+test('review grants exactly contents:read + pull-requests:write + id-token:write', () => {
+  // Hardcoded equality, unlike the derived superset above: the review agent
+  // does not hold this token, so these grants exist for the job's own steps
+  // (checkout, the diagnose/assert steps' gh calls, labelling) and should not
+  // creep. checks:read + actions:read sat here for weeks on the wrong theory
+  // that they cured the agent's 403s; their absence is part of what this file
+  // locks.
+  assert.deepEqual(JOBS.review.permissions, {
+    contents: 'read',
+    'pull-requests': 'write',
+    'id-token': 'write',
   });
-}
+});
 
-// ---- 7. the privileged job's grants, hardcoded on purpose -----------------
+// ---- 8. the privileged job's grants, hardcoded on purpose -----------------
 
 test('auto-merge keeps contents:write + actions:read (hardcoded — this job merges, so its scopes are reviewed by hand)', () => {
   // Deliberately NOT derived: auto-merge runs no agent and has no allow-list, so
