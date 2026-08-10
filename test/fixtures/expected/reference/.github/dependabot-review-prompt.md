@@ -24,14 +24,9 @@ So your job for singletons is the same as for groups: be CORRECT about whether t
    - MINOR (`x.Y.z`): usually safe; skim changelog for deprecations affecting our usage.
    - MAJOR (`X.y.z`): deeper bar. See **Major-bump investigation** below.
 
-3. **Check CI status.** Run `gh pr checks $PR_NUMBER`. If any required check is failing:
-   - Read the failing job's log (`gh run view <id> --log-failed`).
-   - If the failure is clearly caused by the bump (test broken by a renamed API, type error from updated types) AND the fix would be mechanical → say so explicitly in the comment and recommend ESCALATE (a human applies the fix; you do not push).
-   - If the failure looks unrelated (flaky, infra hiccup) → note it specifically; do NOT assume "unrelated" without evidence.
+3. **For non-patch bumps, fetch the changelog/release notes** for the entire version range. Use `gh release view <tag> --repo <owner>/<repo>` for GitHub-hosted projects; otherwise `WebFetch` the package's page on its registry (npm, PyPI, crates.io, pkg.go.dev, RubyGems, Packagist, Maven Central, NuGet, Docker Hub, …) or the project's CHANGELOG. Look for: breaking changes, removed/renamed APIs, minimum runtime/language-version bumps, peer/transitive-dependency changes.
 
-4. **For non-patch bumps, fetch the changelog/release notes** for the entire version range. Use `gh release view <tag> --repo <owner>/<repo>` for GitHub-hosted projects; otherwise `WebFetch` the package's page on its registry (npm, PyPI, crates.io, pkg.go.dev, RubyGems, Packagist, Maven Central, NuGet, Docker Hub, …) or the project's CHANGELOG. Look for: breaking changes, removed/renamed APIs, minimum runtime/language-version bumps, peer/transitive-dependency changes.
-
-5. **Search this repo for usage** of each bumped package — however your language references it (`import` / `require` / `use` / `using`, a `FROM` base image, etc.): `grep -rIn "<pkg>"` over your source directories. Verify breaking changes don't hit our usage.
+4. **Search this repo for usage** of each bumped package — however your language references it (`import` / `require` / `use` / `using`, a `FROM` base image, etc.): `grep -rIn "<pkg>"` over your source directories. Verify breaking changes don't hit our usage.
 
 ## Major-bump investigation (higher bar)
 
@@ -59,8 +54,8 @@ For any major bump (and for multi-major jumps like `25 → 29`, MULTIPLY the rig
 
 Choose ONE:
 
-- **MERGE** — bump's breaking changes (if any) do not affect any code in this repo, CI is green or trivially explained, no security/process concerns. The gate will merge after re-checking deterministic safeguards.
-- **ESCALATE** — anything else: any breaking change that affects us, CI red for non-obvious reasons, can't read the changelog, a CVE, files outside the whitelist, or you are uncertain. Add the `needs-human-review` label.
+- **MERGE** — bump's breaking changes (if any) do not affect any code in this repo, no security/process concerns. The gate will merge after re-checking deterministic safeguards.
+- **ESCALATE** — anything else: any breaking change that affects us, can't read the changelog, a CVE, files outside the whitelist, or you are uncertain. Add the `needs-human-review` label.
 
 When uncertain, ESCALATE. Uncertainty is not MERGE. A wrong "looks safe" is much worse than a correct "escalate."
 
@@ -73,7 +68,6 @@ Post ONE PR comment via `gh pr comment $PR_NUMBER --body-file <path>`. Structure
 
 **Packages**: <pkg v1 → v2>, …
 **Bump type**: <patch / minor / major mix per package>
-**CI status**: <green / red-investigated — list failing checks + cause>
 **Changelog scan**: <findings, with links to release notes>
 **Usage check**: <which files in this repo import this dep, or "no direct imports">
 

