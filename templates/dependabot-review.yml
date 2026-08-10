@@ -120,6 +120,11 @@ jobs:
             sed "s/\$PR_NUMBER/$PR_NUMBER/g" .github/dependabot-review-prompt.md
             echo 'PROMPT_EOF_8X2Y'
           } >> "$GITHUB_OUTPUT"
+          # Captured BEFORE the agent runs, minus a 60s clock-skew margin: the
+          # deliverable assertion below only accepts a V1 comment created at or
+          # after this instant, so a stale comment from an earlier review of
+          # the same PR can never satisfy it (see the assertion's comment).
+          echo "review_started=$(date -u -d '60 seconds ago' +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
 
       - name: Run Claude review
         id: review
@@ -190,7 +195,10 @@ jobs:
             exit 0
           fi
           echo "===== result summary ====="
-          jq -rs '[.. | objects | select(.type? == "result")] | (.[0] // {}) | {is_error, subtype, num_turns, permission_denials_count, total_cost_usd, result}' "$EXEC_FILE" 2>/dev/null || echo "(jq failed)"
+          # The SDK's result object carries `permission_denials` (an array);
+          # a hand-named `_count` field selected null while ten real denials
+          # sat in the array, so derive the count from the data.
+          jq -rs '[.. | objects | select(.type? == "result")] | (.[0] // {}) | {is_error, subtype, num_turns, permission_denials: ((.permission_denials // []) | length), total_cost_usd, result}' "$EXEC_FILE" 2>/dev/null || echo "(jq failed)"
           echo "===== tool calls the agent attempted ====="
           jq -rs '[.. | objects | select(.type? == "tool_use")] | .[] | "TRY [" + (.name // "?") + "] " + (((.input.command // .input.file_path // .input.pattern // (.input|tostring)) | tostring)[0:220])' "$EXEC_FILE" 2>/dev/null || echo "(none / jq failed)"
           echo "===== tool results that were errors/denials ====="
@@ -217,7 +225,7 @@ jobs:
             exit 1
           fi
 
-      - name: Assert the review deliverable exists (V1 block posted)
+      - name: Assert the review deliverable exists (V1 block posted by THIS run)
         # claude-code-action can exit 0 without running at all: its OIDC token
         # exchange refuses any run whose workflow file differs from the default
         # branch's copy — which is every Dependabot PR that bumps an action
@@ -231,11 +239,21 @@ jobs:
         # branches are groups) classifies the branch and we skip the assertion
         # for groups. For everything else a missing verdict ends in {red job +
         # needs-human-review label}, for every silent-failure mode.
+        #
+        # THIS run's deliverable, not any run's: only comments created at or
+        # after review_started count. A replay or a synchronize re-review runs
+        # on a PR that already carries an older V1 comment, and "any V1 exists"
+        # let exactly that happen: an agent's post was denied (it had chained
+        # `&& rm` onto the allow-listed comment command), its self-check found
+        # the STALE comment, it reported success, and this step stayed green
+        # over a review that delivered nothing. The timestamp turns that into
+        # a red with a label.
         if: ${{ !cancelled() }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
           PR_NUMBER: ${{ inputs.pr_number || github.event.pull_request.number }}
+          SINCE: ${{ steps.load_prompt.outputs.review_started }}
           # claude-code-action writes its full result (incl. the real error on a
           # failed run) to this file; the run log only shows is_error, never why.
           EXEC_FILE: ${{ steps.review.outputs.execution_file }}
@@ -246,12 +264,15 @@ jobs:
             echo "PR #$PR_NUMBER ($HEAD_BRANCH) is a minor/patch group — the gate merges it with no verdict; nothing to assert."
             exit 0
           fi
-          COMMENTS=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json comments --jq '.comments[].body')
+          # gh's --jq is gojq, which reads the process environment via `env`;
+          # ISO-8601 UTC strings compare correctly as strings.
+          COMMENTS=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json comments \
+            --jq '[.comments[] | select(.createdAt >= env.SINCE) | .body] | join("\n")')
           if grep -qF '<!-- AUTOMERGE-DECISION-V1 -->' <<<"$COMMENTS"; then
-            echo "V1 decision block found on PR #$PR_NUMBER — review deliverable present."
+            echo "V1 decision block posted during this run (since $SINCE) on PR #$PR_NUMBER — review deliverable present."
             exit 0
           fi
-          echo "No AUTOMERGE-DECISION-V1 comment on PR #$PR_NUMBER — the review produced no verdict."
+          echo "No AUTOMERGE-DECISION-V1 comment posted during this run (since $SINCE) on PR #$PR_NUMBER — the review produced no verdict."
           # Surface the agent's ACTUAL error instead of guessing. The #1 real cause —
           # an invalid/expired CLAUDE_CODE_OAUTH_TOKEN — surfaces here as "401 Invalid
           # bearer token"; without this it is invisible (the execution log is never

@@ -61,7 +61,7 @@ When uncertain, ESCALATE. Uncertainty is not MERGE. A wrong "looks safe" is much
 
 ## Required output shape
 
-Post ONE PR comment via `gh pr comment $PR_NUMBER --body-file <path>`. Structure exactly:
+Write the comment body to `.dep-steward-review.md` with the Write tool, then post it: `gh pr comment $PR_NUMBER --body-file .dep-steward-review.md`. The runner is discarded after the run, so the file needs no cleanup. Structure exactly:
 
 ````
 ## Dependabot review — <MERGE | ESCALATE>
