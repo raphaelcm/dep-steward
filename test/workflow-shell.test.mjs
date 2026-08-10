@@ -250,3 +250,156 @@ test('when every ranked method is refused, one escalation carries them all', () 
   }
   assert.match(stdout, /every ranked merge method was refused/);
 });
+
+// ---- the deliverable assertion, EXECUTED -------------------------------------
+//
+// This step decides whether a review that produced nothing pages a human, and
+// until now nothing exercised it — `bash -n` proves it parses, which is silent
+// about policy. Both of its live failures were policy, not syntax:
+//
+//   1. It accepted ANY AUTOMERGE-DECISION-V1 comment on the PR. A replay whose
+//      post was denied found the STALE comment from an earlier review, and the
+//      step went green over a review that delivered nothing.
+//   2. It then demanded a verdict for a CLOSED PR, which the gate refuses with
+//      `pr_not_open` and deliberately never pages about — so a Dependabot PR
+//      closed while its review was in flight ended in {red + label + assignee}
+//      for a PR nobody can act on.
+//
+// The `gh` stub below pipes canned comment JSON through REAL `jq` using the
+// step's own `--jq` expression, so the timestamp filter under test is the one
+// that ships, not a re-implementation of it.
+
+const ASSERT_GH_STUB = `#!/usr/bin/env bash
+printf '%s\\n' "$*" >> "$GH_LOG"
+case "$1 $2" in
+  "pr view")
+    # The step asks twice: once for headRefName+state, once for comments with a
+    # --jq filter. Dispatch on which fields were requested.
+    for a in "$@"; do
+      case "$a" in
+        *headRefName*) echo "{\\"headRefName\\":\\"$HEAD_BRANCH\\",\\"state\\":\\"$PR_STATE\\"}"; exit 0 ;;
+      esac
+    done
+    # Comments: run the step's own --jq expression over canned data with real jq.
+    expr=""
+    prev=""
+    for a in "$@"; do
+      [ "$prev" = "--jq" ] && expr="$a"
+      prev="$a"
+    done
+    printf '%s' "$PR_COMMENTS_JSON" | jq -r "$expr"
+    exit 0 ;;
+  "pr diff") echo "package.json" ;;
+  *) exit 0 ;;
+esac
+`;
+
+function runAssertStep({ prState, headBranch, comments, since }) {
+  const out = renderTo();
+  const workflow = readFileSync(join(out, '.github/workflows/dependabot-review.yml'), 'utf8');
+  const block = runBlocks(workflow).find((b) => b.stepName.startsWith('Assert the review deliverable exists'));
+  assert.ok(block, 'the deliverable-assertion step must exist — the rest of this test is vacuous without it');
+
+  const bin = mkdtempSync(join(tmpdir(), 'ds-abin-'));
+  writeFileSync(join(bin, 'gh'), ASSERT_GH_STUB, { mode: 0o755 });
+  const ghLog = join(bin, 'gh.log');
+  writeFileSync(ghLog, '');
+  const script = join(bin, 'step.sh');
+  writeFileSync(script, stripActionsExpressions(block.script));
+
+  let status = 0;
+  let stdout = '';
+  try {
+    stdout = execFileSync('bash', ['-e', script], {
+      cwd: out,
+      encoding: 'utf8',
+      stdio: 'pipe',
+      env: {
+        ...process.env,
+        PATH: `${bin}:${process.env.PATH}`,
+        GH_LOG: ghLog,
+        GH_TOKEN: 'x',
+        REPO: 'octocat/repo',
+        PR_NUMBER: '1',
+        PR_STATE: prState,
+        HEAD_BRANCH: headBranch,
+        PR_COMMENTS_JSON: JSON.stringify({ comments }),
+        SINCE: since,
+        EXEC_FILE: '',
+      },
+    });
+  } catch (e) {
+    status = e.status ?? 1;
+    stdout = `${e.stdout ?? ''}${e.stderr ?? ''}`;
+  }
+  const ghCalls = readFileSync(ghLog, 'utf8').split('\n').filter((l) => /^(pr|api|run) /.test(l));
+  return { status, stdout, ghCalls };
+}
+
+const V1 = '<!-- AUTOMERGE-DECISION-V1 -->\n{"recommendation":"merge","our_usage_affected":false}\n<!-- /AUTOMERGE-DECISION-V1 -->';
+const SINGLETON = 'dependabot/npm_and_yarn/ioredis-6.0.0';
+const RUN_START = '2026-08-10T06:00:00Z';
+
+test('assertion: a verdict posted by THIS run satisfies it', () => {
+  const { status, stdout, ghCalls } = runAssertStep({
+    prState: 'OPEN',
+    headBranch: SINGLETON,
+    comments: [{ createdAt: '2026-08-10T06:05:00Z', body: `## Review\n${V1}` }],
+    since: RUN_START,
+  });
+  assert.equal(status, 0, `a fresh verdict must pass:\n${stdout}`);
+  assert.ok(!ghCalls.some((c) => c.includes('needs-human-review')), 'a delivered review must not label');
+});
+
+test('assertion: a STALE verdict from an earlier review does NOT satisfy it', () => {
+  // The exact live false green: the agent's post was denied, its self-check
+  // found this older comment, and the job went green having delivered nothing.
+  const { status, stdout, ghCalls } = runAssertStep({
+    prState: 'OPEN',
+    headBranch: SINGLETON,
+    comments: [{ createdAt: '2026-08-10T04:53:52Z', body: `## Review\n${V1}` }],
+    since: RUN_START,
+  });
+  assert.notEqual(status, 0, 'a review that delivered nothing must go red');
+  assert.match(stdout, /No AUTOMERGE-DECISION-V1 comment posted during this run/);
+  assert.ok(ghCalls.some((c) => c.includes('needs-human-review')), 'it must label so a human sees it');
+});
+
+test('assertion: a CLOSED PR is owed no verdict, and pages nobody', () => {
+  // gate.cjs refuses a closed PR with `pr_not_open` and the auto-merge job keeps
+  // that code out of its escalation allow-list on purpose. This step used to
+  // hold the opposite policy and page about PRs nobody can act on.
+  const { status, stdout, ghCalls } = runAssertStep({
+    prState: 'CLOSED',
+    headBranch: SINGLETON,
+    comments: [],
+    since: RUN_START,
+  });
+  assert.equal(status, 0, `a closed PR must not go red:\n${stdout}`);
+  assert.match(stdout, /is CLOSED, not OPEN/);
+  assert.ok(!ghCalls.some((c) => c.includes('needs-human-review')), 'a closed PR must never be labelled or assigned');
+});
+
+test('assertion: an OPEN singleton with no verdict at all still pages a human', () => {
+  // The invariant the step exists for, unchanged by either scoping fix.
+  const { status, ghCalls } = runAssertStep({
+    prState: 'OPEN',
+    headBranch: SINGLETON,
+    comments: [],
+    since: RUN_START,
+  });
+  assert.notEqual(status, 0, 'a missing verdict on a mergeable PR must go red');
+  assert.ok(ghCalls.some((c) => c.includes('needs-human-review')), 'it must label so a human sees it');
+});
+
+test('assertion: a minor/patch GROUP PR is owed no verdict (the gate merges it verdict-free)', () => {
+  const { status, stdout, ghCalls } = runAssertStep({
+    prState: 'OPEN',
+    headBranch: 'dependabot/npm_and_yarn/npm-minor-patch-abc123',
+    comments: [],
+    since: RUN_START,
+  });
+  assert.equal(status, 0, `a group PR must not go red:\n${stdout}`);
+  assert.match(stdout, /is a minor\/patch group/);
+  assert.ok(!ghCalls.some((c) => c.includes('needs-human-review')), 'a group PR must never be labelled');
+});
