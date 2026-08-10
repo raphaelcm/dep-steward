@@ -28,13 +28,14 @@
  *     `gh pr view <n> --json comments --jq '.comments'`; empty / missing on
  *     group-PR runs.
  *   - ALLOWED_MERGE_METHODS: comma-separated subset of `merge,squash,rebase`
- *     that this repo actually permits, resolved by the workflow from BOTH
- *     restriction layers (repo settings and the default branch's ruleset).
+ *     that this repo appears to permit, resolved by the workflow from the two
+ *     layers it can read (repo settings and the default branch's rules). A
+ *     PRIOR, not an oracle — see the merge-methods section below.
  *
  * Output (stdout): `decision=merge|skip`, `reason=<text>`, `code=<stable-id>`,
- * and `method=` (the merge method, emitted on every call so the caller never
- * computes it). Exit is always 0 — the decision is the contract, not the exit
- * code (keeps `set -e` callers simple).
+ * and `methods=` (the RANKED candidate merge methods, best first, emitted on
+ * every call so the caller never computes them). Exit is always 0 — the
+ * decision is the contract, not the exit code (keeps `set -e` callers simple).
  *
  * `reason` is prose for a human reading the log; `code` is the stable
  * identifier the workflow branches on. They are separate because the caller
@@ -134,34 +135,47 @@ function isWhitelistedPath(p) {
   return false;
 }
 
-// ---- merge method ---------------------------------------------------------
-// The method is a deterministic function of (changed paths, what this repo
-// allows), so it lives here with the rest of the deterministic logic rather
-// than in the workflow's bash, where it could only be tested by grepping YAML.
+// ---- merge methods --------------------------------------------------------
+// A RANKED LIST, not a single choice. The ranking is a deterministic function
+// of (changed paths, what this repo appears to allow), so it lives here with
+// the rest of the deterministic logic rather than in the workflow's bash, where
+// it could only be tested by grepping YAML. The workflow tries the list in
+// order and stops at the first method GitHub accepts.
 //
-// Preference is ordered, not fixed, because a repo can forbid any of the three
-// methods and the gate must pick the best one that is actually available:
+// The list has to reach the workflow intact, because NO PRE-FLIGHT QUERY CAN
+// PREDICT THE ANSWER. Whether GitHub accepts a method has at least five
+// independent inputs — repo settings, repo rulesets, org rulesets, classic
+// branch protection, and the acting token's App scopes versus the PR's changed
+// paths — and two of them are unreadable here by construction:
+//
+//   - classic branch protection (`branches/:branch/protection`, where
+//     `required_linear_history` lives) requires ADMIN to read, and a workflow
+//     `permissions:` block has no key that grants it.
+//   - the App-workflow-scope refusal is not a repo setting at all, so no
+//     endpoint reports it.
+//
+// So ALLOWED_MERGE_METHODS is a prior and a reporting surface, never an oracle.
+// The only authority on "will GitHub accept method M" is asking GitHub to do M.
+// Collapsing this list to its head is how a repo with a hidden restriction gets
+// one refusal and a paged human instead of a merge (Runsense-ai/runsense#2333:
+// both readable layers reported all three methods permitted, and GitHub refused
+// the merge commit anyway).
+//
+// Ranking:
 //
 //   workflow-touching PRs -> merge, then rebase, then squash.
 //     GITHUB_TOKEN can never hold the `workflows` permission, so an
 //     App-authored NEW commit that edits a workflow file is refused. A merge
-//     COMMIT authors no new commit — it preserves Dependabot's own — which is
-//     why it is the one method known to have worked here. A rebase keeps
-//     Dependabot as the author, but GitHub's docs say it "always updates the
-//     committer information and creates new commit SHAs", so it may be refused
-//     for the same reason; second, not first. A squash always produces an
-//     App-authored commit, so it is last and is expected to fail.
+//     COMMIT authors no new commit — it preserves Dependabot's own — so it is
+//     the safest bet when available. Rebase keeps Dependabot as the author and
+//     is DEMONSTRATED to work for workflow-file PRs under GITHUB_TOKEN
+//     (Runsense-ai/runsense#2007 landed one), so it is a real second choice,
+//     not a forlorn hope — which matters on any repo enforcing linear history,
+//     where merge commits are refused outright. A squash always produces an
+//     App-authored commit, so it is last.
 //
 //   everything else -> squash, then rebase, then merge. Squash is the repo
 //     default and the shape every other PR lands in.
-//
-// Both restriction layers matter and they are independent: the repo-level
-// `mergeCommitAllowed`/`rebaseMergeAllowed`/`squashMergeAllowed` settings, AND
-// the default branch's ruleset, whose `pull_request` rule carries its own
-// `allowed_merge_methods`. Reading only the first is how a downstream install
-// concluded its repo forbade merge commits repo-wide and hardcoded `rebase`
-// around a restriction that lived in the ruleset and later went away. The
-// workflow resolves the intersection; this function just picks from it.
 const WORKFLOW_PATH_RE = /^\.github\/workflows\//;
 const PREF_WORKFLOW = ['merge', 'rebase', 'squash'];
 const PREF_DEFAULT = ['squash', 'rebase', 'merge'];
@@ -182,15 +196,16 @@ function parseAllowedMethods(raw) {
     .filter((s) => KNOWN_METHODS.has(s));
 }
 
-// Returns the method name, or 'none' when the repo permits nothing — the caller
-// escalates on 'none' rather than passing an invalid flag to `gh`.
-// On "unknown" we take the head of the preference list and let GitHub refuse if
-// it must. That refusal reaches the workflow's escalate(), which reports the
-// real error — better than silently picking a method that may be wrong.
-function mergeMethodFor(changedPaths, allowedMethods) {
+// Returns the ranked candidate methods, best first — possibly empty, which the
+// caller renders as `none` and escalates on rather than passing an invalid flag
+// to `gh`.
+// On "unknown" the whole preference list survives: a failed query must not
+// narrow the candidates, or an unreadable setting would cost us the fallbacks
+// precisely when we are least sure of the first choice.
+function mergeMethodsFor(changedPaths, allowedMethods) {
   const pref = changedPaths.some((p) => WORKFLOW_PATH_RE.test(p)) ? PREF_WORKFLOW : PREF_DEFAULT;
-  if (allowedMethods === null) return pref[0];
-  return pref.find((m) => allowedMethods.includes(m)) || 'none';
+  if (allowedMethods === null) return [...pref];
+  return pref.filter((m) => allowedMethods.includes(m));
 }
 
 function extractDecisionBlock(body) {
@@ -400,16 +415,21 @@ if ((process.env.GATE_MODE || '') === 'classify') {
 }
 
 const { decision, reason, code } = decide(process.env);
-// `method=` is emitted on EVERY call, including `decision=skip`, so the caller
+// `methods=` is emitted on EVERY call, including `decision=skip`, so the caller
 // never has to compute it and the two can never disagree.
-const method = mergeMethodFor(
+const methods = mergeMethodsFor(
   (process.env.CHANGED_PATHS || '')
     .split('\n')
     .map((s) => s.trim())
     .filter(Boolean),
   parseAllowedMethods(process.env.ALLOWED_MERGE_METHODS),
 );
+// An empty list is a real answer ("this repo permits nothing"), but an empty
+// VALUE would be indistinguishable from a missing line to the caller's `sed`,
+// so it goes out as the same `none` token the workflow uses on the way in.
 // `code=` follows `reason=` so the existing `sed -n 's/^decision=//p'` parsing
 // and gate.test.mjs's /^decision=(\w+)$/m both stay valid.
-process.stdout.write(`decision=${decision}\nreason=${reason}\ncode=${code}\nmethod=${method}\n`);
+process.stdout.write(
+  `decision=${decision}\nreason=${reason}\ncode=${code}\nmethods=${methods.join(',') || 'none'}\n`,
+);
 process.exit(0);

@@ -176,6 +176,29 @@ test('the auto-merge job ARMS GitHub auto-merge rather than merging synchronousl
     'the merge method is gate.cjs output now — computing it in shell puts it where no test can see it');
 });
 
+test('a refused merge method falls through to the next ranked one instead of paging a human', () => {
+  const wf = readFileSync(join(rendered, '.github/workflows/dependabot-review.yml'), 'utf8');
+  // No pre-flight query can predict which method GitHub accepts — classic
+  // branch protection needs admin to read, and the App-workflow-scope refusal
+  // is not a repo setting at all. So the gate's RANKED list must be tried in
+  // order; stopping at the first refusal is the defect (Runsense-ai/runsense#2333:
+  // every readable layer said merge commits were fine, GitHub refused anyway,
+  // and two working methods went untried).
+  assert.match(wf, /METHODS=\$\(echo "\$GATE_OUT" \| sed -n 's\/\^methods=\/\/p'\)/);
+  assert.match(wf, /for METHOD in "\$@"; do/);
+  assert.match(wf, /MERGED_WITH="\$METHOD"\s*\n\s*break/);
+  assert.doesNotMatch(wf, /escalate "enabling auto-merge \(--\$METHOD\) failed/,
+    'escalating on the FIRST refusal is exactly the behaviour the loop replaces');
+  // The refusal is not classified by matching GitHub's error prose — this step
+  // already refuses to parse prose to decide whether to page someone.
+  assert.doesNotMatch(wf, /Merge commits are not allowed/,
+    'pattern-matching GitHub error text is the fragile classifier this design avoids');
+  // Escalation carries EVERY method and what GitHub said to each; one method
+  // and one error is not enough for a human to act on.
+  assert.match(wf, /TRAIL=\$\(printf '%s--%s: %s\\n'/);
+  assert.match(wf, /escalate "\$\(printf 'every ranked merge method was refused/);
+});
+
 test('a later refusal DISARMS an earlier arm, and fails closed when it cannot tell', () => {
   const wf = readFileSync(join(rendered, '.github/workflows/dependabot-review.yml'), 'utf8');
   // Arming is a latch and the gate re-derives on every wake, so a later `skip`
@@ -200,24 +223,28 @@ test('every failure after the gate authorizes escalates to a human, never a sile
   const gateStep = wf.slice(wf.indexOf('Deterministic auto-merge gate'), wf.indexOf('\n  autofix:'));
   assert.match(gateStep, /escalate\(\) \{/);
   assert.match(gateStep, /--add-label needs-human-review --add-assignee octocat/);
-  assert.match(gateStep, /escalate "enabling auto-merge \(--\$METHOD\) failed/);
-  assert.match(gateStep, /if \[ "\$METHOD" = "none" \]/,
+  assert.match(gateStep, /escalate "\$\(printf 'every ranked merge method was refused/);
+  assert.match(gateStep, /if \[ "\$METHODS" = "none" \] \|\| \[ -z "\$METHODS" \]/,
     'a repo permitting no merge method must escalate, not pass `--none` to gh');
 });
 
-test('the merge method comes from the repo, resolved across BOTH restriction layers', () => {
+test('the merge methods come from the repo, resolved across every layer the token can read', () => {
   const wf = readFileSync(join(rendered, '.github/workflows/dependabot-review.yml'), 'utf8');
-  // Merge methods can be forbidden by repo settings AND, independently, by the
-  // default branch's ruleset. A downstream install read only the first,
-  // concluded its repo banned merge commits repo-wide, and hardcoded `rebase`
-  // around a restriction that lived in the ruleset and later went away.
+  // Three readable layers, all independent: repo settings, the `pull_request`
+  // rule's allowed_merge_methods, and a `required_linear_history` rule — which
+  // bans merge commits while saying nothing about allowed_merge_methods, so a
+  // repo can advertise all three methods and still refuse one.
   assert.match(wf, /mergeCommitAllowed,rebaseMergeAllowed,squashMergeAllowed/);
   assert.match(wf, /allowed_merge_methods/);
   assert.match(wf, /rules\/branches\/\$DEFAULT_BRANCH/);
+  assert.match(wf, /any\(\.\[\]; \.type=="required_linear_history"\)/);
   assert.match(wf, /ALLOWED_MERGE_METHODS: \$\{\{ steps\.methods\.outputs\.allowed_merge_methods \}\}/);
-  assert.match(wf, /METHOD=\$\(echo "\$GATE_OUT" \| sed -n 's\/\^method=\/\/p'\)/);
+  assert.match(wf, /METHODS=\$\(echo "\$GATE_OUT" \| sed -n 's\/\^methods=\/\/p'\)/);
   // "could not read it" must stay distinguishable from "nothing is allowed".
   assert.match(wf, /"ok:" \+/);
+  // One request, two readings — the two restrictions ride in the same response.
+  assert.equal((wf.match(/gh api "repos\/\$REPO\/rules\/branches\/\$DEFAULT_BRANCH"/g) || []).length, 1,
+    'the rules endpoint is fetched once and read twice, not called per restriction');
 });
 
 // ---- a refusal that can never resolve reaches a human ----------------------

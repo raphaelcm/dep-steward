@@ -319,16 +319,28 @@ jobs:
         if: steps.pr.outputs.skip != 'true'
         id: methods
         # A capability probe: reads settings, writes one output, touches nothing.
-        # Two INDEPENDENT layers can forbid a merge method, and reading only the
-        # first is a real trap — a downstream install once concluded its repo
-        # banned merge commits repo-wide and hardcoded `rebase` around a
-        # restriction that actually lived in the ruleset, and later went away.
+        # It produces a PRIOR for the gate's ranking, NOT a verdict — the arm
+        # step below is what actually finds out, by asking GitHub.
+        #
+        # Three readable restriction layers, all independent:
         #   1. repo settings: mergeCommitAllowed / rebaseMergeAllowed / squashMergeAllowed
-        #   2. the default branch's ruleset: the `pull_request` rule's own
+        #   2. the default branch's rules: the `pull_request` rule's own
         #      `allowed_merge_methods` (absent = the rule imposes no restriction)
-        # The gate gets the INTERSECTION. Either query failing leaves the value
-        # empty, which the gate reads as "could not tell" and handles by trying
-        # its first choice — a refusal there is loud, via escalate() below.
+        #   3. the same rules response: a `required_linear_history` rule, which
+        #      bans merge commits without ever appearing in either list above
+        # The gate gets the INTERSECTION. Any query failing leaves the value
+        # empty, which the gate reads as "could not tell" and answers with its
+        # full ranked list rather than a narrowed one.
+        #
+        # What this step CANNOT see, and why the arm step must still fall back:
+        #   - classic branch protection (`branches/:branch/protection`), where a
+        #     `required_linear_history` toggle can also live. That read requires
+        #     ADMIN and a workflow `permissions:` block has no key granting it,
+        #     so the call would 403 and is deliberately not made. Runsense hit
+        #     exactly this: layers 1 and 2 both reported all three methods
+        #     permitted, and GitHub refused the merge commit anyway.
+        #   - the App-workflow-scope refusal, which is a property of the token
+        #     and the PR's changed paths, not a repo setting any endpoint serves.
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
@@ -358,13 +370,26 @@ jobs:
           # trust the payload shape.
           [ -n "$DEFAULT_BRANCH" ] || DEFAULT_BRANCH=$(gh repo view "$REPO" \
             --json defaultBranchRef --jq '.defaultBranchRef.name' 2>/dev/null || echo "")
+          # Fetched ONCE and read twice: the merge-method list and the
+          # linear-history rule are two restrictions carried in one response,
+          # and a second call for the second reading would pay twice for the
+          # same bytes.
+          RULES_JSON=$(gh api "repos/$REPO/rules/branches/$DEFAULT_BRANCH" 2>/dev/null || echo "")
           # No `pull_request` rule, a rule that sets no allowed_merge_methods, or
           # a failed query all mean the same thing HERE — do not narrow — so
           # collapsing them is safe, unlike above.
-          RULE_METHODS=$(gh api "repos/$REPO/rules/branches/$DEFAULT_BRANCH" \
-            --jq '[.[] | select(.type=="pull_request")
-                       | .parameters.allowed_merge_methods // empty] | first // [] | join(",")' \
+          RULE_METHODS=$(printf '%s' "$RULES_JSON" \
+            | jq -r '[.[] | select(.type=="pull_request")
+                          | .parameters.allowed_merge_methods // empty] | first // [] | join(",")' \
             2>/dev/null || echo "")
+          # `required_linear_history` forbids merge commits while saying nothing
+          # about `allowed_merge_methods`, so a repo can advertise all three
+          # methods and still refuse one of them. It carries no parameters —
+          # its presence IS the restriction.
+          LINEAR=$(printf '%s' "$RULES_JSON" \
+            | jq -r 'if any(.[]; .type=="required_linear_history") then "yes" else "no" end' \
+            2>/dev/null || echo "no")
+          [ "$LINEAR" = "yes" ] || LINEAR=no
           if [ -z "$RULE_METHODS" ]; then
             ALLOWED="$REPO_METHODS"
           else
@@ -375,12 +400,20 @@ jobs:
               ALLOWED="${ALLOWED:+$ALLOWED,}$m"
             done
           fi
+          if [ "$LINEAR" = "yes" ]; then
+            NARROWED=''
+            for m in squash rebase; do
+              case ",$ALLOWED," in *",$m,"*) NARROWED="${NARROWED:+$NARROWED,}$m" ;; esac
+            done
+            ALLOWED="$NARROWED"
+          fi
           # A real "nothing allowed" answer must stay distinguishable from a
           # failed query, so send a non-empty token the gate reads as an empty
           # set rather than as silence.
           [ -n "$ALLOWED" ] || ALLOWED=none
           echo "allowed_merge_methods=$ALLOWED" >> "$GITHUB_OUTPUT"
-          echo "Repo allows: '$REPO_METHODS'; ruleset allows: '${RULE_METHODS:-(unrestricted)}'; effective: '$ALLOWED'"
+          echo "Repo allows: '$REPO_METHODS'; branch rules allow: '${RULE_METHODS:-(unrestricted)}'; linear history: $LINEAR; effective: '$ALLOWED'"
+          echo "This is a prior, not a verdict — restrictions in classic branch protection and in App token scopes are invisible here, so the arm step tries the ranked list in order."
 
       - name: Deterministic auto-merge gate
         if: steps.pr.outputs.skip != 'true'
@@ -413,9 +446,10 @@ jobs:
           # step branches on. Re-parsing prose to decide whether to page someone
           # is how a notifier goes wrong.
           CODE=$(echo "$GATE_OUT" | sed -n 's/^code=//p')
-          # The merge method is deterministic logic over the changed paths and
-          # what this repo allows, so gate.cjs owns it. This step never computes it.
-          METHOD=$(echo "$GATE_OUT" | sed -n 's/^method=//p')
+          # The ranked merge methods are deterministic logic over the changed
+          # paths and what this repo allows, so gate.cjs owns them. This step
+          # never computes them — it only tries them in the order given.
+          METHODS=$(echo "$GATE_OUT" | sed -n 's/^methods=//p')
 
           # Label + assign + comment. Both callers below share it; they differ in
           # whether the job then goes red, which is the real distinction between
@@ -547,8 +581,8 @@ jobs:
             exit 1
           }
 
-          if [ "$METHOD" = "none" ]; then
-            escalate "this repository permits no merge method (checked both the repo settings and the default branch's ruleset), so there is nothing to arm. Enable at least one of merge/squash/rebase."
+          if [ "$METHODS" = "none" ] || [ -z "$METHODS" ]; then
+            escalate "this repository permits no merge method (checked the repo settings and the default branch's rules), so there is nothing to arm. Enable at least one of merge/squash/rebase."
           fi
 
           # Arm GitHub's native auto-merge rather than merging imperatively.
@@ -567,8 +601,44 @@ jobs:
           # holds the request and merges the moment every requirement is
           # satisfied, instead of the step failing with no retry. Re-arming an
           # already-armed PR is a no-op, so repeated wakes are safe.
-          echo "Arming auto-merge on PR #$PR_NUMBER, method $METHOD ($REASON)"
-          if ! ARM_OUT=$(gh pr merge "$PR_NUMBER" --repo "$REPO" --auto "--$METHOD" --delete-branch 2>&1); then
-            escalate "enabling auto-merge (--$METHOD) failed: $ARM_OUT"
+          #
+          # TRY THE RANKED LIST IN ORDER. The probe above is a prior, not a
+          # verdict — restrictions living in classic branch protection or in the
+          # token's App scopes are invisible to it, so the first choice can be
+          # refused by a repo that reported it as permitted. One refusal used to
+          # end the run and page a human while a perfectly good second choice
+          # went untried; that is the defect this loop closes.
+          #
+          # The refusal is NOT classified by matching GitHub's error prose. This
+          # step already refuses to parse prose to decide whether to page
+          # someone, and the same reasoning applies here: a failure that is not
+          # about the method (unmergeable, 403, rate limit) fails identically on
+          # every candidate, so it costs at most two extra calls and arrives at
+          # the same escalation — carrying every error instead of only the first.
+          MERGED_WITH=''
+          TRAIL=''
+          # Field-splitting on the comma happens once, when `for` expands the
+          # list, so IFS is restored immediately and the body runs under the
+          # normal one.
+          OLD_IFS=$IFS
+          IFS=','
+          # shellcheck disable=SC2086
+          set -- $METHODS
+          IFS=$OLD_IFS
+          for METHOD in "$@"; do
+            echo "Arming auto-merge on PR #$PR_NUMBER, method $METHOD ($REASON)"
+            # `set -e` is disarmed inside an `if` condition, so a refusal here
+            # reaches the next line instead of killing the step mid-list.
+            if ARM_OUT=$(gh pr merge "$PR_NUMBER" --repo "$REPO" --auto "--$METHOD" --delete-branch 2>&1); then
+              MERGED_WITH="$METHOD"
+              break
+            fi
+            TRAIL=$(printf '%s--%s: %s\n' "$TRAIL" "$METHOD" "$ARM_OUT")
+            echo "::notice::PR #$PR_NUMBER: GitHub refused --$METHOD ($ARM_OUT). Trying the next ranked method."
+          done
+
+          if [ -z "$MERGED_WITH" ]; then
+            escalate "$(printf 'every ranked merge method was refused (ranked: %s):\n\n%s' "$METHODS" "$TRAIL")"
           fi
+          echo "Auto-merge armed on PR #$PR_NUMBER with --$MERGED_WITH."
 #__AUTOFIX_JOB__
