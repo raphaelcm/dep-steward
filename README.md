@@ -110,7 +110,16 @@ When autofix can't produce a clean, minimal fix — the break isn't clearly the 
 
 ## Claude Code plugin
 
-This repo is also a [Claude Code plugin](https://code.claude.com/docs/en/plugins), in review for [Anthropic's community plugin marketplace](https://github.com/anthropics/claude-plugins-community). The install commands will appear here when the listing goes live; its three commands — `/dep-steward:install`, `/dep-steward:summary`, `/dep-steward:uninstall` — then follow you into every repo you work in.
+This repo is also a [Claude Code plugin](https://code.claude.com/docs/en/plugins) **and its own marketplace**, so it installs in two commands, from here, with no third-party listing in the way:
+
+```
+/plugin marketplace add raphaelcm/dep-steward
+/plugin install dep-steward@dep-steward
+```
+
+Its three commands — `/dep-steward:install`, `/dep-steward:summary`, `/dep-steward:uninstall` — then follow you into every repo you work in. (From a shell, the same two as `claude plugin marketplace add raphaelcm/dep-steward` and `claude plugin install dep-steward@dep-steward`.)
+
+A listing in [Anthropic's community marketplace](https://github.com/anthropics/claude-plugins-community) is submitted and pending review. That would add a second install path — `@claude-community` — rather than replace this one, so nothing here depends on it.
 
 | Command | What it does |
 |---|---|
