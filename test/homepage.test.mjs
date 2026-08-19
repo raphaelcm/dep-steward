@@ -62,12 +62,24 @@ test('the commands the page advertises are the skills that exist', () => {
   }
 });
 
-test('the page names the marketplace but instructs no command that fails before listing', () => {
-  // Until dep-steward appears in the community catalog, any /plugin install
-  // line on the page is an instruction that errors for whoever runs it.
-  assert.ok(html.includes('https://github.com/anthropics/claude-plugins-community'), 'links the community marketplace');
-  assert.ok(!text.includes('/plugin install dep-steward@'), 'no not-yet-working install command');
-  assert.ok(!text.includes('/plugin marketplace add raphaelcm/'), 'no self-marketplace command');
+test('the plugin install lines are byte-identical to the README’s', () => {
+  // Two copies of a two-command sequence is two things to drift. The page is
+  // the surface a stranger runs the commands from, so it must carry the
+  // README’s exactly — a wrong marketplace id or plugin id resolves nothing
+  // and reads to them as a broken product, not a typo.
+  const readme = readFileSync(join(REPO, 'README.md'), 'utf8');
+  const cmds = [...readme.matchAll(/^\/plugin (?:marketplace add|install) \S+$/gm)].map((m) => m[0]);
+  assert.deepEqual(
+    cmds,
+    ['/plugin marketplace add raphaelcm/dep-steward', '/plugin install dep-steward@dep-steward'],
+    'the README must document both plugin commands, add before install',
+  );
+  for (const cmd of cmds) {
+    assert.ok(text.includes(cmd), `the page must carry the README’s "${cmd}" verbatim`);
+  }
+  const copies = [...html.matchAll(/data-copy='([^']+)'/g)].map((m) => m[1]).filter((c) => c.startsWith('/plugin'));
+  assert.ok(copies.length >= 1, 'the plugin slip needs a copy button');
+  assert.ok(copies.every((c) => cmds.includes(c)), 'every plugin copy button must copy one of the README’s commands');
 });
 
 test('the page is self-contained: no external stylesheets, scripts, or images', () => {
