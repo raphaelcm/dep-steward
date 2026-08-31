@@ -40,6 +40,16 @@ import { fileURLToPath } from 'node:url';
  *     job's entire first step, and its comments carry no decision block, so
  *     nothing needs to wake on them.
  *
+ * And the no-passthrough half is FLAG-granular, not verb-granular: an
+ * allow-list entry is a prefix wildcard, so it is judged by the worst flag
+ * it admits. `Bash(gh pr view:*)` needs only pull-requests:read at verb
+ * level — a scope the App token has — but the same wildcard admits
+ * `--json statusCheckRollup`, a Checks read, and the review agent burned
+ * turns 403ing through it ("GraphQL: Resource not accessible by
+ * integration", 12 permission denials in one run — observed on
+ * Runsense-ai/runsense#2561, run 33357967765). Verb-level scoping is how
+ * that entry survived the assertion below.
+ *
  * Byte-parity (render.test.mjs) cannot catch any of this: it would have
  * locked the original bug in. Everything below runs over the RENDERED tree,
  * which is what an adopter ships.
@@ -90,6 +100,31 @@ const GH_SCOPES = {
   'run view': { actions: 'read' },
   'run list': { actions: 'read' },
   'release view': { contents: 'read' },
+};
+
+// Scopes a wildcard entry can REACH via flags, beyond what its bare verb
+// needs. An allow-list entry is a PREFIX wildcard — `Bash(gh pr view:*)`
+// admits every flag the verb takes and must be judged by the worst of them:
+// `gh pr view N --json statusCheckRollup` walks into the Checks API (403
+// observed live on the App token: Runsense-ai/runsense#2561, run
+// 33357967765 — 12 permission denials that run). Verb-level GH_SCOPES
+// cannot see this: `pr view` maps to pull-requests:read, a scope the App
+// token HAS, which is exactly how the dead entry survived assertion #4.
+// Judgment recorded deliberately, like the statuses omission above: an
+// empty entry means "vetted — no flag crosses a scope boundary". Keys must
+// mirror GH_SCOPES exactly (asserted below), so adding a verb forces this
+// vetting instead of silently defaulting to no reach.
+const GH_FLAG_REACH = {
+  'pr view': { checks: 'read' },
+  'pr diff': {},
+  'pr list': { checks: 'read' }, // same --json field surface as pr view
+  'pr comment': {},
+  'pr edit': {},
+  'pr merge': {},
+  'pr checks': {},
+  'run view': {},
+  'run list': {},
+  'release view': {},
 };
 
 // Non-`gh` allow-list entries. `grep` shells out locally and needs no GitHub
@@ -216,6 +251,20 @@ function scopesNeededBy(tools) {
   return need;
 }
 
+// What an entry can REACH, not just what its bare verb needs: GH_SCOPES
+// unioned with GH_FLAG_REACH. This is the measure for a no-passthrough job,
+// where the only control over a wildcard's flag surface is subtraction.
+function scopesReachableBy(tools) {
+  const need = scopesNeededBy(tools);
+  for (const t of tools) {
+    if (t.kind !== 'gh') continue;
+    for (const [scope, level] of Object.entries(GH_FLAG_REACH[t.name] ?? {})) {
+      if (!need[scope] || LEVEL[level] > LEVEL[need[scope]]) need[scope] = level;
+    }
+  }
+  return need;
+}
+
 const AGENT_JOBS = Object.entries(JOBS).filter(([, j]) => allowlistedTools(j.body) !== null);
 
 // ---- 1. the parser actually found something -------------------------------
@@ -262,6 +311,10 @@ for (const [name, j] of AGENT_JOBS) {
       // Superset, deliberately: `id-token: write` maps to no command (it serves
       // the action's OIDC fallback), so demanding equality would fail on a
       // legitimate grant.
+      // NEED, not reach: grants track what the prompts order; demanding
+      // grants ⊇ flag-reach would inflate scopes past "neither missing nor
+      // quietly over-granted". Reach matters where no lever exists — the
+      // no-passthrough branch below.
       const need = scopesNeededBy(allowlistedTools(j.body));
       const got = j.permissions;
       for (const [scope, level] of Object.entries(need)) {
@@ -273,17 +326,22 @@ for (const [name, j] of AGENT_JOBS) {
       }
     });
   } else {
-    test(`${name}: no github_token, so no allow-listed command may need a scope the App token lacks`, () => {
+    test(`${name}: no github_token, so no allow-listed command may REACH a scope the App token lacks`, () => {
       // Without the passthrough the agent's gh runs on the Claude App token,
-      // and the job's permissions block is irrelevant to it. A command needing
-      // checks/actions here is the original blind-review defect coming back:
-      // it 403s on every call and the model reports blindness as risk.
-      const need = scopesNeededBy(allowlistedTools(j.body));
-      for (const scope of Object.keys(need)) {
+      // and the job's permissions block is irrelevant to it. A command whose
+      // wildcard reaches checks/actions here is the blind-review defect
+      // coming back: it 403s and the model reports blindness as risk.
+      // REACH, not need — the flags count: `gh pr view` needs only
+      // pull-requests:read, and its `--json statusCheckRollup` still 403'd
+      // straight through the needs-based version of this assertion
+      // (Runsense-ai/runsense#2561, run 33357967765; cf. the verb-level
+      // #2335 failure in the header).
+      const reach = scopesReachableBy(allowlistedTools(j.body));
+      for (const scope of Object.keys(reach)) {
         assert.ok(
           !APP_TOKEN_LACKS.has(scope),
-          `${name} allow-lists a command needing "${scope}", which the Claude App token cannot read — ` +
-            'either drop the tool or pass github_token (and read the identity contract in the workflow header first)',
+          `${name} allow-lists a command that can reach "${scope}" via its flags, which the Claude App token cannot read — ` +
+            'drop the tool (compute the fact in the workflow and inject it into the prompt) or pass github_token (and read the identity contract in the workflow header first)',
         );
       }
     });
@@ -342,4 +400,75 @@ test('auto-merge keeps contents:write + actions:read (hardcoded — this job mer
   assert.equal(JOBS['auto-merge'].permissions['pull-requests'], 'write');
   assert.equal(JOBS['auto-merge'].permissions.actions, 'read');
   assert.equal(JOBS['auto-merge'].permissions['id-token'], undefined, 'the gate needs no OIDC token');
+});
+
+// ---- 9. the flag-reach table mirrors the scope table ----------------------
+
+test('every GH_SCOPES verb has a GH_FLAG_REACH entry (a silent "no reach" default is how the last gap survived)', () => {
+  // GH_SCOPES throws on an unmapped verb; this gives GH_FLAG_REACH the same
+  // loudness. A verb added to one table without the flag-vetting judgment in
+  // the other would default to "no reach" — precisely the shape of gap that
+  // let `pr view` sit in the review allow-list for months.
+  assert.deepEqual(Object.keys(GH_FLAG_REACH).sort(), Object.keys(GH_SCOPES).sort());
+});
+
+// ---- 10. a token-less agent's allow-list holds only what its prompt orders --
+
+for (const [name, j] of AGENT_JOBS) {
+  if (hasTokenPassthrough(j.body)) continue;
+  test(`${name}: every allow-listed gh command is ordered by its prompt (dead capability is an instruction nobody wrote)`, () => {
+    // "The tools' presence in the allow-list was itself the instruction to
+    // use them" (#19). For an agent on the App token, an entry the prompt
+    // never orders is a standing invitation to improvise on a flag surface
+    // the verb tables cannot fully see: `Bash(gh pr view:*)` sat here
+    // ordered by nothing — the workflow injects the PR number and author as
+    // text — while the agent burned turns 403ing through its --json flags
+    // (Runsense-ai/runsense#2561, run 33357967765). The autofix job is
+    // exempt by construction: it passes github_token, its surface is
+    // governed by the grant assertions above, and its un-ordered entries
+    // are legitimate diagnosis latitude. Local commands (grep) have no
+    // token or scope surface and are not covered.
+    const promptText = readFileSync(join(rendered, '.github', promptFor(j.body)[0]), 'utf8');
+    const ordered = new Set(commandsOrderedBy(promptText));
+    for (const t of allowlistedTools(j.body)) {
+      if (t.kind !== 'gh') continue;
+      assert.ok(
+        ordered.has(t.name),
+        `${name} allow-lists "gh ${t.name}" but its prompt never orders it — ` +
+          'remove the entry, or order it from the prompt (and re-run the scope assertions)',
+      );
+    }
+  });
+}
+
+// ---- 11. capability floors, hardcoded on purpose ---------------------------
+
+// Anchored to the PARSED allow-list, not a regex over the job body: the job
+// bodies also mention these entries in prose (the review job's env comment
+// quotes `Bash(gh pr diff:*)` verbatim), and a body regex stays green on that
+// comment after the real entry is deleted — caught by falsifying this very
+// test.
+function allowedGh(jobBody) {
+  return new Set(allowlistedTools(jobBody).filter((t) => t.kind === 'gh').map((t) => t.name));
+}
+
+test('review keeps Bash(gh pr diff:*) — the diff is the thing under review', () => {
+  // Over-narrowing is the opposite failure of everything above: a reviewer
+  // denied the diff still posts an escalate-shaped V1 block, every job stays
+  // green, and nobody learns the review was void (the diagnose step asserts
+  // on a DENIED diff at runtime because exactly that happened in the 2.1.207
+  // "Contains expansion" wave). Assertion #3 catches a lone allow-list
+  // deletion but goes vacuous when the prompt line is deleted with it, so
+  // the floor is pinned here independently of the prompt.
+  assert.ok(allowedGh(JOBS.review.body).has('pr diff'));
+});
+
+test('autofix keeps Bash(gh pr checks:*) and Bash(gh run view:*) — reading the failing run is its whole first step', () => {
+  // The review job's subtraction must never be copied to the job whose
+  // contract is reading CI: without these two the fixer diagnoses blind and
+  // "found nothing it could safely fix" every time (the #2335 era, runs
+  // 31356783516/31356783466). It passes github_token and grants checks:read
+  // + actions:read precisely so these entries work.
+  assert.ok(allowedGh(JOBS.autofix.body).has('pr checks'));
+  assert.ok(allowedGh(JOBS.autofix.body).has('run view'));
 });

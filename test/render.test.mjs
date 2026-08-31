@@ -316,8 +316,11 @@ test('both prompt-loads bake in the literal PR number, never cat the raw prompt'
   // So `gh pr diff $PR_NUMBER` must be substituted to `gh pr diff <n>` before the agent
   // sees it, or every gh call is denied and the review times out with no verdict. Both
   // the review and autofix prompt-loads substitute; neither cats the raw prompt.
-  assert.ok(wf.includes('sed "s/\\$PR_NUMBER/$PR_NUMBER/g" .github/dependabot-review-prompt.md'),
-    'review prompt-load must substitute the literal PR number');
+  // The review load also bakes the PR author (hard rule 3 compares against it now
+  // that the agent holds no `gh pr view`), on a `|` delimiter — the value is
+  // `app/dependabot` on every routine run, and a `/` would end the s command.
+  assert.ok(wf.includes('sed -e "s/\\$PR_NUMBER/$PR_NUMBER/g" -e "s|\\$PR_AUTHOR|$PR_AUTHOR|g" .github/dependabot-review-prompt.md'),
+    'review prompt-load must substitute the literal PR number and the author');
   assert.ok(wf.includes('sed "s/\\$PR_NUMBER/$PR_NUMBER/g" .github/dependabot-autofix-prompt.md'),
     'autofix prompt-load must substitute the literal PR number');
   assert.doesNotMatch(wf, /cat \.github\/dependabot-(review|autofix)-prompt\.md/,

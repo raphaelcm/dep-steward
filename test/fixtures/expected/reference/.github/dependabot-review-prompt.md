@@ -1,6 +1,6 @@
 # Dependabot PR review — agent prompt
 
-> **Your only actions: post ONE PR comment via `gh pr comment`, and — only when escalating — add the `needs-human-review` label via `gh pr edit`.** Investigate freely with `gh`, `git log`, `grep`, file reads, and `WebFetch`. Do NOT merge, approve, push commits, or edit the PR title/description/labels (other than adding `needs-human-review`).
+> **Your only actions: post ONE PR comment via `gh pr comment`, and — only when escalating — add the `needs-human-review` label via `gh pr edit`.** Investigate freely with `grep`, file reads, and `WebFetch`. Do NOT merge, approve, push commits, or edit the PR title/description/labels (other than adding `needs-human-review`).
 
 ## How the merge decision works
 
@@ -47,7 +47,7 @@ For any major bump (and for multi-major jumps like `25 → 29`, MULTIPLY the rig
 
 - Bumped package's release notes mention a CVE / security advisory affecting our use → ESCALATE with **PRIORITY** noted at the top of the comment (these are the highest-value Dependabot PRs).
 - Any changed file outside the dependency manifests/lockfiles for your configured ecosystems (npm, pip, cargo, gomod, docker, github-actions) → ESCALATE (Dependabot shouldn't be touching source; treat as suspicious). The gate will also reject on whitelist, but you should still flag it.
-- PR is not from Dependabot (manual `workflow_dispatch` on a non-Dependabot PR) → ESCALATE with a note that this isn't a routine review.
+- This PR was opened by `$PR_AUTHOR`. If that is neither `dependabot[bot]` nor `app/dependabot`, this is a manual `workflow_dispatch` on a non-Dependabot PR → ESCALATE with a note that this isn't a routine review.
 - Changelog unreadable / missing for any non-patch bump → ESCALATE.
 
 ## Decision
