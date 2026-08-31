@@ -403,3 +403,96 @@ test('assertion: a minor/patch GROUP PR is owed no verdict (the gate merges it v
   assert.match(stdout, /is a minor\/patch group/);
   assert.ok(!ghCalls.some((c) => c.includes('needs-human-review')), 'a group PR must never be labelled');
 });
+
+// ---- the prompt load, EXECUTED ----------------------------------------------
+//
+// The Load agent prompt step went from pure text transformation to a step
+// with a gh call and a two-expression sed, and its interesting failure modes
+// are invisible to both `bash -n` and byte-parity:
+//
+//   1. The author sed's delimiter. `gh pr view --json author` renders
+//      Dependabot as `app/dependabot` (gate.cjs documents the spelling
+//      pair), so a `/`-delimited s command dies with a sed syntax error on
+//      EVERY routine run — no review ever happens.
+//   2. A $-token surviving into the agent's prompt. An unsubstituted
+//      $PR_NUMBER is the 2.1.207 "Contains expansion" denial class; an
+//      unsubstituted $PR_AUTHOR silently voids hard rule 3's comparison.
+//
+// The stub gh answers `pr view` with the login itself — the step's --jq runs
+// inside real gh, so the stub emits the command's OUTPUT. `date` is stubbed
+// because the step uses GNU `date -d`, which BSD/macOS date lacks: the
+// timestamp is not what these tests lock, and the suite must pass on a dev
+// Mac (CI is Ubuntu).
+
+const PROMPT_GH_STUB = `#!/usr/bin/env bash
+printf '%s\\n' "$*" >> "$GH_LOG"
+case "$1 $2" in
+  "pr view") echo "$STUB_AUTHOR" ;;
+  *) exit 0 ;;
+esac
+`;
+
+const DATE_STUB = `#!/usr/bin/env bash
+echo "2026-08-10T06:00:00Z"
+`;
+
+function runPromptLoadStep({ stubAuthor }) {
+  const out = renderTo();
+  const workflow = readFileSync(join(out, '.github/workflows/dependabot-review.yml'), 'utf8');
+  const block = runBlocks(workflow).find((b) => b.stepName === 'Load agent prompt');
+  assert.ok(block, 'the Load agent prompt step must exist — the rest of this test is vacuous without it');
+
+  const bin = mkdtempSync(join(tmpdir(), 'ds-pbin-'));
+  writeFileSync(join(bin, 'gh'), PROMPT_GH_STUB, { mode: 0o755 });
+  writeFileSync(join(bin, 'date'), DATE_STUB, { mode: 0o755 });
+  const ghLog = join(bin, 'gh.log');
+  writeFileSync(ghLog, '');
+  const githubOutput = join(bin, 'github_output');
+  writeFileSync(githubOutput, '');
+  const script = join(bin, 'step.sh');
+  writeFileSync(script, stripActionsExpressions(block.script));
+
+  let status = 0;
+  let stderr = '';
+  try {
+    execFileSync('bash', ['-e', script], {
+      cwd: out,
+      encoding: 'utf8',
+      stdio: 'pipe',
+      env: {
+        ...process.env,
+        PATH: `${bin}:${process.env.PATH}`,
+        GH_LOG: ghLog,
+        STUB_AUTHOR: stubAuthor,
+        GH_TOKEN: 'x',
+        REPO: 'octocat/repo',
+        PR_NUMBER: '123',
+        GITHUB_OUTPUT: githubOutput,
+      },
+    });
+  } catch (e) {
+    status = e.status ?? 1;
+    stderr = `${e.stderr ?? ''}`;
+  }
+  const output = readFileSync(githubOutput, 'utf8');
+  const ghCalls = readFileSync(ghLog, 'utf8').split('\n').filter(Boolean);
+  return { status, stderr, output, ghCalls };
+}
+
+test('prompt-load: a slash-bearing author (app/dependabot) survives substitution and no $-token reaches the agent', () => {
+  const { status, stderr, output } = runPromptLoadStep({ stubAuthor: 'app/dependabot' });
+  assert.equal(status, 0, `the step must succeed on the value every routine run produces:\n${stderr}`);
+  assert.match(output, /^prompt<<PROMPT_EOF_8X2Y$/m, 'the rendered prompt must reach GITHUB_OUTPUT as a heredoc');
+  assert.match(output, /^review_started=/m, 'the run-start timestamp must still be emitted');
+  assert.ok(output.includes('gh pr diff 123'), 'the PR number must be baked into the ordered commands');
+  assert.ok(output.includes('`app/dependabot`'), "the author must land in hard rule 3's fact line");
+  assert.ok(!output.includes('$PR_NUMBER'), 'an unsubstituted $PR_NUMBER is the "Contains expansion" denial class');
+  assert.ok(!output.includes('$PR_AUTHOR'), 'an unsubstituted $PR_AUTHOR silently voids the authorship rule');
+});
+
+test('prompt-load: a non-Dependabot author lands verbatim in the escalation rule', () => {
+  const { status, stderr, output, ghCalls } = runPromptLoadStep({ stubAuthor: 'octocat' });
+  assert.equal(status, 0, `the step must succeed:\n${stderr}`);
+  assert.ok(output.includes('`octocat`'), 'the foreign author must be visible to the escalation rule');
+  assert.ok(ghCalls.some((c) => c.startsWith('pr view 123')), 'the author must come from gh pr view on the workflow token');
+});

