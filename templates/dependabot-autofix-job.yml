@@ -55,8 +55,14 @@
             echo "No open PR for $HEAD_BRANCH — nothing to do."; echo "skip=true" >> "$GITHUB_OUTPUT"; exit 0
           fi
           AUTHOR=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json author --jq '.author.login')
+          # Two spellings, one App: gh returns `app/dependabot`, event payloads
+          # return `dependabot[bot]` (gate.cjs documents the pair). And `case`
+          # patterns are GLOBS, so an UNQUOTED dependabot[bot] is a character
+          # class matching `dependabotb`/`dependaboto`/`dependabott` and NOT the
+          # literal login — it would admit a near-miss human account and refuse
+          # the App this step exists to recognise. Quoting makes both literal.
           case "$AUTHOR" in
-            app/dependabot|dependabot[bot]) : ;;
+            'app/dependabot'|'dependabot[bot]') : ;;
             *) echo "PR author is $AUTHOR, not Dependabot — nothing to do."; echo "skip=true" >> "$GITHUB_OUTPUT"; exit 0 ;;
           esac
           echo "pr_number=$PR_NUMBER" >> "$GITHUB_OUTPUT"

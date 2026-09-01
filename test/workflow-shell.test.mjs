@@ -496,3 +496,120 @@ test('prompt-load: a non-Dependabot author lands verbatim in the escalation rule
   assert.ok(output.includes('`octocat`'), 'the foreign author must be visible to the escalation rule');
   assert.ok(ghCalls.some((c) => c.startsWith('pr view 123')), 'the author must come from gh pr view on the workflow token');
 });
+
+// ---- the autofix identity guard, EXECUTED ------------------------------------
+//
+// This step is the autofix job's whole answer to "is this really Dependabot's
+// PR?", and it decides that with a `case`. `case` patterns are GLOBS, which is
+// the trap the auto-merge job already hit and documented for `$ARMED_BY`: an
+// UNQUOTED `dependabot[bot]` is the literal `dependabot` followed by the
+// character class `[bot]`, so it matches `dependabotb`/`dependaboto`/
+// `dependabott` and never the login it is written to match.
+//
+// Both halves of that are wrong in a way reading cannot catch and `bash -n`
+// cannot catch — it parses perfectly either way. Only executing the branch with
+// each spelling shows which logins the guard actually admits, so that is what
+// this does, against the REAL rendered shell.
+
+const RESOLVE_GH_STUB = `#!/usr/bin/env bash
+printf '%s\\n' "$*" >> "$GH_LOG"
+# Both calls in this step pass --jq, so the stub emits the POST-jq value: gh
+# applies the filter itself and prints a bare number / a bare login.
+case "$1 $2" in
+  "pr list") echo "1" ;;
+  "pr view") echo "$STUB_AUTHOR" ;;
+  *) exit 0 ;;
+esac
+`;
+
+function runResolveStep({ author }) {
+  const out = renderTo();
+  const workflow = readFileSync(join(out, '.github/workflows/dependabot-review.yml'), 'utf8');
+  const block = runBlocks(workflow).find((b) => b.stepName.startsWith('Resolve the PR'));
+  assert.ok(block, 'the autofix resolve step must exist — the rest of this test is vacuous without it');
+
+  const bin = mkdtempSync(join(tmpdir(), 'ds-rbin-'));
+  writeFileSync(join(bin, 'gh'), RESOLVE_GH_STUB, { mode: 0o755 });
+  const ghLog = join(bin, 'gh.log');
+  writeFileSync(ghLog, '');
+  // The step's only durable effect is what it writes here; `set -u` also means
+  // it must be set or the block dies before reaching the guard.
+  const githubOutput = join(bin, 'github_output');
+  writeFileSync(githubOutput, '');
+
+  const script = join(bin, 'step.sh');
+  writeFileSync(script, stripActionsExpressions(block.script));
+
+  let status = 0;
+  let stdout = '';
+  try {
+    stdout = execFileSync('bash', ['-e', script], {
+      cwd: out,
+      encoding: 'utf8',
+      stdio: 'pipe',
+      env: {
+        ...process.env,
+        PATH: `${bin}:${process.env.PATH}`,
+        GH_LOG: ghLog,
+        GH_TOKEN: 'x',
+        REPO: 'octocat/repo',
+        HEAD_BRANCH: 'dependabot/npm_and_yarn/ioredis-6.0.0',
+        STUB_AUTHOR: author,
+        GITHUB_OUTPUT: githubOutput,
+      },
+    });
+  } catch (e) {
+    status = e.status ?? 1;
+    stdout = `${e.stdout ?? ''}${e.stderr ?? ''}`;
+  }
+  const outputs = Object.fromEntries(
+    readFileSync(githubOutput, 'utf8')
+      .split('\n')
+      .filter(Boolean)
+      .map((l) => [l.slice(0, l.indexOf('=')), l.slice(l.indexOf('=') + 1)]),
+  );
+  return { status, stdout, outputs };
+}
+
+test('autofix guard: the gh-CLI spelling of Dependabot proceeds', () => {
+  // `gh pr view --json author --jq .author.login` normalizes the Dependabot App
+  // to `app/dependabot`; this is the spelling the step sees in production, so
+  // this case is the one that must never regress while the others are fixed.
+  const { status, stdout, outputs } = runResolveStep({ author: 'app/dependabot' });
+  assert.equal(status, 0, `the live path must succeed:\n${stdout}`);
+  assert.equal(outputs.skip, undefined, 'the real Dependabot must not be skipped');
+  assert.equal(outputs.pr_number, '1');
+  assert.equal(outputs.head_branch, 'dependabot/npm_and_yarn/ioredis-6.0.0');
+});
+
+test('autofix guard: the event-payload spelling of Dependabot also proceeds', () => {
+  // `dependabot[bot]` is the same App as seen from event payloads — the spelling
+  // gate.cjs pairs with `app/dependabot` and the review job compares against.
+  // UNQUOTED, the pattern is a character class and rejects this login outright,
+  // so the arm written to accept it silently skips instead. Nothing today feeds
+  // this spelling here, but the payload is already in scope for this job
+  // (`github.event.workflow_run.actor.login` is `dependabot[bot]`), so the arm
+  // is dead by wiring, not by construction — one refactor from being load-bearing.
+  const { status, stdout, outputs } = runResolveStep({ author: 'dependabot[bot]' });
+  assert.equal(status, 0, `the payload spelling must succeed:\n${stdout}`);
+  assert.equal(outputs.skip, undefined, 'the bracket spelling names the same App and must not be skipped');
+  assert.equal(outputs.pr_number, '1');
+});
+
+test('autofix guard: a login one character off Dependabot is REFUSED', () => {
+  // The other half of the glob bug, and the one that matters without any
+  // refactor: unquoted, `dependabot[bot]` matches `dependabot` + one of b/o/t,
+  // so `dependabott` (unregistered on GitHub, therefore claimable) passes a
+  // check whose entire purpose is confirming the PR is Dependabot's.
+  const { status, stdout, outputs } = runResolveStep({ author: 'dependabott' });
+  assert.equal(status, 0, `a refusal is a clean no-op, not a failure:\n${stdout}`);
+  assert.equal(outputs.skip, 'true', 'a near-miss human login must never satisfy the Dependabot guard');
+  assert.equal(outputs.pr_number, undefined, 'a skipped run must publish no PR for the fixer to edit');
+  assert.match(stdout, /not Dependabot/);
+});
+
+test('autofix guard: an unrelated bot is refused', () => {
+  const { outputs } = runResolveStep({ author: 'renovate[bot]' });
+  assert.equal(outputs.skip, 'true');
+  assert.equal(outputs.pr_number, undefined);
+});
