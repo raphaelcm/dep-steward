@@ -129,6 +129,17 @@ test('the rendered autofix job pushes for a human to merge — it never merges',
   assert.match(autofixJob, /git push origin/);
 });
 
+test('the autofix identity guard matches Dependabot literally, not as a glob', () => {
+  const wf = readFileSync(join(rendered, '.github/workflows/dependabot-review.yml'), 'utf8');
+  const autofixJob = wf.slice(wf.indexOf('\n  autofix:'));
+  // Same trap as the disarm case above: `case` patterns are globs, so an
+  // UNQUOTED dependabot[bot] is a character class matching `dependabotb`, which
+  // both admits a near-miss human login and rejects the App's own payload
+  // spelling. workflow-shell.test.mjs executes both halves; this locks the
+  // spelling in the rendered output.
+  assert.match(autofixJob, /case "\$AUTHOR" in\s*\n\s*'app\/dependabot'\|'dependabot\[bot\]'\)/);
+});
+
 // ---- diagnosability: the frontier model, and real errors surfaced ----------
 
 test('both agent invocations run at the frontier Opus default', () => {
