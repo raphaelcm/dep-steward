@@ -109,7 +109,7 @@ test('by default the autofix job and its two files render, all markers substitut
   const wf = readFileSync(join(rendered, '.github/workflows/dependabot-review.yml'), 'utf8');
   assert.match(wf, /^ {2}autofix:/m);
   assert.match(wf, /workflow_run\.conclusion == 'failure'/);
-  assert.doesNotMatch(wf, /__AUTOFIX_JOB__|__MODEL__|__CI_NAME__|__ASSIGN_FLAG__|__REVIEW_LINT_PATH__/);
+  assert.doesNotMatch(wf, /__AUTOFIX_JOB__|__MODEL__|__CI_NAME__|__ASSIGN_FLAG__|__REVIEW_LINT_PATH__|__REVIEW_ACTION_PIN__|__AUTOFIX_ACTION_PIN__/);
   assert.ok(existsSync(join(rendered, '.github/dependabot-automerge/autofix-bounds.cjs')));
   const prompt = readFileSync(join(rendered, '.github/dependabot-autofix-prompt.md'), 'utf8');
   assert.match(prompt, /--add-label needs-human-review --add-assignee octocat/);
@@ -227,6 +227,20 @@ test('a failed agent run surfaces its actual error, not a guess', () => {
   assert.match(wf, /EXEC_FILE: \$\{\{ steps\.fixer\.outputs\.execution_file \}\}/);
   assert.match(wf, /Invalid bearer token/);
   assert.match(wf, /claude setup-token/);
+});
+
+test('the action pin is a placeholder in both templates, resolved by the installer', () => {
+  // A hardcoded pin here is the defect action-pin.test.mjs exists for: the
+  // template never receives the adopter's Dependabot bumps, so plain text
+  // copied on every render quietly downgrades any repo that has moved on.
+  // install.sh owns the first-install default and keeps a newer repo pin.
+  const review = readFileSync(join(REPO, 'templates/dependabot-review.yml'), 'utf8');
+  const autofix = readFileSync(join(REPO, 'templates/dependabot-autofix-job.yml'), 'utf8');
+  assert.match(review, /uses: anthropics\/claude-code-action@__REVIEW_ACTION_PIN__$/m);
+  assert.match(autofix, /uses: anthropics\/claude-code-action@__AUTOFIX_ACTION_PIN__$/m);
+  for (const [name, text] of [['dependabot-review.yml', review], ['dependabot-autofix-job.yml', autofix]]) {
+    assert.doesNotMatch(text, /claude-code-action@[0-9a-f]{40}/, `templates/${name} hardcodes a pin again`);
+  }
 });
 
 test('both agent jobs run the same SHA-pinned action version', () => {

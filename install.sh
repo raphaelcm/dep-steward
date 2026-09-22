@@ -7,7 +7,9 @@
 #
 # What it does (all idempotent — safe to re-run):
 #   1. Preflight: gh authed with repo+workflow scopes; a GitHub repo in cwd.
-#   2. Detect the JS lockfile(s) and your CI workflow name.
+#   2. Detect your package ecosystems, your CI workflow name, and the
+#      claude-code-action pin your repo already runs (a reinstall keeps it
+#      when it is newer than dep-steward's — never a downgrade).
 #   3. Render the pipeline into .github/ (workflow, prompts, dependabot.yml,
 #      gate, review lint, and the autofix bounds check unless --no-autofix).
 #   4. Create the `needs-human-review` label.
@@ -34,6 +36,16 @@ CDPATH=''
 # the fault, not the model (which is why the installer now verifies the token below).
 # Keep the frontier default.
 DEFAULT_MODEL='claude-opus-4-8'
+
+# The anthropics/claude-code-action pin a FIRST install gets. After that, the
+# installed repo's own Dependabot owns it: the github-actions ecosystem in the
+# rendered dependabot.yml bumps it every week, through the pipeline's own gate,
+# and none of those bumps ever reach this file (Dependabot scans the repo's
+# .github/workflows/, not dep-steward's templates/). So this is a floor for new
+# installs, never a value to write over a repo's newer one — see
+# resolve_action_pins. Raising it is a separate, deliberate change.
+TEMPLATE_ACTION_REF='1623c36729ac1cd5895198cded705a287de7db79'
+TEMPLATE_ACTION_VERSION='v1.0.187'
 REPO_URL='https://github.com/raphaelcm/dep-steward'
 GATE_PATH='.github/dependabot-automerge/gate.cjs'
 REVIEW_LINT_PATH='.github/dependabot-automerge/review-lint.cjs'
@@ -235,6 +247,144 @@ else
   ESCALATABLE_NOTE='ci_failed IS here: autofix is off, so no other job is watching CI and a red build would otherwise strand silently.'
 fi
 
+# ---- the claude-code-action pin (the installed repo owns it) ---------------
+# Both agent jobs pin anthropics/claude-code-action, and the value reaches the
+# templates through the __REVIEW_ACTION_PIN__ / __AUTOFIX_ACTION_PIN__
+# placeholders, resolved per job from the workflow the repo already has:
+#
+#   no existing workflow, or no pin in it   the template's pin
+#   an existing pin                          whichever is newer, compared on the
+#                                            `# vX.Y.Z` comment Dependabot keeps
+#                                            beside the SHA
+#   a version that cannot be compared       the existing pin, and a warning
+#
+# Seen live: a repo on v1.0.230, merged through its own gate that day, would
+# have been moved back to v1.0.187 — 43 releases — by a plain reinstall: an
+# older action and Claude Code than it had vetted, the same bump reopened the
+# next Monday on a PR the reviewer cannot review (it edits this workflow), and
+# the review-lint hook on a runtime it was never tested against. A reinstall
+# must never go backwards, so when in doubt the repo's pin wins.
+EXISTING_WORKFLOW='.github/workflows/dependabot-review.yml'
+REVIEW_ACTION_PIN="$TEMPLATE_ACTION_REF # $TEMPLATE_ACTION_VERSION"
+AUTOFIX_ACTION_PIN="$REVIEW_ACTION_PIN"
+REVIEW_PIN_NOTE=''
+AUTOFIX_PIN_NOTE=''
+
+# The first claude-code-action pin in each job of an existing workflow, as one
+# "<job><TAB><ref><TAB><version comment>" line per job ("-" for a pin outside
+# any job it can name). Line-oriented like the rest of this installer — no YAML
+# parser: jobs are the two-space keys under `jobs:`, which is how every version
+# of this workflow has been laid out.
+existing_action_pins() {
+  awk -v q="'" '
+    BEGIN { pat = "^[ \t]*(-[ \t]+)?uses:[ \t]*[\"" q "]?anthropics/claude-code-action@" }
+    { sub(/\r$/, "") }
+    /^jobs:[ \t]*(#.*)?$/ { injobs = 1; job = ""; next }
+    injobs && /^[^ \t#]/ { injobs = 0 }
+    injobs && /^  [A-Za-z0-9_-]+:[ \t]*(#.*)?$/ { job = $0; sub(/^  /, "", job); sub(/:.*$/, "", job); next }
+    $0 ~ pat {
+      label = (injobs && job != "") ? job : "-"
+      if (label in seen) next
+      seen[label] = 1
+      rest = $0; sub(pat, "", rest)
+      comment = ""
+      h = index(rest, "#")
+      if (h > 0) { comment = substr(rest, h + 1); rest = substr(rest, 1, h - 1) }
+      gsub(/[ \t"]/, "", rest); gsub(q, "", rest)
+      gsub(/\t/, " ", comment)   # the fields travel tab-separated
+      sub(/^[ \t]+/, "", comment); sub(/[ \t]+$/, "", comment)
+      printf "%s\t%s\t%s\n", label, rest, comment
+    }
+  ' "$1"
+}
+
+pin_for_job() { # pin_for_job <job> <existing_action_pins output>
+  printf '%s\n' "$2" | awk -v j="$1" 'BEGIN { FS = "\t" } $1 == j { print; exit }'
+}
+
+# "X.Y.Z" from a "vX.Y.Z" or "X.Y.Z" version comment; nothing for anything else.
+version_of() {
+  printf '%s\n' "$1" | sed -n 's/^v\{0,1\}\([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\)$/\1/p'
+}
+
+# -1, 0 or 1 as the first X.Y.Z is older than, equal to, or newer than the second.
+version_cmp() {
+  awk -v a="$1" -v b="$2" 'BEGIN {
+    split(a, x, "."); split(b, y, ".")
+    for (i = 1; i <= 3; i++) {
+      if (x[i] + 0 > y[i] + 0) { print 1; exit }
+      if (x[i] + 0 < y[i] + 0) { print -1; exit }
+    }
+    print 0
+  }'
+}
+
+# pick_action_pin <job> <a pin line, or empty> <why there is no pin>
+# Sets PICKED_PIN (the text after "anthropics/claude-code-action@") and
+# PICKED_NOTE (the line every run prints).
+pick_action_pin() {
+  _job="$1"
+  if [ -z "$2" ]; then
+    PICKED_PIN="$TEMPLATE_ACTION_REF # $TEMPLATE_ACTION_VERSION"
+    PICKED_NOTE="claude-code-action ($_job job): using the template's $TEMPLATE_ACTION_VERSION ($3)"
+    return 0
+  fi
+  _ref=$(printf '%s\n' "$2" | cut -f2)
+  _comment=$(printf '%s\n' "$2" | cut -f3)
+  PICKED_PIN="$_ref"
+  if [ -n "$_comment" ]; then PICKED_PIN="$_ref # $_comment"; fi
+  _have=$(version_of "$_comment")
+  _tmpl=$(version_of "$TEMPLATE_ACTION_VERSION")
+  if [ -z "$_have" ] || [ -z "$_tmpl" ]; then
+    # Keep the repo's pin: it is the one its gate merged, and a guess in either
+    # direction could be a downgrade.
+    if [ -n "$_comment" ]; then _label="\"$_comment\""; else _label="@$_ref"; fi
+    PICKED_NOTE="claude-code-action ($_job job): keeping $_label from the existing workflow (not comparable with the template's $TEMPLATE_ACTION_VERSION)"
+    warn "claude-code-action ($_job job): the existing pin's version, $_label, cannot be compared with the template's $TEMPLATE_ACTION_VERSION (expected a '# vX.Y.Z' comment), so the existing pin is kept. Check it by hand: anthropics/claude-code-action@$PICKED_PIN"
+    return 0
+  fi
+  if [ "$(version_cmp "$_have" "$_tmpl")" = "-1" ]; then
+    PICKED_PIN="$TEMPLATE_ACTION_REF # $TEMPLATE_ACTION_VERSION"
+    PICKED_NOTE="claude-code-action ($_job job): upgrading $_comment to the template's $TEMPLATE_ACTION_VERSION"
+  else
+    PICKED_NOTE="claude-code-action ($_job job): keeping $_comment from the existing workflow (template has $TEMPLATE_ACTION_VERSION)"
+  fi
+}
+
+# Resolve every rendered occurrence: the review job always, the autofix job
+# when autofix is on. Reads the workflow relative to the current directory, so
+# callers run it where the target repo is: before any emit, which may write
+# over that same file.
+resolve_action_pins() {
+  _pins=''
+  _none='no existing workflow'
+  if [ -f "$EXISTING_WORKFLOW" ]; then
+    _pins=$(existing_action_pins "$EXISTING_WORKFLOW")
+    _none='the existing workflow has no claude-code-action pin'
+  fi
+  # A job's own pin first. A job this install adds — autofix turned on after a
+  # --no-autofix install — has none of its own, and takes the pin the repo
+  # already runs rather than the template's, so the two agent jobs never run
+  # different action versions.
+  _any=$(printf '%s\n' "$_pins" | awk 'NF { print; exit }')
+  _line=$(pin_for_job review "$_pins")
+  pick_action_pin review "${_line:-$_any}" "$_none"
+  REVIEW_ACTION_PIN="$PICKED_PIN"
+  REVIEW_PIN_NOTE="$PICKED_NOTE"
+  if [ "$AUTOFIX" -eq 1 ]; then
+    _line=$(pin_for_job autofix "$_pins")
+    pick_action_pin autofix "${_line:-$_any}" "$_none"
+    AUTOFIX_ACTION_PIN="$PICKED_PIN"
+    AUTOFIX_PIN_NOTE="$PICKED_NOTE"
+  fi
+}
+
+# Printed on every run: --render-only, --dry-run and a real install alike.
+report_action_pins() { # report_action_pins <say|info>
+  "$1" "$REVIEW_PIN_NOTE"
+  if [ "$AUTOFIX" -eq 1 ]; then "$1" "$AUTOFIX_PIN_NOTE"; fi
+}
+
 # ---- render helpers --------------------------------------------------------
 # CI name token for `gh run list --workflow X`: bare when safe, else quoted.
 ci_runlist_token() {
@@ -252,6 +402,11 @@ inject() { # inject <marker> <block> ; filters stdin -> stdout
 }
 
 render_dependabot_yml() { inject '#__UPDATES__' "$DEP_UPDATES" < "$SRC/templates/dependabot.yml"; }
+
+# For a value substituted into a `s|…|…|` replacement that came from a file in
+# the target repo rather than from this installer: `\`, `&` and the `|`
+# delimiter must arrive as themselves.
+sed_escape() { printf '%s\n' "$1" | sed 's/[\\&|]/\\&/g'; }
 
 render_prompt() {
   sed -e "s|__WHITELIST_HUMAN__|$WHITELIST_HUMAN|g" \
@@ -272,6 +427,8 @@ render_workflow() {
           -e "s|__MODEL__|$MODEL|g" \
           -e "s|__GATE_PATH__|$GATE_PATH|g" \
           -e "s|__REVIEW_LINT_PATH__|$REVIEW_LINT_PATH|g" \
+          -e "s|__REVIEW_ACTION_PIN__|$(sed_escape "$REVIEW_ACTION_PIN")|g" \
+          -e "s|__AUTOFIX_ACTION_PIN__|$(sed_escape "$AUTOFIX_ACTION_PIN")|g" \
           -e "s|__ESCALATABLE_NOTE__|$ESCALATABLE_NOTE|g" \
           -e "s,__ESCALATABLE_CODES__,$ESCALATABLE_CODES,g" \
           -e "s|__ASSIGN_FLAG__|$ASSIGN_FLAG|g"
@@ -305,6 +462,9 @@ emit() { # emit <renderer-fn> <dest-path>
 # ---- render-only mode (used by the parity test) ----------------------------
 if [ "$RENDER_ONLY" -eq 1 ]; then
   [ -n "$CI_NAME" ] || CI_NAME='CI'
+  # Before any emit: --out may be the target repo itself, and the pin has to be
+  # read from the workflow before the render replaces it.
+  resolve_action_pins
   emit render_dependabot_yml "$OUT/.github/dependabot.yml"
   emit render_prompt          "$OUT/.github/dependabot-review-prompt.md"
   emit render_workflow        "$OUT/.github/workflows/dependabot-review.yml"
@@ -314,6 +474,7 @@ if [ "$RENDER_ONLY" -eq 1 ]; then
     emit render_autofix_prompt "$OUT/$AUTOFIX_PROMPT_PATH"
     emit render_autofix_bounds "$OUT/$AUTOFIX_BOUNDS_PATH"
   fi
+  report_action_pins say
   say "Rendered to $OUT (ecosystems: $ACTIVE; ci: $CI_NAME; model: $MODEL; assignee: ${ASSIGNEE:-none}; autofix: $([ "$AUTOFIX" -eq 1 ] && echo on || echo off))"
   exit 0
 fi
@@ -356,6 +517,11 @@ if [ -z "$CI_NAME" ]; then
 fi
 [ -n "$CI_NAME" ] || die "could not determine the CI workflow name — re-run with --ci-name \"<name>\" (the gate keys off this exact name; it cannot fire without it)"
 
+# ---- resolve the claude-code-action pin (the repo's own, when newer) -------
+# Here, at the repo root and before the render: the existing workflow is read
+# from the same tree the new one is written into.
+resolve_action_pins
+
 # ---- resolve the escalation assignee (default: you) ------------------------
 if [ "$ASSIGNEE_EXPLICIT" -eq 0 ]; then
   ASSIGNEE=$(gh api user --jq '.login' 2>/dev/null || echo '')
@@ -371,6 +537,7 @@ info "review model: $MODEL"
 info "gate path:    $GATE_PATH"
 info "escalations:  $([ -n "$ASSIGNEE" ] && echo "assign @$ASSIGNEE + label" || echo "label only (no assignee)")"
 info "autofix:      $([ "$AUTOFIX" -eq 1 ] && echo "on — Claude pushes small mechanical fixes for you to merge" || echo "off")"
+report_action_pins info
 say ""
 
 # ---- render (to a temp tree first, for dry-run diffing) --------------------
