@@ -16,7 +16,7 @@ Run this in the repo you want to protect:
 sh -c "$(curl -fsSL https://raw.githubusercontent.com/raphaelcm/dep-steward/main/install.sh)"
 ```
 
-It inspects your repo, shows what it will change, and does it. Re-running is safe (every step is idempotent). Preview without touching anything:
+It inspects your repo, shows what it will change, and does it. Re-running is safe (every step is idempotent), and it is how you upgrade. A re-run keeps the `anthropics/claude-code-action` version your repo's Dependabot has already moved to whenever that is newer than the one dep-steward ships, so an upgrade never downgrades the action; every run says which pin it kept. Preview without touching anything:
 
 ```sh
 sh -c "$(curl -fsSL https://raw.githubusercontent.com/raphaelcm/dep-steward/main/install.sh)" -- --dry-run
@@ -208,6 +208,7 @@ node --test test/*.test.mjs
 - `test/workflow-shell.test.mjs` — every `run:` block in the rendered workflow parses under `bash -n` (the shell GitHub actually runs `run:` blocks with). Nothing else parses the shell the templates generate.
 - `test/permissions.test.mjs` — each agent job grants every GitHub scope the commands in its own prompt need, and an agent left on the Claude App token (no `github_token` passthrough) allow-lists nothing that could reach — even via a flag on a wildcard entry — a scope that token lacks, nor any `gh` command its prompt never orders. Derived from the rendered workflow and prompt rather than hardcoded.
 - `test/plugin.test.mjs` — the plugin and marketplace manifests parse and agree, every skill carries a description, and the README's raw-file links resolve on disk.
+- `test/action-pin.test.mjs` — a reinstall keeps the repo's own `claude-code-action` pin when it is newer than the template's, takes the template's when it is older, keeps the repo's and warns when the versions cannot be compared, and renders a fresh install byte-for-byte as before.
 - `test/review-lint.test.mjs` — the reviewer's prose guard, in both of its modes: it refuses the comment that actually leaked and passes verbatim changelog text that merely mentions CI, and as a hook it blocks only the comment post and never blocks on its own failure.
 - `test/prompt-hygiene.test.mjs` — the rendered review prompt never raises CI as something to consider, with a self-check that its patterns still catch what leaked (so it cannot go quietly vacuous).
 

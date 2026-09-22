@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, writeFileSync, readFileSync, existsSync, chmodSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -67,7 +67,7 @@ esac
 exit 0
 `;
 
-function runInstaller(extraEnv = {}) {
+function runInstaller(extraEnv = {}, { args = [], setup = () => {} } = {}) {
   const bin = mkdtempSync(join(tmpdir(), 'ds-bin-'));
   const ghLog = join(bin, 'gh.log');
   writeFileSync(join(bin, 'gh'), FAKE_GH);
@@ -79,8 +79,9 @@ function runInstaller(extraEnv = {}) {
   writeFileSync(join(repoDir, 'package.json'), '{}\n');
   writeFileSync(join(repoDir, 'package-lock.json'), '{}\n');
   execFileSync('git', ['init', '-q'], { cwd: repoDir });
+  setup(repoDir);
 
-  const stdout = execFileSync('sh', [join(REPO, 'install.sh'), '--ci-name', 'CI'], {
+  const stdout = execFileSync('sh', [join(REPO, 'install.sh'), '--ci-name', 'CI', ...args], {
     cwd: repoDir,
     env: {
       ...process.env,
@@ -169,4 +170,34 @@ test('a token that fails verification is never stored (no opaque bad-token insta
     `a token rejected by the probe must not be written to either store. gh log:\n${badLog}`);
   // Contrast: the default run (probe returns OK) DOES set it in both stores —
   // proven by the 'sets the secret ...' tests above, which share this harness.
+});
+
+// ---- the claude-code-action pin survives a real reinstall --------------------
+//
+// action-pin.test.mjs covers the choice itself through --render-only. These two
+// cover the other entry points: a full install resolves after `cd` to the repo
+// root, and --dry-run must say what it would do.
+
+const TEMPLATE_PIN = '1623c36729ac1cd5895198cded705a287de7db79 # v1.0.187';
+const RUNSENSE_PIN = '4036a180cf690f49529f5d8c79c998855287f590 # v1.0.230';
+const seedWorkflowAt = (pin) => (repoDir) => {
+  const golden = readFileSync(join(REPO, 'test/fixtures/expected/reference/.github/workflows/dependabot-review.yml'), 'utf8');
+  mkdirSync(join(repoDir, '.github', 'workflows'), { recursive: true });
+  writeFileSync(join(repoDir, '.github/workflows/dependabot-review.yml'), golden.split(TEMPLATE_PIN).join(pin));
+};
+const pinsIn = (workflow) => [...workflow.matchAll(/^\s*uses: anthropics\/claude-code-action@(.+)$/gm)].map((m) => m[1].trim());
+
+test('a full reinstall keeps the repo\'s newer claude-code-action pin, and says so', () => {
+  const { repoDir: dir, stdout } = runInstaller({}, { setup: seedWorkflowAt(RUNSENSE_PIN) });
+  const written = readFileSync(join(dir, '.github/workflows/dependabot-review.yml'), 'utf8');
+  assert.deepEqual(pinsIn(written), [RUNSENSE_PIN, RUNSENSE_PIN]);
+  assert.match(stdout, /claude-code-action \(review job\): keeping v1\.0\.230 from the existing workflow \(template has v1\.0\.187\)/);
+});
+
+test('--dry-run reports the pin it would keep, and writes nothing', () => {
+  const { repoDir: dir, stdout } = runInstaller({}, { args: ['--dry-run'], setup: seedWorkflowAt(RUNSENSE_PIN) });
+  assert.match(stdout, /claude-code-action \(review job\): keeping v1\.0\.230 from the existing workflow/);
+  assert.match(stdout, /\[dry-run\] no changes made\./);
+  const onDisk = readFileSync(join(dir, '.github/workflows/dependabot-review.yml'), 'utf8');
+  assert.deepEqual(pinsIn(onDisk), [RUNSENSE_PIN, RUNSENSE_PIN], 'a dry run must not touch the file');
 });

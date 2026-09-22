@@ -157,7 +157,7 @@ jobs:
         # NEVER pass `github_token` here: the App identity that posts the
         # review comment is what fires the gate's issue_comment wake-up
         # (header, "IDENTITY CONTRACT").
-        uses: anthropics/claude-code-action@1623c36729ac1cd5895198cded705a287de7db79 # v1.0.187
+        uses: anthropics/claude-code-action@__REVIEW_ACTION_PIN__
         env:
           PR_NUMBER: ${{ inputs.pr_number || github.event.pull_request.number }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
