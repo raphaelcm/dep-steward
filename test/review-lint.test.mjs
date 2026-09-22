@@ -26,9 +26,10 @@ import { fileURLToPath } from 'node:url';
  * The hard half is NOT flagging legitimate text. A reviewer quoting a test
  * framework's release notes writes "Cannot use --watch in CI" verbatim, and a
  * guard that made it paraphrase would corrupt `breaking_changes_enumerated`,
- * whose contract is "verbatim from changelog". So the tiers below are scoped:
- * only a first-person confession is caught inside a quote, and the negative
- * fixtures here are real upstream phrasings.
+ * whose contract is "verbatim from changelog". So only the reviewer's own
+ * voice is linted, every finding needs a failure to PERCEIVE (not a bare
+ * "cannot"), and the negative fixtures here are real upstream phrasings and
+ * the impact sentences the prompt itself asks for.
  */
 
 const REPO = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -113,11 +114,24 @@ test('body: refuses a first-person confession anywhere in the comment', () => {
   assert.equal(runBody('We were unable to verify the build status here.').decision, 'refuse');
 });
 
-test('body: refuses a claim about CI state — the reviewer cannot know it', () => {
+test('body: refuses a claim about this PR\'s CI state — the reviewer cannot know it', () => {
   // It runs concurrently with CI. "CI is green" is a guess even when true, and
   // a public repo's checks page is reachable through the WebFetch allow.
   assert.equal(runBody('CI is green on this head, so this is safe to merge.').decision, 'refuse');
-  assert.equal(runBody('The build is still pending, but the bump looks routine.').decision, 'refuse');
+  assert.equal(runBody('CI is still pending on this PR, but the bump looks routine.').decision, 'refuse');
+});
+
+test('body: refuses every phrasing of the confession, not just the one that leaked', () => {
+  for (const body of [
+    'Could not verify CI results for this head.',
+    'Unable to confirm the checks are passing from this run.',
+    'I cannot tell whether the build is green, so escalating.',
+    'The checks API returned 403 on this token.',
+    'I could not read CI.',
+    "I don't have access to the PR's check results.",
+  ]) {
+    assert.equal(runBody(body).decision, 'refuse', `must refuse: ${body}`);
+  }
 });
 
 test('body: a version number does not split a clause and hide the leak', () => {
@@ -134,6 +148,44 @@ test('body: posts a clean MERGE comment', () => {
 test('body: posts a clean ESCALATE comment (the reviewer that said nothing about CI)', () => {
   const { decision, reason } = runBody(CLEAN_ESCALATE);
   assert.equal(decision, 'post', reason);
+});
+
+test('body: posts the impact sentence the prompt itself asks for', () => {
+  // The prompt's one question is whether a change REACHES our usage, so a
+  // reviewer writes exactly this. A rule keyed on bare "cannot" refused it,
+  // and on a bump whose changelog is about CI it would keep refusing until the
+  // agent ran out of turns and posted nothing — worse than the leak itself.
+  for (const body of [
+    'Affected: no — the CI-only reporter change cannot reach our usage; we configure no reporters.',
+    'Our usage cannot be affected by the CI reporter change.',
+    'I checked the changelog; the CI reporter output path moved, and we do not read it.',
+  ]) {
+    assert.equal(runBody(body).decision, 'post', `must not refuse the reviewer's own impact analysis: ${body}`);
+  }
+});
+
+test('body: posts release-note paraphrases from the dependencies whose changelogs are about CI', () => {
+  // Build tools, actions/checkout, ci-info, octokit, the artifact actions and
+  // the test-reporter actions all describe CI in their release notes, and a
+  // reviewer summarises them in its own words on the "Changelog scan" line.
+  // "we" and "our" mean this repository in a review, never the reviewer.
+  for (const body of [
+    '**Changelog scan**: 5.0.1 fixes a bug where the build was failing on Windows.',
+    '**Changelog scan**: tests were failing in CI on Node 22 with the new resolver; fixed in 5.0.1.',
+    '**Changelog scan**: the CI job cannot check out private submodules without a token.',
+    '**Changelog scan**: ci-info 4.1 fixes "could not detect CI" on Buildkite, and could not determine CI vendor before.',
+    '**Changelog scan**: octokit v21 cannot access the Actions API without actions: read — we only call the pulls API.',
+    "**Changelog scan**: v4 can't view artifacts from other workflow runs; we never download artifacts.",
+    '**Changelog scan**: 2.3 fixes being unable to read test results when the path contains spaces.',
+  ]) {
+    assert.equal(runBody(body).decision, 'post', `must not refuse a changelog summary: ${body}`);
+  }
+});
+
+test('body: a first-person line inside a blockquote is upstream\'s voice', () => {
+  // Maintainers write release notes in the first person too. Only the
+  // reviewer's own prose is linted.
+  assert.equal(runBody('> I could not reproduce the CI failure on macOS, so this release pins the runner.').decision, 'post');
 });
 
 test('body: posts changelog prose that merely mentions CI', () => {
@@ -293,6 +345,37 @@ test('hook: refuses a comment it cannot read before it is posted', () => {
     assert.equal(status, 2, `must refuse an unlintable form: ${command}`);
     assert.match(stderr, /--body-file \.dep-steward-review\.md/, 'and name the form that works');
   }
+});
+
+test('hook: a -F that belongs to an earlier command is not the body file', () => {
+  // Read as one string, `grep -F x y && gh pr comment …` offered grep's `x`
+  // as the body file; it did not exist, the hook exited 0, and the real post
+  // went through unlinted. The command is split the way the shell splits it.
+  assert.equal(runHook(bash('grep -F x y && gh pr comment 1 --body "I could not read CI status from this token"')).status, 2);
+});
+
+test('hook: text inside a quoted body is not a flag or a separator', () => {
+  // " -e " is not --editor, and "; |" inside quotes does not end the command.
+  assert.equal(runHook(bash('gh pr comment 1 --body "MERGE — pass -e to enable"')).status, 0);
+  assert.equal(runHook(bash("gh pr comment 1 --body 'MERGE; patch bump | no usage'")).status, 0);
+});
+
+test('hook: every spelling of the body-file flag is read', () => {
+  const dir = withBodyFile(LEAKED_ASSESSMENT);
+  for (const command of [
+    'gh pr comment 1 -F .dep-steward-review.md',
+    'gh pr comment 1 -F.dep-steward-review.md',
+    'gh pr comment 1 --body-file=.dep-steward-review.md',
+  ]) {
+    assert.equal(runHook(bash(command, dir)).status, 2, `must read the body from: ${command}`);
+  }
+});
+
+test('hook: what is not a post is not blocked', () => {
+  // Deleting a comment posts nothing, and naming the command is not running it.
+  assert.equal(runHook(bash('gh pr comment 1 --delete-last --yes')).status, 0);
+  assert.equal(runHook(bash('echo "gh pr comment 1"')).status, 0);
+  assert.equal(runHook(bash('gh pr diff 1 | grep -F comment')).status, 0);
 });
 
 test('hook: malformed input never blocks (it fails open, the assertion backstops it)', () => {
