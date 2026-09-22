@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, writeFileSync, readFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -612,4 +612,335 @@ test('autofix guard: an unrelated bot is refused', () => {
   const { outputs } = runResolveStep({ author: 'renovate[bot]' });
   assert.equal(outputs.skip, 'true');
   assert.equal(outputs.pr_number, undefined);
+});
+
+// ---- the reviewer's prose guard, EXECUTED ------------------------------------
+//
+// The hook (review step, `settings`) refuses a comment reporting on the PR's CI
+// before `gh pr comment` runs; review-lint.test.mjs covers that rule directly.
+// What is executed HERE is the second caller: the deliverable assertion runs
+// the same rule over the comment GitHub actually stored, so a hook that stopped
+// firing cannot pass silently. Its policy is the interesting part and it is
+// invisible to `bash -n`: refuse ⇒ red, but no label, because the verdict is
+// valid and it is dep-steward's own guard that broke.
+
+const LEAKED_V1 = `## Dependabot review — ESCALATE
+
+**Assessment**: ESCALATE — a major bump of the repo's core test framework; I could not read CI status from this token to confirm green, so this warrants a human glance.
+
+<!-- AUTOMERGE-DECISION-V1 -->
+{"recommendation":"escalate","our_usage_affected":true,"reason":"Major vitest bump, and CI status was not readable from this token."}
+<!-- /AUTOMERGE-DECISION-V1 -->`;
+
+const CLEAN_V1 = `## Dependabot review — ESCALATE
+
+**Assessment**: ESCALATE — the clear-mocks default flip reaches 12 specs that rely on persisted mock state.
+
+<!-- AUTOMERGE-DECISION-V1 -->
+{"recommendation":"escalate","our_usage_affected":true,"reason":"vitest 5 flips clearMocks to true by default, which reaches 12 specs."}
+<!-- /AUTOMERGE-DECISION-V1 -->`;
+
+test('assertion: a verdict that reports on CI goes red — and pages nobody', () => {
+  // The exact comment that reached Runsense-ai/runsense#2762, in the shape the
+  // assertion sees it. The escalation itself was correct; the CI sentence is
+  // the defect, and it means the hook did not refuse the post.
+  const { status, stdout, ghCalls } = runAssertStep({
+    prState: 'OPEN',
+    headBranch: SINGLETON,
+    comments: [{ createdAt: '2026-08-10T06:05:00Z', body: LEAKED_V1 }],
+    since: RUN_START,
+  });
+  assert.notEqual(status, 0, 'a guard that stopped guarding must be visible');
+  assert.match(stdout, /::error::The review comment on PR #1 reports on evidence outside/);
+  // The decision block's `reason` is reported ahead of the prose: it is the
+  // field the operator triages from, so a false premise there is the costly one.
+  assert.match(stdout, /«[^»]*CI status was not readable from this token[^»]*»/,
+    'the log must quote the offending clause, not just name a category');
+  assert.ok(!ghCalls.some((c) => c.includes('needs-human-review')),
+    'the verdict is valid and needs no human — labelling here would page someone about dep-steward\'s own bug');
+});
+
+test('assertion: a clean verdict passes the lint and says so', () => {
+  const { status, stdout } = runAssertStep({
+    prState: 'OPEN',
+    headBranch: SINGLETON,
+    comments: [{ createdAt: '2026-08-10T06:05:00Z', body: CLEAN_V1 }],
+    since: RUN_START,
+  });
+  assert.equal(status, 0, `a clean verdict must pass:\n${stdout}`);
+  assert.match(stdout, /passes the prose lint/);
+});
+
+test('assertion: only the V1 comment is the deliverable — other comments in the window are not linted', () => {
+  // The same window can hold the gate's stuck-PR notice, an autofix comment, or
+  // a human replying "I couldn't see the CI status either". None of those is
+  // the reviewer's verdict, and failing the review job on one would be a red
+  // job for something the review agent never wrote.
+  const { status, stdout } = runAssertStep({
+    prState: 'OPEN',
+    headBranch: SINGLETON,
+    comments: [
+      { createdAt: '2026-08-10T06:04:00Z', body: 'I could not read the CI status on this PR either — taking a look.' },
+      { createdAt: '2026-08-10T06:05:00Z', body: CLEAN_V1 },
+    ],
+    since: RUN_START,
+  });
+  assert.equal(status, 0, `a human's comment must not fail the review job:\n${stdout}`);
+  assert.match(stdout, /passes the prose lint/);
+});
+
+// ---- the autofix prompt-load, EXECUTED ---------------------------------------
+//
+// Three fixers in one weekly batch gave three different date rationales for the
+// same failure, and one was simply false ("Today is 2026-09-21, a Sunday" — it
+// was a Monday). Nothing gave them the clock: a model asked what day it is
+// answers from a date in its system prompt with no time and no weekday. The
+// step now derives the failing run's own instant and bakes it in, which is only
+// worth anything if the substitution actually happens and the step survives a
+// payload it cannot parse.
+
+// `date` is stubbed so the assertions are deterministic on any host: BSD/macOS
+// `date` has no `-d`, and the suite must pass on a dev Mac (CI is Ubuntu). The
+// stub answers the two weekday forms differently so a swap between "the run's
+// weekday" and "today's weekday" is visible.
+const AUTOFIX_DATE_STUB = `#!/usr/bin/env bash
+for a in "$@"; do [ "$a" = "-d" ] && { echo "Monday"; exit 0; }; done
+for a in "$@"; do [ "$a" = "+%A" ] && { echo "Thursday"; exit 0; }; done
+echo "2026-09-21T06:12:00Z"
+`;
+
+function runAutofixPromptLoadStep({ runStartedAt = '', createdAt = '', realDate = false } = {}) {
+  const out = renderTo();
+  const workflow = readFileSync(join(out, '.github/workflows/dependabot-review.yml'), 'utf8');
+  const block = runBlocks(workflow).find((b) => b.stepName === 'Load the autofix prompt');
+  assert.ok(block, 'the autofix prompt-load step must exist — the rest of this test is vacuous without it');
+
+  const bin = mkdtempSync(join(tmpdir(), 'ds-afp-'));
+  if (!realDate) writeFileSync(join(bin, 'date'), AUTOFIX_DATE_STUB, { mode: 0o755 });
+  const githubOutput = join(bin, 'github_output');
+  writeFileSync(githubOutput, '');
+  const script = join(bin, 'step.sh');
+  writeFileSync(script, stripActionsExpressions(block.script));
+
+  let status = 0;
+  let stderr = '';
+  try {
+    execFileSync('bash', ['-e', script], {
+      cwd: out,
+      encoding: 'utf8',
+      stdio: 'pipe',
+      env: {
+        ...process.env,
+        PATH: `${bin}:${process.env.PATH}`,
+        PR_NUMBER: '123',
+        CI_RUN_STARTED_AT: runStartedAt,
+        CI_RUN_CREATED_AT: createdAt,
+        GITHUB_OUTPUT: githubOutput,
+      },
+    });
+  } catch (e) {
+    status = e.status ?? 1;
+    stderr = `${e.stderr ?? ''}`;
+  }
+  return { status, stderr, output: readFileSync(githubOutput, 'utf8') };
+}
+
+test('autofix prompt-load: the failing run\'s instant and weekday reach the prompt as facts', () => {
+  const { status, stderr, output } = runAutofixPromptLoadStep({ runStartedAt: '2026-09-21T04:41:00Z' });
+  assert.equal(status, 0, `the step must succeed:\n${stderr}`);
+  assert.ok(output.includes('2026-09-21T04:41:00Z'), 'the run\'s own start time is the anchor a time-dependent failure needs');
+  assert.ok(output.includes('a **Monday**'), 'the weekday must be derived from the run instant, not from today');
+  assert.ok(output.includes('2026-09-21T06:12:00Z') && output.includes('a **Thursday**'), 'and "now" must be carried separately');
+  // Same denial class as the review prompt: an unsubstituted $-token in an
+  // allow-listed command is "Contains expansion" and every gh call is denied.
+  for (const token of ['$PR_NUMBER', '$CI_RUN_STARTED', '$CI_RUN_WEEKDAY', '$NOW_UTC', '$NOW_WEEKDAY']) {
+    assert.ok(!output.includes(token), `an unsubstituted ${token} reached the agent`);
+  }
+  assert.ok(output.includes('gh pr comment 123 --body-file .dep-steward-autofix-comment.md'),
+    'and the prescribed draft path must arrive with the PR number baked in');
+});
+
+test('autofix prompt-load: a payload timestamp it cannot parse falls back instead of killing the step', () => {
+  // This step runs under `bash -e`, and the bounds step runs on !cancelled():
+  // an aborted load means the fixer never runs and the job posts "CI is failing
+  // and dep-steward could not fix it" for a build it never read.
+  const { status, stderr, output } = runAutofixPromptLoadStep({ runStartedAt: 'not-a-timestamp', createdAt: '' });
+  assert.equal(status, 0, `a malformed payload value must not abort the load:\n${stderr}`);
+  assert.ok(output.includes('2026-09-21T06:12:00Z'), 'it falls back to now');
+  assert.ok(!output.includes('not-a-timestamp'), 'and never passes the unparsed value off as the run\'s start');
+});
+
+test('autofix prompt-load: a second-choice payload field is used when the first is absent', () => {
+  const { output } = runAutofixPromptLoadStep({ runStartedAt: '', createdAt: '2026-09-21T04:39:00Z' });
+  assert.ok(output.includes('2026-09-21T04:39:00Z'));
+});
+
+test('autofix prompt-load: with the real date, 2026-09-21T04:41:00Z is a Monday', () => {
+  // The stub proves the plumbing; this proves the answer. The #2761 fixer said
+  // Sunday. Skipped where `date -d` does not exist (BSD/macOS) — CI is Ubuntu.
+  let gnuDate = true;
+  try {
+    execFileSync('date', ['-u', '-d', '2026-09-21T04:41:00Z', '+%A'], { stdio: 'pipe' });
+  } catch {
+    gnuDate = false;
+  }
+  if (!gnuDate) return;
+  const { status, output } = runAutofixPromptLoadStep({ runStartedAt: '2026-09-21T04:41:00Z', realDate: true });
+  assert.equal(status, 0);
+  assert.ok(output.includes('(UTC), a **Monday**'), 'the weekday of the batch that got this wrong');
+});
+
+// ---- the bounds step, EXECUTED -----------------------------------------------
+//
+// `autofix-bounds.cjs` refuses any file status but M, which is right: an added
+// file the pipeline did not ask for must escalate. What went wrong is that the
+// agent's own comment draft was such a file. Its prompt said "post ONE comment
+// (gh pr comment N)" and named no path, so it invented one in the working tree
+// (`.autofix-comment.md` on two PRs, `autofix_comment.md` on a third), `git add
+// -A` staged it, and the fix was discarded with "exceeded the safe bounds" —
+// three times in one weekly batch. On those three the agent was escalating, so
+// nothing was lost; the latent failure is a REAL fix thrown away beside it.
+//
+// The fix is a prescribed path plus one `rm -f`, which is only provable by
+// running the step: it stages, measures, commits and pushes, and every one of
+// those is invisible to `bash -n` and to byte-parity.
+
+const BOUNDS_GH_STUB = `#!/usr/bin/env bash
+printf '%s\\n' "$*" >> "$GH_LOG"
+case "$1 $2" in
+  "pr view") echo "" ;;
+  *) exit 0 ;;
+esac
+`;
+
+function runBoundsStep({ fix = null, draft = null, draftName = '.dep-steward-autofix-comment.md' } = {}) {
+  const out = renderTo();
+  const workflow = readFileSync(join(out, '.github/workflows/dependabot-review.yml'), 'utf8');
+  const block = runBlocks(workflow).find((b) => b.stepName.startsWith('Bounds-check the fix'));
+  assert.ok(block, 'the bounds step must exist — the rest of this test is vacuous without it');
+
+  const root = mkdtempSync(join(tmpdir(), 'ds-bounds-'));
+  const work = join(root, 'work');
+  const bare = join(root, 'origin.git');
+  const runnerTemp = join(root, 'runner-temp');
+  const bin = join(root, 'bin');
+  for (const d of [work, runnerTemp, bin, join(work, 'src'), join(work, '.github/dependabot-automerge')]) {
+    mkdirSync(d, { recursive: true });
+  }
+  const git = (args, cwd = work) =>
+    execFileSync('git', args, { cwd, stdio: 'pipe', encoding: 'utf8', env: { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null' } });
+
+  // The base commit is the PR head as the fixer found it: the bump plus the
+  // pipeline's own files. They must be COMMITTED, or `git add -A` stages them
+  // as additions and every case escalates for the wrong reason.
+  writeFileSync(join(work, 'src/client.ts'), 'export const timeout = 1000;\n');
+  writeFileSync(join(work, 'package.json'), '{"name":"app","dependencies":{"ioredis":"^6.0.0"}}\n');
+  writeFileSync(
+    join(work, '.github/dependabot-automerge/autofix-bounds.cjs'),
+    readFileSync(join(out, '.github/dependabot-automerge/autofix-bounds.cjs'), 'utf8'),
+  );
+  execFileSync('git', ['init', '-q', '-b', 'main', work], { stdio: 'pipe' });
+  git(['config', 'user.email', 'test@example.invalid']);
+  git(['config', 'user.name', 'test']);
+  git(['add', '-A']);
+  git(['commit', '-q', '-m', 'bump ioredis 5 -> 6']);
+  const baseSha = git(['rev-parse', 'HEAD']).trim();
+  execFileSync('git', ['init', '-q', '--bare', bare], { stdio: 'pipe' });
+  git(['remote', 'add', 'origin', bare]);
+  const headBranch = 'dependabot/npm_and_yarn/ioredis-6.0.0';
+  git(['push', '-q', 'origin', `HEAD:${headBranch}`]);
+
+  // What the fixer left behind.
+  if (fix) writeFileSync(join(work, 'src/client.ts'), fix);
+  if (draft) writeFileSync(join(work, draftName), draft);
+
+  writeFileSync(join(runnerTemp, 'bump_paths.txt'), 'package.json\n');
+  writeFileSync(join(bin, 'gh'), BOUNDS_GH_STUB, { mode: 0o755 });
+  const ghLog = join(bin, 'gh.log');
+  writeFileSync(ghLog, '');
+  const script = join(bin, 'step.sh');
+  writeFileSync(script, stripActionsExpressions(block.script));
+
+  let status = 0;
+  let stdout = '';
+  try {
+    stdout = execFileSync('bash', ['-e', script], {
+      cwd: work,
+      encoding: 'utf8',
+      stdio: 'pipe',
+      env: {
+        ...process.env,
+        PATH: `${bin}:${process.env.PATH}`,
+        GH_LOG: ghLog,
+        GH_TOKEN: 'x',
+        REPO: 'octocat/repo',
+        PR_NUMBER: '1',
+        HEAD_BRANCH: headBranch,
+        BASE_SHA: baseSha,
+        EXEC_FILE: '',
+        RUNNER_TEMP: runnerTemp,
+        GIT_CONFIG_GLOBAL: '/dev/null',
+        GIT_CONFIG_SYSTEM: '/dev/null',
+      },
+    });
+  } catch (e) {
+    status = e.status ?? 1;
+    stdout = `${e.stdout ?? ''}${e.stderr ?? ''}`;
+  }
+  const pushedSha = execFileSync('git', ['--git-dir', bare, 'rev-parse', headBranch], { encoding: 'utf8' }).trim();
+  const pushedFiles =
+    pushedSha === baseSha
+      ? []
+      : execFileSync('git', ['--git-dir', bare, 'show', '--name-only', '--format=', headBranch], { encoding: 'utf8' })
+          .split('\n')
+          .filter(Boolean);
+  return {
+    status,
+    stdout,
+    pushed: pushedSha !== baseSha,
+    pushedFiles,
+    ghLogText: readFileSync(ghLog, 'utf8'),
+  };
+}
+
+test('bounds: the prescribed draft is discarded, and the real fix is pushed without it', () => {
+  // The whole point. Before the `rm -f`, this case escalated with
+  // `fix changes file status "A"` and threw away a perfectly in-bounds fix.
+  const { status, stdout, pushed, pushedFiles, ghLogText } = runBoundsStep({
+    fix: 'export const timeout = 2000;\n',
+    draft: '## dep-steward autofix\n\nBumped the timeout to match ioredis 6.\n',
+  });
+  assert.equal(status, 0, `the step must succeed:\n${stdout}`);
+  assert.match(stdout, /Pushed the fix/);
+  assert.ok(pushed, 'the fix must reach the PR branch');
+  assert.deepEqual(pushedFiles, ['src/client.ts'], 'the draft must not ride along into the commit');
+  assert.ok(!ghLogText.includes('exceeded the safe bounds'), 'and nobody is told the fix was out of bounds');
+});
+
+test('bounds: a scratch file the pipeline did not prescribe still escalates', () => {
+  // The checker is deliberately unchanged: this is the name the agent invented
+  // on PRs #2764 and #2760. An added file nobody asked for is exactly what the
+  // bounds check exists to refuse — the fix was to stop CREATING one, not to
+  // start ignoring them.
+  const { status, stdout, pushed, ghLogText } = runBoundsStep({
+    fix: 'export const timeout = 2000;\n',
+    draft: '## dep-steward autofix\n',
+    draftName: '.autofix-comment.md',
+  });
+  assert.equal(status, 0, `escalating is a clean outcome, not a failure:\n${stdout}`);
+  assert.match(stdout, /Fix is out of bounds/);
+  assert.match(ghLogText, /fix changes file status "A" \(\.autofix-comment\.md\)/);
+  assert.ok(!pushed, 'nothing may be pushed when the bounds refuse');
+});
+
+test('bounds: a draft with no fix beside it is "no edits", not a push', () => {
+  // Removing the draft must not turn an escalating fixer into a pusher of
+  // empty commits — this is the path the three real PRs should have taken.
+  const { status, stdout, pushed, ghLogText } = runBoundsStep({
+    draft: '## dep-steward autofix\n\nEscalating: the failure is not the bump\'s fault.\n',
+  });
+  assert.equal(status, 0, `declining is a clean outcome:\n${stdout}`);
+  assert.match(stdout, /The fixer made no edits/);
+  assert.ok(!pushed, 'a comment draft is not a fix');
+  assert.match(ghLogText, /needs-human-review/, 'and a red build with no fix still reaches a human');
 });

@@ -8,7 +8,8 @@
 # What it does (all idempotent — safe to re-run):
 #   1. Preflight: gh authed with repo+workflow scopes; a GitHub repo in cwd.
 #   2. Detect the JS lockfile(s) and your CI workflow name.
-#   3. Render four files into .github/ (workflow, prompt, dependabot.yml, gate).
+#   3. Render the pipeline into .github/ (workflow, prompts, dependabot.yml,
+#      gate, review lint, and the autofix bounds check unless --no-autofix).
 #   4. Create the `needs-human-review` label.
 #   5. Set CLAUDE_CODE_OAUTH_TOKEN in BOTH the Actions and Dependabot stores.
 #   6. Enable auto-merge on the repo.
@@ -18,7 +19,7 @@
 #   --dry-run            show every change without making it
 #   --ci-name NAME       the CI workflow whose green status gates merges
 #   --model NAME         Claude model for the review job (default below)
-#   --render-only --out DIR   render the four files to DIR and stop (no gh)
+#   --render-only --out DIR   render those files to DIR and stop (no gh)
 #
 # It writes files and (label/secret/setting) via `gh`. It never touches your
 # source, your existing CI workflow, branch-protection rules, or git history.
@@ -35,6 +36,7 @@ CDPATH=''
 DEFAULT_MODEL='claude-opus-4-8'
 REPO_URL='https://github.com/raphaelcm/dep-steward'
 GATE_PATH='.github/dependabot-automerge/gate.cjs'
+REVIEW_LINT_PATH='.github/dependabot-automerge/review-lint.cjs'
 AUTOFIX_BOUNDS_PATH='.github/dependabot-automerge/autofix-bounds.cjs'
 AUTOFIX_PROMPT_PATH='.github/dependabot-autofix-prompt.md'
 LABEL='needs-human-review'
@@ -269,6 +271,7 @@ render_workflow() {
           -e "s|__CI_RUNLIST__|$crt|g" \
           -e "s|__MODEL__|$MODEL|g" \
           -e "s|__GATE_PATH__|$GATE_PATH|g" \
+          -e "s|__REVIEW_LINT_PATH__|$REVIEW_LINT_PATH|g" \
           -e "s|__ESCALATABLE_NOTE__|$ESCALATABLE_NOTE|g" \
           -e "s,__ESCALATABLE_CODES__,$ESCALATABLE_CODES,g" \
           -e "s|__ASSIGN_FLAG__|$ASSIGN_FLAG|g"
@@ -279,6 +282,13 @@ render_gate() {
     | inject '//__WL_EXACT__' "$WL_EXACT" \
     | inject '//__WL_REGEX__' "$WL_REGEX"
 }
+
+# The reviewer's prose lint: static, and NOT autofix-conditional — it is the
+# review job's guard, wired as a PreToolUse hook through the review step's
+# `settings` input and re-run over the posted comment by the deliverable
+# assertion. Both callers name it by REVIEW_LINT_PATH, so the path has one
+# source.
+render_review_lint() { cat "$SRC/templates/review-lint.cjs"; }
 
 # autofix (--autofix only): the fixer prompt takes the same escalate flag as the
 # review prompt; the bounds script is static (rendered verbatim).
@@ -299,6 +309,7 @@ if [ "$RENDER_ONLY" -eq 1 ]; then
   emit render_prompt          "$OUT/.github/dependabot-review-prompt.md"
   emit render_workflow        "$OUT/.github/workflows/dependabot-review.yml"
   emit render_gate            "$OUT/$GATE_PATH"
+  emit render_review_lint     "$OUT/$REVIEW_LINT_PATH"
   if [ "$AUTOFIX" -eq 1 ]; then
     emit render_autofix_prompt "$OUT/$AUTOFIX_PROMPT_PATH"
     emit render_autofix_bounds "$OUT/$AUTOFIX_BOUNDS_PATH"
@@ -368,8 +379,9 @@ emit render_dependabot_yml "$STAGE/.github/dependabot.yml"
 emit render_prompt          "$STAGE/.github/dependabot-review-prompt.md"
 emit render_workflow        "$STAGE/.github/workflows/dependabot-review.yml"
 emit render_gate            "$STAGE/$GATE_PATH"
+emit render_review_lint     "$STAGE/$REVIEW_LINT_PATH"
 
-FILES=".github/dependabot.yml .github/dependabot-review-prompt.md .github/workflows/dependabot-review.yml $GATE_PATH"
+FILES=".github/dependabot.yml .github/dependabot-review-prompt.md .github/workflows/dependabot-review.yml $GATE_PATH $REVIEW_LINT_PATH"
 if [ "$AUTOFIX" -eq 1 ]; then
   emit render_autofix_prompt "$STAGE/$AUTOFIX_PROMPT_PATH"
   emit render_autofix_bounds "$STAGE/$AUTOFIX_BOUNDS_PATH"

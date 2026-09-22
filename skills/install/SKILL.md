@@ -25,7 +25,7 @@ Run these and tell the user what you found. Each failure has a specific fix, so 
 sh -c "$(curl -fsSL https://raw.githubusercontent.com/raphaelcm/dep-steward/main/install.sh)" -- --dry-run
 ```
 
-Add `--ci-name "<name>"` when you determined it in preflight, plus anything from `$ARGUMENTS`. Summarize the output for the user: the four files it writes into `.github/`, the label it creates, the secrets it sets, and the repo settings it touches. It never touches their source, their existing CI workflow, branch-protection rules, or git history.
+Add `--ci-name "<name>"` when you determined it in preflight, plus anything from `$ARGUMENTS`. Summarize the output for the user: the files it writes into `.github/`, the label it creates, the secrets it sets, and the repo settings it touches. It never touches their source, their existing CI workflow, branch-protection rules, or git history.
 
 ## 3. Install
 

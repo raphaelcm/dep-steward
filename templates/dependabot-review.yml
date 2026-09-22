@@ -20,6 +20,14 @@ name: Dependabot PR review
 #    Checks/Actions APIs, so such a tool 403s on every call and the model
 #    reports blindness as risk.
 #
+#    That contract is carried by the prompt, which names the reviewer's
+#    evidence (the diff, the changelog, this repo's source) and nothing else,
+#    and by a guard that does not depend on the model: a PreToolUse hook
+#    (review step, `settings`) lints the comment body before `gh pr comment`
+#    runs and blocks a post that reports on CI, so the agent rewrites it. The
+#    deliverable assertion re-runs the same rule over the posted comment; a
+#    refusal there means the hook itself stopped working.
+#
 #    IDENTITY CONTRACT: the review comment MUST be posted by the Claude
 #    GitHub App (claude[bot]), i.e. `github_token` must never be passed to
 #    the review step. A comment created with the workflow's GITHUB_TOKEN
@@ -157,6 +165,23 @@ jobs:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           allowed_bots: "dependabot[bot]"
           prompt: ${{ steps.load_prompt.outputs.prompt }}
+          # The deterministic half of the reviewer's evidence contract. The
+          # prompt is where CI was legitimized and the prompt is fixed; this is
+          # the part that does not rely on the model holding the line. The
+          # action writes this JSON to ~/.claude/settings.json and Claude Code
+          # loads it, so the hook runs before every Bash call and refuses a
+          # `gh pr comment` whose body reports on the PR's CI — the post never
+          # happens, the agent gets the reason, and it rewrites. Refusing here
+          # rather than in a workflow step is deliberate: a step could only go
+          # red with nothing posted, and the comment must come from the App
+          # identity (see IDENTITY CONTRACT above) to wake the gate.
+          #
+          # Shell form, not the exec form's `args`: a Claude Code that predates
+          # `args` would ignore it, run `node` with no argv, and pass every
+          # comment silently. `$CLAUDE_PROJECT_DIR` is inert to YAML and to the
+          # action's JSON.parse; the hook's own shell expands it.
+          settings: |
+            {"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"node \"$CLAUDE_PROJECT_DIR/__REVIEW_LINT_PATH__\"","timeout":30}]}]}}
           # 60-turn budget: a thorough major-bump review (read diff, fetch
           # changelog for each version in the range, grep each affected API,
           # enumerate breaking changes, emit V1 block) routinely needs ~30-50
@@ -303,11 +328,37 @@ jobs:
             exit 0
           fi
           # gh's --jq is gojq, which reads the process environment via `env`;
-          # ISO-8601 UTC strings compare correctly as strings.
-          COMMENTS=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json comments \
-            --jq '[.comments[] | select(.createdAt >= env.SINCE) | .body] | join("\n")')
-          if grep -qF '<!-- AUTOMERGE-DECISION-V1 -->' <<<"$COMMENTS"; then
+          # ISO-8601 UTC strings compare correctly as strings. Only comments
+          # carrying the V1 marker are collected: this run's window can also
+          # hold the gate's stuck-PR notice, an autofix comment or a human's
+          # reply, none of which is the deliverable — and none of which should
+          # be able to fail the prose lint below on the reviewer's behalf.
+          V1_BODIES=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json comments \
+            --jq '[.comments[] | select(.createdAt >= env.SINCE) | select(.body | contains("<!-- AUTOMERGE-DECISION-V1 -->")) | .body] | join("\n")')
+          if [ -n "$V1_BODIES" ]; then
             echo "V1 decision block posted during this run (since $SINCE) on PR #$PR_NUMBER — review deliverable present."
+            # The deliverable exists; this checks the guard that shapes it. The
+            # reviewer's evidence is the diff, the changelog and this repo's
+            # source, and the PreToolUse hook above refuses a comment reporting
+            # on anything else BEFORE it posts. This is that same rule, run
+            # over what GitHub actually stored, so a refusal here has exactly
+            # one meaning: the hook did not fire. Red, but NO label — the
+            # verdict is valid and needs no human on the PR; dep-steward's own
+            # guard is what broke.
+            #
+            # The lint's own failure (missing node, a bug in it) is fail-OPEN,
+            # matching the hook: a broken guard must not strand a PR whose
+            # review delivered.
+            if ! LINT_OUT=$(REVIEW_LINT_MODE=body REVIEW_BODY="$V1_BODIES" node __REVIEW_LINT_PATH__ 2>&1); then
+              echo "::warning::Could not run the review prose lint on PR #$PR_NUMBER ($LINT_OUT) — the deliverable is present, so this step is not failing on the guard's own failure."
+              exit 0
+            fi
+            if [ "$(sed -n 's/^decision=//p' <<<"$LINT_OUT")" != "post" ]; then
+              echo "::error::The review comment on PR #$PR_NUMBER reports on evidence outside the reviewer's set, and the lint hook did not refuse it before it posted — $(sed -n 's/^reason=//p' <<<"$LINT_OUT")"
+              echo "The hook is wired through the review step's 'settings' input: check that claude-code-action still writes it to ~/.claude/settings.json and that the bundled Claude Code still runs PreToolUse hooks."
+              exit 1
+            fi
+            echo "The review comment passes the prose lint."
             exit 0
           fi
           echo "No AUTOMERGE-DECISION-V1 comment posted during this run (since $SINCE) on PR #$PR_NUMBER — the review produced no verdict."

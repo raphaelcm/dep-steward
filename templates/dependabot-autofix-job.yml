@@ -95,10 +95,52 @@
           # 2.1.207+ denies allowlisted Bash commands that contain a `$VAR` expansion,
           # so the agent must see `gh pr comment 123`, not `gh pr comment $PR_NUMBER`.
           PR_NUMBER: ${{ steps.pr.outputs.pr_number }}
+          # The failing run's own clock, as FACT rather than inference. An agent
+          # asked when "now" is answers from a date in its system prompt with no
+          # time and no weekday, and three fixers in one batch produced three
+          # different date rationales for the same failure — one of them simply
+          # wrong ("2026-09-21, a Sunday"; it was a Monday). Every one of them
+          # reached the right verdict, so the cost is not a wrong outcome: it is
+          # an escalation comment that carries a false premise to the operator.
+          # Time-dependent tests are exactly what a bump breaks, so the instant
+          # the build ran is the anchor, not the instant anyone reasons about it.
+          # Payload data travels by env, never interpolated into command text —
+          # the same rule the auto-merge job's resolve step follows.
+          CI_RUN_STARTED_AT: ${{ github.event.workflow_run.run_started_at }}
+          CI_RUN_CREATED_AT: ${{ github.event.workflow_run.created_at }}
         run: |
+          set -euo pipefail
+          # %A is locale-dependent; hosted runners are C.UTF-8 but self-hosted
+          # ones need not be, and a localized weekday would be worse than none.
+          export LC_ALL=C
+          # NOW first, and it cannot fail: it is the fallback for everything
+          # below. This step runs under `bash -e`, so an unguarded `date -d`
+          # on a malformed payload value would kill it — and the bounds step
+          # runs on `!cancelled()`, so the job would then page a human with
+          # "CI is failing and dep-steward could not fix it" for a build the
+          # fixer was never given the chance to read.
+          NOW_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          NOW_WEEKDAY=$(date -u +%A)
+          CI_RUN_STARTED="$NOW_UTC"
+          for candidate in "${CI_RUN_STARTED_AT:-}" "${CI_RUN_CREATED_AT:-}"; do
+            case "$candidate" in
+              [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]Z)
+                CI_RUN_STARTED="$candidate"; break ;;
+            esac
+          done
+          CI_RUN_WEEKDAY=$(date -u -d "$CI_RUN_STARTED" +%A 2>/dev/null || echo "$NOW_WEEKDAY")
           {
             echo 'prompt<<PROMPT_EOF_9Z3Q'
-            sed "s/\$PR_NUMBER/$PR_NUMBER/g" .github/dependabot-autofix-prompt.md
+            # `|` delimiters on the four facts: the values are ISO-8601 UTC
+            # stamps and English weekday names, so none of `|`, `&`, `\` can
+            # occur in them and the replacement text is inert. No placeholder is
+            # a prefix of another, so the order of the expressions is free.
+            sed -e "s/\$PR_NUMBER/$PR_NUMBER/g" \
+                -e "s|\$CI_RUN_STARTED|$CI_RUN_STARTED|g" \
+                -e "s|\$CI_RUN_WEEKDAY|$CI_RUN_WEEKDAY|g" \
+                -e "s|\$NOW_UTC|$NOW_UTC|g" \
+                -e "s|\$NOW_WEEKDAY|$NOW_WEEKDAY|g" \
+                .github/dependabot-autofix-prompt.md
             echo 'PROMPT_EOF_9Z3Q'
           } >> "$GITHUB_OUTPUT"
 
@@ -141,6 +183,19 @@
           EXEC_FILE: ${{ steps.fixer.outputs.execution_file }}
         run: |
           set -euo pipefail
+          # The agent's comment draft is not part of the fix. It writes one to
+          # the prescribed path (its prompt names it, the way the reviewer's
+          # names `.dep-steward-review.md`) and posts it with --body-file; left
+          # in the tree it stages as an ADDED file, and the bounds check below
+          # refuses any status but M — so the real fix is discarded along with
+          # it and the PR is told the fix "exceeded the safe bounds". That
+          # happened on three PRs in one weekly batch.
+          #
+          # Removed here, not exempted in autofix-bounds.cjs: an added file the
+          # pipeline did not ask for must still escalate. (A repo that tracks a
+          # file at this exact path would see it staged as D and escalate,
+          # which is the safe direction.)
+          rm -f .dep-steward-autofix-comment.md
           git add -A
           FIX_NAME_STATUS=$(git diff --cached --name-status "$BASE_SHA")
           FIX_NUMSTAT=$(git diff --cached --numstat "$BASE_SHA")

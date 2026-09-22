@@ -26,6 +26,9 @@ const FILES = [
   '.github/dependabot-review-prompt.md',
   '.github/workflows/dependabot-review.yml',
   '.github/dependabot-automerge/gate.cjs',
+  // The reviewer's prose lint ships on every install, autofix or not — it is
+  // the review job's guard, not the fixer's.
+  '.github/dependabot-automerge/review-lint.cjs',
   // autofix is ON by default, so the reference render includes these too:
   '.github/dependabot-automerge/autofix-bounds.cjs',
   '.github/dependabot-autofix-prompt.md',
@@ -106,7 +109,7 @@ test('by default the autofix job and its two files render, all markers substitut
   const wf = readFileSync(join(rendered, '.github/workflows/dependabot-review.yml'), 'utf8');
   assert.match(wf, /^ {2}autofix:/m);
   assert.match(wf, /workflow_run\.conclusion == 'failure'/);
-  assert.doesNotMatch(wf, /__AUTOFIX_JOB__|__MODEL__|__CI_NAME__|__ASSIGN_FLAG__/);
+  assert.doesNotMatch(wf, /__AUTOFIX_JOB__|__MODEL__|__CI_NAME__|__ASSIGN_FLAG__|__REVIEW_LINT_PATH__/);
   assert.ok(existsSync(join(rendered, '.github/dependabot-automerge/autofix-bounds.cjs')));
   const prompt = readFileSync(join(rendered, '.github/dependabot-autofix-prompt.md'), 'utf8');
   assert.match(prompt, /--add-label needs-human-review --add-assignee octocat/);
@@ -119,6 +122,69 @@ test('--no-autofix removes the job, its files, and leaves no marker', () => {
   assert.doesNotMatch(wf, /__AUTOFIX_JOB__/);
   assert.ok(!existsSync(join(out, '.github/dependabot-automerge/autofix-bounds.cjs')));
   assert.ok(!existsSync(join(out, '.github/dependabot-autofix-prompt.md')));
+  // ...but the review lint stays: turning the fixer off must not disarm the
+  // reviewer's guard, and the workflow still references it in two places.
+  assert.ok(existsSync(join(out, '.github/dependabot-automerge/review-lint.cjs')));
+  assert.doesNotMatch(wf, /__REVIEW_LINT_PATH__/);
+  assert.match(wf, /review-lint\.cjs/);
+});
+
+// ---- the reviewer's prose guard is wired where it can refuse --------------
+
+test('the review step wires the prose lint as a PreToolUse hook at the installed path', () => {
+  const wf = readFileSync(join(rendered, '.github/workflows/dependabot-review.yml'), 'utf8');
+  // The action writes this input to ~/.claude/settings.json and Claude Code
+  // loads it. If it is not valid JSON the action treats it as a FILE PATH,
+  // fails to read it, and throws — every review red, every singleton labelled.
+  // So the JSON is parsed here rather than pattern-matched.
+  const block = /^\s*settings: \|\n((?:\s{12}.*\n)+)/m.exec(wf);
+  assert.ok(block, 'the review step must carry a settings block');
+  const hook = JSON.parse(block[1].split('\n').map((l) => l.slice(12)).join('\n').trim());
+  const entry = hook.hooks.PreToolUse[0];
+  assert.equal(entry.matcher, 'Bash', 'the comment is posted through Bash; any other matcher never fires');
+  assert.equal(entry.hooks[0].type, 'command');
+  assert.match(entry.hooks[0].command, /\.github\/dependabot-automerge\/review-lint\.cjs/);
+  // `$CLAUDE_PROJECT_DIR` is the hook's own shell expanding it; a `${{ }}`
+  // here would be GitHub substituting at render time, which is a different
+  // (and wrong) thing.
+  assert.ok(!entry.hooks[0].command.includes('${{'), 'the path must not be a GitHub expression');
+});
+
+test('the autofix step carries no settings block — the lint guards the reviewer only', () => {
+  const wf = readFileSync(join(rendered, '.github/workflows/dependabot-review.yml'), 'utf8');
+  const autofixJob = wf.slice(wf.indexOf('\n  autofix:'));
+  assert.doesNotMatch(autofixJob, /settings: \|/,
+    'the fixer\'s contract IS reading CI; linting its prose for CI would be backwards');
+});
+
+test('the deliverable assertion re-runs the same lint over what was posted', () => {
+  const wf = readFileSync(join(rendered, '.github/workflows/dependabot-review.yml'), 'utf8');
+  // One rule, two callers: the hook refuses before the post, this catches a
+  // hook that silently stopped firing. A refusal here is red WITHOUT a label —
+  // the verdict is valid; dep-steward's own guard is what broke.
+  assert.match(wf, /REVIEW_LINT_MODE=body REVIEW_BODY="\$V1_BODIES" node \.github\/dependabot-automerge\/review-lint\.cjs/);
+  assert.match(wf, /select\(\.body \| contains\("<!-- AUTOMERGE-DECISION-V1 -->"\)\)/,
+    'only V1-bearing comments are the deliverable — the gate\'s own notices share that window');
+  const assertStep = wf.slice(wf.indexOf('Assert the review deliverable exists'), wf.indexOf('\n  auto-merge:'));
+  assert.match(assertStep, /::error::The review comment on PR #\$PR_NUMBER reports on evidence outside/);
+  assert.doesNotMatch(assertStep.slice(assertStep.indexOf('passes the prose lint') - 1200, assertStep.indexOf('passes the prose lint')), /add-label/,
+    'a lint failure must not page a human — the review delivered a valid verdict');
+});
+
+// ---- the autofix draft has ONE prescribed path ---------------------------
+
+test('the path the autofix prompt names is the path the bounds step removes', () => {
+  const wf = readFileSync(join(rendered, '.github/workflows/dependabot-review.yml'), 'utf8');
+  const prompt = readFileSync(join(rendered, '.github/dependabot-autofix-prompt.md'), 'utf8');
+  // The agent used to invent this filename (`.autofix-comment.md`,
+  // `autofix_comment.md`), the bounds check saw an ADDED file, and three PRs
+  // in one batch had their fix discarded for it. Prompt and workflow must name
+  // the same path or the removal misses and the discard comes back.
+  const named = /gh pr comment \$PR_NUMBER --body-file ([^\s`]+)/.exec(prompt);
+  assert.ok(named, 'the autofix prompt must name a body file');
+  const removed = /rm -f (\S+)\n\s*git add -A/.exec(wf);
+  assert.ok(removed, 'the bounds step must remove the draft immediately before staging');
+  assert.equal(named[1], removed[1]);
 });
 
 test('the rendered autofix job pushes for a human to merge — it never merges', () => {
@@ -332,8 +398,14 @@ test('both prompt-loads bake in the literal PR number, never cat the raw prompt'
   // `app/dependabot` on every routine run, and a `/` would end the s command.
   assert.ok(wf.includes('sed -e "s/\\$PR_NUMBER/$PR_NUMBER/g" -e "s|\\$PR_AUTHOR|$PR_AUTHOR|g" .github/dependabot-review-prompt.md'),
     'review prompt-load must substitute the literal PR number and the author');
-  assert.ok(wf.includes('sed "s/\\$PR_NUMBER/$PR_NUMBER/g" .github/dependabot-autofix-prompt.md'),
+  assert.ok(wf.includes('sed -e "s/\\$PR_NUMBER/$PR_NUMBER/g" \\'),
     'autofix prompt-load must substitute the literal PR number');
+  // The fixer is also GIVEN the clock rather than left to derive it: three
+  // fixers in one batch produced three date rationales for the same failure,
+  // one of them naming the wrong weekday in an escalation comment.
+  for (const fact of ['CI_RUN_STARTED', 'CI_RUN_WEEKDAY', 'NOW_UTC', 'NOW_WEEKDAY']) {
+    assert.ok(wf.includes(`-e "s|\\$${fact}|$${fact}|g" \\`), `autofix prompt-load must bake $${fact}`);
+  }
   assert.doesNotMatch(wf, /cat \.github\/dependabot-(review|autofix)-prompt\.md/,
     'no prompt-load may cat the raw prompt — that leaves $PR_NUMBER unexpanded → denied');
 });

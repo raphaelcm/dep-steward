@@ -78,6 +78,9 @@ Files written into your repo (review and commit them like any change):
 | `.github/dependabot-review-prompt.md` | the reviewer's instructions |
 | `.github/dependabot.yml` | groups minor/patch bumps; majors stay individual |
 | `.github/dependabot-automerge/gate.cjs` | the deterministic gate (vanilla Node, zero deps) |
+| `.github/dependabot-automerge/review-lint.cjs` | checks the reviewer's comment against its evidence before it posts |
+| `.github/dependabot-autofix-prompt.md` | the fixer's instructions (autofix only) |
+| `.github/dependabot-automerge/autofix-bounds.cjs` | the fixer's scope limiter (autofix only) |
 
 GitHub settings it configures (via `gh`):
 
@@ -91,6 +94,8 @@ It does not touch your source, your existing CI workflow, or your git history.
 ## Autofix (on by default)
 
 When a dependency bump **breaks your CI** in a small, mechanical way — a renamed export, a changed signature, a moved default — a Claude agent makes the minimal fix, pushes it to the PR branch, and leaves it for **you** to re-run CI and merge. It turns "escalate, go diagnose and fix it yourself" into "here's an already-fixed PR, take a look." It needs **no extra credential** beyond the token the review job already uses.
+
+The fixer is also told the failing run's own timestamp and weekday rather than left to work them out, because a bump that breaks a time-dependent test is exactly where a guessed weekday turns into a confident, wrong diagnosis.
 
 It's the one part of dep-steward that drafts changes to *your* source — always in a PR you review and merge, never on your default branch. If you'd rather no agent did that, turn it off at install:
 
@@ -125,7 +130,7 @@ A listing in [Anthropic's community marketplace](https://github.com/anthropics/c
 |---|---|
 | `/dep-steward:install` | Preflights the prerequisites in whatever repo you're in, shows you the `--dry-run` plan, then installs. Hands off cleanly for the two steps that need a browser (minting the token, granting the GitHub App). |
 | `/dep-steward:summary` | Read-only readout: what was auto-merged, what was escalated and why, any security updates it landed, and an honest time-saved estimate. Takes a window: `/dep-steward:summary 90d`. |
-| `/dep-steward:uninstall` | Removes the pipeline from a repo — the four files, the label, and the token from **both** secret stores (forgetting the second one is the usual half-uninstall). |
+| `/dep-steward:uninstall` | Removes the pipeline from a repo — the files above, the label, and the token from **both** secret stores (forgetting the second one is the usual half-uninstall). |
 
 These are **personal, install-once** tools: they act on whatever repo you're currently in. The per-repo installer deliberately does **not** write to your `~/.claude/` — a repo-setup tool has no business editing your personal config.
 
@@ -186,7 +191,7 @@ The review job's final step prints the agent's *actual* error, read from `claude
 It's conservative by default: a major bump merges only if the model affirmatively recommends it *and* finds no affected usage. To make majors always wait for a human, tell the reviewer to always escalate majors (edit `.github/dependabot-review-prompt.md`), or require human review on those PRs via branch protection.
 
 **How do I uninstall?**
-Delete the four files above, remove the `needs-human-review` label, and delete the `CLAUDE_CODE_OAUTH_TOKEN` secret from both stores. No other footprint. `/dep-steward:uninstall` walks it for you, including the second secret store people forget.
+Delete the files above, remove the `needs-human-review` label, and delete the `CLAUDE_CODE_OAUTH_TOKEN` secret from both stores. No other footprint. `/dep-steward:uninstall` walks it for you, including the second secret store people forget.
 
 ## Development
 
@@ -203,6 +208,8 @@ node --test test/*.test.mjs
 - `test/workflow-shell.test.mjs` — every `run:` block in the rendered workflow parses under `bash -n` (the shell GitHub actually runs `run:` blocks with). Nothing else parses the shell the templates generate.
 - `test/permissions.test.mjs` — each agent job grants every GitHub scope the commands in its own prompt need, and an agent left on the Claude App token (no `github_token` passthrough) allow-lists nothing that could reach — even via a flag on a wildcard entry — a scope that token lacks, nor any `gh` command its prompt never orders. Derived from the rendered workflow and prompt rather than hardcoded.
 - `test/plugin.test.mjs` — the plugin and marketplace manifests parse and agree, every skill carries a description, and the README's raw-file links resolve on disk.
+- `test/review-lint.test.mjs` — the reviewer's prose guard, in both of its modes: it refuses the comment that actually leaked and passes verbatim changelog text that merely mentions CI, and as a hook it blocks only the comment post and never blocks on its own failure.
+- `test/prompt-hygiene.test.mjs` — the rendered review prompt never raises CI as something to consider, with a self-check that its patterns still catch what leaked (so it cannot go quietly vacuous).
 
 Working on the plugin locally:
 
