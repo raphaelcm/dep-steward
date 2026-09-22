@@ -2,7 +2,7 @@
 description: Remove the dep-steward pipeline from the current repository — delete its files, label, and secrets, leaving no footprint.
 ---
 
-Remove **dep-steward** from the repository the user is working in. Its whole footprint is four files, one label, and one secret stored in two places. Nothing else was ever touched, so nothing else needs undoing.
+Remove **dep-steward** from the repository the user is working in. Its whole footprint is a handful of files under `.github/`, one label, and one secret stored in two places. Nothing else was ever touched, so nothing else needs undoing.
 
 The half-uninstall to avoid is leaving the token behind: `CLAUDE_CODE_OAUTH_TOKEN` lives in the Actions store **and** the Dependabot store, and deleting one leaves a live credential in the other.
 
@@ -10,7 +10,7 @@ The half-uninstall to avoid is leaving the token behind: `CLAUDE_CODE_OAUTH_TOKE
 
 Report what exists before removing anything — the repo may have only some of it, or a hand-edited variant.
 
-- Files: `.github/workflows/dependabot-review.yml`, `.github/dependabot-review-prompt.md`, `.github/dependabot.yml`, `.github/dependabot-automerge/` (the gate, plus `autofix-bounds.cjs` and `.github/dependabot-autofix-prompt.md` when autofix is on).
+- Files: `.github/workflows/dependabot-review.yml`, `.github/dependabot-review-prompt.md`, `.github/dependabot.yml`, `.github/dependabot-automerge/` (the gate and the reviewer's prose lint, plus `autofix-bounds.cjs` and `.github/dependabot-autofix-prompt.md` when autofix is on).
 - Label: `gh label list --search needs-human-review`.
 - Secrets: `gh secret list` and `gh secret list --app dependabot`.
 - Open PRs still carrying the label: `gh pr list --label needs-human-review --state open`.

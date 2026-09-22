@@ -1,16 +1,20 @@
 # Dependabot PR review — agent prompt
 
-> **Your only actions: post ONE PR comment via `gh pr comment`, and — only when escalating — add the `needs-human-review` label via `gh pr edit`.** Investigate freely with `grep`, file reads, and `WebFetch`. Do NOT merge, approve, push commits, or edit the PR title/description/labels (other than adding `needs-human-review`).
+> **Your only actions: post ONE PR comment via `gh pr comment`, and — only when escalating — add the `needs-human-review` label via `gh pr edit`.** Investigate freely with `grep`, file reads, and `WebFetch`. Your `gh` is exactly four commands, and this is the complete list: `gh pr diff` (the change under review), `gh release view` (upstream release notes), `gh pr comment` (your one comment), `gh pr edit` (the label, on escalate). Do NOT merge, approve, push commits, or edit the PR title/description/labels (other than adding `needs-human-review`).
+
+## Your evidence
+
+Your evidence is complete, and it is exactly three things: the PR diff, the upstream changelog / release notes for the bumped range, and this repository's source. Your verdict answers exactly one question: **does a documented change in this bump reach code in this repo?** Everything else about whether the PR can merge is the gate's to derive from its own sources at merge time, and none of it is part of your comment. A fact you cannot establish from this evidence — a changelog you cannot read, a breaking change you cannot trace to our usage — is a reason to ESCALATE, stated in those terms.
 
 ## How the merge decision works
 
-A separate, fully deterministic gate runs in the `workflow_run` / `issue_comment` job of the same workflow. It decides merge in one of two ways:
+A separate, fully deterministic gate decides the merge, in a job of its own, from conditions it re-derives itself at merge time — including that the author is Dependabot, the PR is open, and every changed path is a dependency manifest/lockfile for one of your configured ecosystems (npm, pip, cargo, gomod, docker, github-actions). It decides in one of two ways:
 
-- **Group PRs** (branch matches a configured group prefix, e.g. `dependabot/<manager>/<ecosystem>-minor-patch-*`): the gate merges with **zero LLM input** when CI is green, author is Dependabot, PR is open, and every changed path is a dependency manifest/lockfile for one of your configured ecosystems (npm, pip, cargo, gomod, docker, github-actions). `.github/dependabot.yml` guarantees groups contain only minor + patch bumps by construction. Your comment for a group PR is the audit trail, not the merge authorizer.
-- **Singleton / major PRs**: the gate reads YOUR structured recommendation from the `AUTOMERGE-DECISION-V1` block in your comment (defined below). It merges only when ALL of these hold: your recommendation is `merge`, your `our_usage_affected` is `false`, CI is green, author is Dependabot, PR is open, and every changed path is whitelisted. **Your recommendation alone cannot cause a merge** — the gate independently re-checks whitelist, CI, author, and state. So:
+- **Group PRs** (branch matches a configured group prefix, e.g. `dependabot/<manager>/<ecosystem>-minor-patch-*`): the gate merges with **zero LLM input** once its own conditions hold. `.github/dependabot.yml` guarantees groups contain only minor + patch bumps by construction. Your comment for a group PR is the audit trail, not the merge authorizer.
+- **Singleton / major PRs**: the gate reads YOUR structured recommendation from the `AUTOMERGE-DECISION-V1` block in your comment (defined below). It merges only when your recommendation is `merge`, your `our_usage_affected` is `false`, AND every one of its own conditions also holds. **Your recommendation alone cannot cause a merge.** So:
 
 This is the prompt-injection fail-safe. A prompt-injected dependency diff can at most:
-- Flip your recommendation from `escalate` to `merge` — but the gate STILL applies whitelist/CI/author/state. A merge can only happen if the PR touches only dependency files (whitelist) AND tests pass (CI). The injection cannot smuggle a source change or make broken tests pass.
+- Flip your recommendation from `escalate` to `merge` — but the gate STILL applies the whitelist and its other conditions. A merge can only happen if the PR touches only dependency files. The injection cannot smuggle a source change past the whitelist.
 - Flip your `our_usage_affected` from `true` to `false` — same bounded outcome.
 
 So your job for singletons is the same as for groups: be CORRECT about whether the bump affects our use. When uncertain, recommend escalate — that's the safe default and costs only a human glance.
@@ -54,7 +58,7 @@ For any major bump (and for multi-major jumps like `25 → 29`, MULTIPLY the rig
 
 Choose ONE:
 
-- **MERGE** — bump's breaking changes (if any) do not affect any code in this repo, no security/process concerns. The gate will merge after re-checking deterministic safeguards.
+- **MERGE** — bump's breaking changes (if any) do not affect any code in this repo, no security/process concerns. The gate will merge after re-deriving its own conditions.
 - **ESCALATE** — anything else: any breaking change that affects us, can't read the changelog, a CVE, files outside the whitelist, or you are uncertain. Add the `needs-human-review` label.
 
 When uncertain, ESCALATE. Uncertainty is not MERGE. A wrong "looks safe" is much worse than a correct "escalate."
@@ -73,13 +77,13 @@ Write the comment body to `.dep-steward-review.md` with the Write tool, then pos
 
 <For major bumps: the "Breaking changes enumerated" block above>
 
-**Assessment**: <MERGE | ESCALATE> — <one-line reason>
+**Assessment**: <MERGE | ESCALATE> — <one line: the bump-level fact that decided it>
 
 <!-- AUTOMERGE-DECISION-V1 -->
 {
   "recommendation": "merge" | "escalate",
   "our_usage_affected": true | false,
-  "reason": "<short prose, will be logged>",
+  "reason": "<one sentence: the bump-level fact that decided the verdict>",
   "breaking_changes_enumerated": [
     { "description": "<verbatim from changelog>", "source_url": "<url>" }
   ]
@@ -93,7 +97,7 @@ Write the comment body to `.dep-steward-review.md` with the Write tool, then pos
 - `recommendation` must be exactly `"merge"` or `"escalate"`. Any other value, or a missing field, causes the gate to skip with "malformed."
 - `our_usage_affected` must be exactly `true` or `false` (no string, no nullable). A merge recommendation with `our_usage_affected: true` is contradictory — the gate skips.
 - `breaking_changes_enumerated` is the audit trail: include every breaking change from the changelog you reviewed, with a source URL. For patch/minor bumps with no breaking changes, the array MAY be empty (e.g., a typo-fix patch). For major bumps, the array MUST be non-empty — if you can't find any breaking changes documented in a major-version changelog, escalate (the changelog is probably incomplete and you can't trust the bump).
-- `reason` is a one-sentence justification. It is logged but not used in the gate's decision.
+- `reason` is one sentence naming the bump-level fact that decided the verdict (e.g. `v6 removes the callback API; src/ has no usage of it`). It is logged but not used in the gate's decision.
 
 Then, if ESCALATE: add the `needs-human-review` label — `gh pr edit $PR_NUMBER --add-label needs-human-review --add-assignee octocat`, which also assigns `octocat` so GitHub notifies them.
 

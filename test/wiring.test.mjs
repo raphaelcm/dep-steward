@@ -134,6 +134,7 @@ test('writes the automation files into the target repo (repo scope only — no p
     '.github/dependabot-review-prompt.md',
     '.github/workflows/dependabot-review.yml',
     '.github/dependabot-automerge/gate.cjs',
+    '.github/dependabot-automerge/review-lint.cjs',
   ]) {
     assert.ok(existsSync(join(repoDir, f)), `expected ${f} to be written`);
   }
