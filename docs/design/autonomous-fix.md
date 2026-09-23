@@ -55,19 +55,20 @@ build D (auto-merge) now.**
 5. **Wrinkle to handle:** Dependabot may force-push its branch and clobber the fix
    — detect and re-apply or escalate.
 
-### Update (2026-09-23): B pushes as a GitHub App when the repo has one
+### Update (2026-09-23): B's fix now starts CI, with nothing to set up
 
 The "consequence of no PAT" above cost more than it looked: on
 Runsense-ai/runsense#2693 the fix commit had zero check runs for nine days,
-because nobody closed and reopened the PR. So B gained the §10 App path as an
-**option**, still with no change to who merges:
+because nobody closed and reopened the PR. So B now takes §10's App path, with
+the one App every install already has:
 
-- With `DEP_STEWARD_APP_CLIENT_ID` + `DEP_STEWARD_APP_PRIVATE_KEY` in the Actions
-  store, the autofix job mints an installation token (`contents: write`, this
-  repo only) after the bounds check says push, and pushes the fix with it, so
-  CI runs on the fix by itself. Without them, B is exactly as decided above.
-- The zero-setup promise holds: the App is opt-in, and its absence changes
-  nothing.
+- The push step exchanges the job's OIDC token for an installation token of the
+  **Claude Code GitHub App** (the exchange `claude-code-action` performs,
+  `src/github/token.ts`; Anthropic's own CI auto-fix example uses it on
+  `workflow_run`), pushes the fix with it, and revokes it. A push by an App
+  starts CI.
+- The zero-setup promise holds: no App to register, no secret, no flag. (v0.10.0
+  briefly asked each adopter to register their own App; that was withdrawn.)
 - An App push starts CI, and red CI starts autofix, so §7 #7's **single
   attempt** is now enforced for B as well: a PR that already carries a
   dep-steward commit gets no second push.
