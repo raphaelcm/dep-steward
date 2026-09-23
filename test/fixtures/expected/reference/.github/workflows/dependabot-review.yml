@@ -932,8 +932,22 @@ jobs:
           # a person's merge commit on top of the fix must not buy a second push.
           # A Dependabot recreate force-pushes the fix away, and then a fresh
           # attempt on the fresh bump is right.
-          PRIOR=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json commits \
-            --jq '[.commits[] | select(any(.authors[]; .name == env.AUTOFIX_AUTHOR_NAME and .email == env.AUTOFIX_AUTHOR_EMAIL)) | .oid] | first // empty')
+          if ! PRIOR=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json commits \
+            --jq '[.commits[] | select(any(.authors[]; .name == env.AUTOFIX_AUTHOR_NAME and .email == env.AUTOFIX_AUTHOR_EMAIL)) | .oid] | first // empty'); then
+            # Fail CLOSED: without the commits there is no proving this is the
+            # first attempt, so nothing is attempted. And fail LOUD: this job
+            # owns a red build, so going quiet here would leave nobody told.
+            echo "proceed=false" >> "$GITHUB_OUTPUT"
+            echo "::error::Could not read PR #$PR_NUMBER's commits, so autofix cannot tell whether it already pushed a fix here; attempting nothing."
+            gh pr comment "$PR_NUMBER" --repo "$REPO" --body "$(printf '%s\n' \
+              "## CI is failing and dep-steward could not check it safely" \
+              '' \
+              "dep-steward could not read this PR's commits, so it cannot tell whether it already pushed a fix here, and it attempted nothing." \
+              '' \
+              'The deterministic gate will not merge a PR with a red build, so this one waits for a person.')" || true
+            gh pr edit "$PR_NUMBER" --repo "$REPO" --add-label needs-human-review --add-assignee octocat || true
+            exit 1
+          fi
           if [ -z "$PRIOR" ]; then
             echo "proceed=true" >> "$GITHUB_OUTPUT"
             exit 0

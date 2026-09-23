@@ -94,7 +94,9 @@ case "$1 $2" in
   "pr view")
     case "$(flag --json "$@")" in
       author) doc='{"author":{"login":"app/dependabot"}}' ;;
-      commits) doc="$PR_COMMITS_JSON" ;;
+      commits)
+        [ "$PR_COMMITS_JSON" = unreadable ] && { echo "HTTP 502: Bad Gateway (https://api.github.com/graphql)" >&2; exit 1; }
+        doc="$PR_COMMITS_JSON" ;;
       labels) doc="$PR_LABELS_JSON" ;;
       *) echo "gh stub: no canned answer for: $*" >&2; exit 1 ;;
     esac ;;
@@ -248,7 +250,7 @@ async function runAutofix({ edits = IN_BOUNDS_FIX, commits = [DEPENDABOT_COMMIT]
         PATH: `${bin}:${process.env.PATH}`,
         GH_LOG: ghLog,
         GH_COMMENTS: commentsDir,
-        PR_COMMITS_JSON: JSON.stringify({ commits }),
+        PR_COMMITS_JSON: commits === 'unreadable' ? 'unreadable' : JSON.stringify({ commits }),
         PR_LABELS_JSON: JSON.stringify({ labels: labels.map((name) => ({ name })) }),
         BUMP_PATHS: 'package.json',
         RUNNER_TEMP: runnerTemp,
@@ -282,6 +284,11 @@ async function runAutofix({ edits = IN_BOUNDS_FIX, commits = [DEPENDABOT_COMMIT]
   }
 }
 
+// The plain App-configured, in-bounds run: several tests read it, none
+// changes it, so it runs once.
+let appConfigured;
+const appConfiguredRun = () => (appConfigured ??= runAutofix({ app: true }));
+
 const labelledAndAssigned = (ghCalls) =>
   ghCalls.some((c) => /^pr edit 1 --repo octocat\/repo --add-label needs-human-review --add-assignee octocat$/.test(c));
 
@@ -292,7 +299,7 @@ test('with the App configured, the fix reaches the PR branch as the App, not as 
   // token and not for one by GITHUB_TOKEN, and the working tree still holds
   // GITHUB_TOKEN twice (checkout's header, the fixer's origin URL). Either one
   // winning is the #2693 defect again, silently.
-  const r = await runAutofix({ app: true });
+  const r = await appConfiguredRun();
   assert.equal(r.failed, false, r.log);
   assert.equal(r.calls.fixer.length, 1, 'a PR with only Dependabot\'s commits gets its one attempt');
   assert.deepEqual(r.pushedAs, [APP_TOKEN], `the remote must see the App token on the push:\n${r.log}`);
@@ -313,7 +320,7 @@ test('the close-and-reopen comment is posted exactly when no App is configured',
   assert.deepEqual(without.comments, [CLOSE_AND_REOPEN]);
   assert.equal(without.calls.mint.length, 0, 'no App, no token');
 
-  const withApp = await runAutofix({ app: true });
+  const withApp = await appConfiguredRun();
   assert.ok(
     !withApp.comments.some((c) => c.includes('close and reopen')),
     `an App push must not tell anyone to start CI by hand:\n${withApp.comments.join('\n---\n')}`,
@@ -372,7 +379,7 @@ test('when every push is refused, nothing lands and a person is told once', asyn
 // ---- when a token exists at all --------------------------------------------
 
 test('the push token is minted exactly when a fix will be pushed, and only for contents: write', async () => {
-  const inBounds = await runAutofix({ app: true });
+  const inBounds = await appConfiguredRun();
   assert.deepEqual(
     inBounds.calls.mint,
     [{ 'client-id': APP_CLIENT_ID, 'private-key': APP_PRIVATE_KEY, 'permission-contents': 'write' }],
@@ -392,7 +399,7 @@ test('the push token is minted exactly when a fix will be pushed, and only for c
 test('the App\'s key and token reach only the steps that use them', async () => {
   // The fixer reads attacker-influenced text with an allow-listed toolset;
   // nothing it can see may carry a credential that starts workflows.
-  const r = await runAutofix({ app: true });
+  const r = await appConfiguredRun();
   // Raw values, not JSON: the key's newlines would be escaped in JSON text.
   const carries = (map, secret) => Object.values(map ?? {}).some((v) => String(v).includes(secret));
   const holders = (secret) => r.result.steps.filter((s) => carries(s.env, secret) || carries(s.with, secret));
@@ -429,6 +436,19 @@ test('a person\'s commit on top of the fix does not buy a second attempt', async
   const r = await runAutofix({ app: true, commits: [DEPENDABOT_COMMIT, AUTOFIX_COMMIT, PERSON_MERGE_COMMIT] });
   assert.equal(r.calls.fixer.length, 0, r.log);
   assert.equal(r.pushed, false);
+});
+
+test('when the PR\'s commits cannot be read, the job attempts nothing and tells a person', async () => {
+  // The guard cannot prove this is the first attempt, so it must not let the
+  // fixer run; and since autofix owns a red build, staying silent would strand
+  // the PR with nobody told.
+  const r = await runAutofix({ app: true, commits: 'unreadable' });
+  assert.equal(r.calls.fixer.length, 0, r.log);
+  assert.equal(r.pushed, false);
+  assert.equal(r.failed, true, 'dep-steward could not do its job, and must look like it');
+  assert.equal(r.comments.length, 1);
+  assert.match(r.comments[0], /could not read this PR's commits/);
+  assert.ok(labelledAndAssigned(r.ghCalls), r.ghCalls.join('\n'));
 });
 
 test('a PR already waiting for a person is refused quietly', async () => {

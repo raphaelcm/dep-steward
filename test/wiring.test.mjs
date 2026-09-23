@@ -52,7 +52,10 @@ case "$cmd" in
       printf '%s' "$value" > "$GH_SECRETS/$store.$name"
       exit 0
     fi
-    if [ "$sub" = list ]; then printf '%s' "\${GH_SECRET_NAMES:-}"; exit 0; fi
+    if [ "$sub" = list ]; then
+      [ -n "\${GH_SECRET_LIST_FAILS:-}" ] && { echo "HTTP 403: Resource not accessible by integration" >&2; exit 1; }
+      printf '%s' "\${GH_SECRET_NAMES:-}"; exit 0
+    fi
     exit 0 ;;
   api)
     case "$*" in
@@ -276,6 +279,14 @@ test('an App whose secrets are already set is reported, not re-asked for', () =>
   const { stored: s, stdout } = runInstaller({ GH_SECRET_NAMES: 'CLAUDE_CODE_OAUTH_TOKEN\nDEP_STEWARD_APP_CLIENT_ID\nDEP_STEWARD_APP_PRIVATE_KEY' });
   assert.deepEqual(appSecrets(s), []);
   assert.match(stdout, /autofix push: +as your GitHub App \(its secrets are already set\)/);
+});
+
+test('when the repo\'s secret names cannot be read, the summary says so instead of guessing', () => {
+  // Listing secrets needs admin. A maintainer without it must not be told
+  // fixes will need a manual CI start on a repo whose App is already set up.
+  const { stdout } = runInstaller({ GH_SECRET_LIST_FAILS: '1' });
+  assert.match(stdout, /autofix push: +could not read this repo's secrets/);
+  assert.doesNotMatch(stdout, /autofix push: +with GITHUB_TOKEN/);
 });
 
 test('--no-autofix with the App flags stores no App secret, and says why', () => {

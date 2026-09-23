@@ -417,9 +417,8 @@ resolve_action_pins() {
     AUTOFIX_ACTION_PIN="$PICKED_PIN"
     AUTOFIX_PIN_NOTE="$PICKED_NOTE"
     # The push token's action lives in the autofix job alone.
-    _any=$(printf '%s\n' "$_tok" | awk 'NF { print; exit }')
     _line=$(pin_for_job autofix "$_tok")
-    pick_action_pin actions/create-github-app-token autofix "$TEMPLATE_APP_TOKEN_REF" "$TEMPLATE_APP_TOKEN_VERSION" "${_line:-$_any}" "$_tok_none"
+    pick_action_pin actions/create-github-app-token autofix "$TEMPLATE_APP_TOKEN_REF" "$TEMPLATE_APP_TOKEN_VERSION" "$_line" "$_tok_none"
     APP_TOKEN_ACTION_PIN="$PICKED_PIN"
     APP_TOKEN_PIN_NOTE="$PICKED_NOTE"
   fi
@@ -608,8 +607,10 @@ if [ "$AUTOFIX" -eq 1 ]; then
   # Whether CI starts on a fix by itself depends on who pushes it.
   if [ -n "$APP_CLIENT_ID" ]; then
     APP_NOTE='as your GitHub App (CI runs on each fix by itself)'
-  elif _secrets=$(gh secret list --repo "$NWO" --json name --jq '.[].name' 2>/dev/null) \
-       && printf '%s\n' "$_secrets" | grep -qxF "$APP_CLIENT_ID_SECRET" \
+  elif ! _secrets=$(gh secret list --repo "$NWO" --json name --jq '.[].name' 2>/dev/null); then
+    # Listing needs admin; "no App" would be a guess.
+    APP_NOTE="could not read this repo's secrets, so whether fixes are pushed as a GitHub App (and start CI by themselves) is unknown"
+  elif printf '%s\n' "$_secrets" | grep -qxF "$APP_CLIENT_ID_SECRET" \
        && printf '%s\n' "$_secrets" | grep -qxF "$APP_KEY_SECRET"; then
     APP_NOTE='as your GitHub App (its secrets are already set)'
   else
