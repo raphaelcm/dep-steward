@@ -131,9 +131,11 @@ const IN_BOUNDS_FIX = { 'src/client.ts': 'export const timeout = 2000;\n' };
  *   labels   the PR's labels
  *   app      whether dep-steward's App secrets are set
  *   mint     'ok' or 'fails' (create-github-app-token's outcome)
- *   refuse   credentials the remote answers with 403
+ *   refuse   credentials the remote refuses, with `refuseWith` (403 or 401)
+ *   helper   leave a credential helper in the tree, as claude-code-action's
+ *            allowed_non_write_users mode does, instead of a token in origin
  */
-async function runAutofix({ edits = IN_BOUNDS_FIX, commits = [DEPENDABOT_COMMIT], labels = [], app = false, mint = 'ok', refuse = [] } = {}) {
+async function runAutofix({ edits = IN_BOUNDS_FIX, commits = [DEPENDABOT_COMMIT], labels = [], app = false, mint = 'ok', refuse = [], refuseWith = 403, helper = false } = {}) {
   const root = mkdtempSync(join(tmpdir(), 'ds-autofix-'));
   const srv = join(root, 'srv');
   const bare = join(srv, 'octocat', 'repo.git');
@@ -161,7 +163,7 @@ async function runAutofix({ edits = IN_BOUNDS_FIX, commits = [DEPENDABOT_COMMIT]
   git(['init', '-q', '--bare', bare]);
   git(['push', '-q', bare, `HEAD:refs/heads/${HEAD_BRANCH}`], work);
 
-  const server = await startGitServer(srv, { refuse });
+  const server = await startGitServer(srv, { refuse, refuseWith });
   try {
     // What actions/checkout v7 leaves behind: an origin with no credential in
     // it, and GITHUB_TOKEN as an extraheader in a RUNNER_TEMP file the repo's
@@ -186,7 +188,15 @@ async function runAutofix({ edits = IN_BOUNDS_FIX, commits = [DEPENDABOT_COMMIT]
         // identity, and origin rewritten to carry the job's github_token.
         git(['config', 'user.name', 'claude[bot]'], work);
         git(['config', 'user.email', '41898282+claude[bot]@users.noreply.github.com'], work);
-        git(['remote', 'set-url', 'origin', `${server.url.replace('http://', `http://x-access-token:${w.github_token}@`)}/octocat/repo.git`], work);
+        if (helper) {
+          // Its other layout: a helper that answers any 401 with $GH_TOKEN,
+          // which every later step of this job sets to GITHUB_TOKEN.
+          const script = join(runnerTemp, 'git-credential-gh-token');
+          writeFileSync(script, '#!/bin/sh\necho username=x-access-token\necho password="$GH_TOKEN"\n', { mode: 0o700 });
+          git(['config', 'credential.helper', script], work);
+        } else {
+          git(['remote', 'set-url', 'origin', `${server.url.replace('http://', `http://x-access-token:${w.github_token}@`)}/octocat/repo.git`], work);
+        }
         // Then what the agent wrote.
         for (const [path, content] of Object.entries(edits)) {
           mkdirSync(dirname(join(work, path)), { recursive: true });
@@ -335,6 +345,19 @@ test('a refused App push falls back to GITHUB_TOKEN, and goes red', async () => 
   assert.match(r.comments.join('\n'), /GitHub App/);
 });
 
+test('a credential helper in the tree cannot turn a rejected App token into a GITHUB_TOKEN push that claims to be the App', async () => {
+  // GitHub answers an expired or revoked token with 401, and git answers a
+  // 401 by asking its credential helpers for another. If the one
+  // claude-code-action leaves could answer, the push would succeed as
+  // GITHUB_TOKEN while the step reported the App: "CI is now running" on a
+  // commit where CI never starts.
+  const r = await runAutofix({ app: true, helper: true, refuse: [basicFor(APP_TOKEN)], refuseWith: 401 });
+  assert.equal(r.failed, true, r.log);
+  assert.deepEqual(r.pushedAs, [WORKFLOW_TOKEN], 'the fallback push is the explicit one');
+  assert.doesNotMatch(r.comments.join('\n'), /CI is now running/);
+  assert.match(r.comments.join('\n'), /GitHub App/);
+});
+
 test('when every push is refused, nothing lands and a person is told once', async () => {
   // A fix the bounds accepted and nobody could push used to end as a red step
   // nobody watches, with the fixer's own comment claiming a fix.
@@ -370,7 +393,9 @@ test('the App\'s key and token reach only the steps that use them', async () => 
   // The fixer reads attacker-influenced text with an allow-listed toolset;
   // nothing it can see may carry a credential that starts workflows.
   const r = await runAutofix({ app: true });
-  const holders = (secret) => r.result.steps.filter((s) => JSON.stringify(s.env).includes(secret) || JSON.stringify(s.with).includes(secret));
+  // Raw values, not JSON: the key's newlines would be escaped in JSON text.
+  const carries = (map, secret) => Object.values(map ?? {}).some((v) => String(v).includes(secret));
+  const holders = (secret) => r.result.steps.filter((s) => carries(s.env, secret) || carries(s.with, secret));
   const keyHolders = holders(APP_PRIVATE_KEY);
   assert.deepEqual(keyHolders.map((s) => s.uses?.split('@')[0]), ['actions/create-github-app-token'], 'only the mint sees the key');
   const tokenHolders = holders(APP_TOKEN);
@@ -379,7 +404,7 @@ test('the App\'s key and token reach only the steps that use them', async () => 
   const fixerIndex = r.result.steps.findIndex((s) => s.uses?.startsWith('anthropics/claude-code-action'));
   assert.ok(r.result.steps.indexOf(tokenHolders[0]) > fixerIndex, 'and it runs after the fixer, never before');
   for (const secret of [APP_PRIVATE_KEY, APP_TOKEN]) {
-    assert.ok(!JSON.stringify(r.result.jobEnv).includes(secret), 'no credential in the job-level env, which every step inherits');
+    assert.ok(!carries(r.result.jobEnv, secret), 'no credential in the job-level env, which every step inherits');
   }
 });
 

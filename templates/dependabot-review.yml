@@ -86,9 +86,21 @@ permissions: {}
 jobs:
   review:
     # LLM review — comment + `needs-human-review` label only. Never merges.
+    #
+    # Starts only for pushers its Claude step will act for: people, and the
+    # bots in that step's `allowed_bots`. claude-code-action refuses any other
+    # bot actor ("Workflow initiated by non-human actor", its checkHumanActor),
+    # and the deliverable assertion below would then label and assign a PR
+    # whose review was never attempted. dep-steward's own App is such a bot:
+    # its autofix push fires `synchronize`. That push is deliberately not
+    # re-reviewed. The bump already has its verdict, and the fix waits for a
+    # person, who is assigned once CI finishes on it (by the gate when CI is
+    # green, by the autofix job's one-push guard when it is red).
     if: >
       github.event_name == 'workflow_dispatch' ||
-      (github.event_name == 'pull_request' && github.event.pull_request.user.login == 'dependabot[bot]')
+      (github.event_name == 'pull_request' &&
+       github.event.pull_request.user.login == 'dependabot[bot]' &&
+       (github.event.sender.type == 'User' || github.actor == 'dependabot[bot]'))
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:

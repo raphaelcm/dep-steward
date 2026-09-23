@@ -46,6 +46,11 @@ DEFAULT_MODEL='claude-opus-4-8'
 # resolve_action_pins. Raising it is a separate, deliberate change.
 TEMPLATE_ACTION_REF='1623c36729ac1cd5895198cded705a287de7db79'
 TEMPLATE_ACTION_VERSION='v1.0.187'
+# The actions/create-github-app-token pin a first install gets, for the token
+# the autofix job pushes with when the repo has dep-steward's App. Owned by the
+# repo afterwards, exactly like the claude-code-action pin above.
+TEMPLATE_APP_TOKEN_REF='bcd2ba49218906704ab6c1aa796996da409d3eb1'
+TEMPLATE_APP_TOKEN_VERSION='v3.2.0'
 REPO_URL='https://github.com/raphaelcm/dep-steward'
 GATE_PATH='.github/dependabot-automerge/gate.cjs'
 REVIEW_LINT_PATH='.github/dependabot-automerge/review-lint.cjs'
@@ -267,6 +272,7 @@ fi
 EXISTING_WORKFLOW='.github/workflows/dependabot-review.yml'
 REVIEW_ACTION_PIN="$TEMPLATE_ACTION_REF # $TEMPLATE_ACTION_VERSION"
 AUTOFIX_ACTION_PIN="$REVIEW_ACTION_PIN"
+APP_TOKEN_ACTION_PIN="$TEMPLATE_APP_TOKEN_REF # $TEMPLATE_APP_TOKEN_VERSION"
 REVIEW_PIN_NOTE=''
 AUTOFIX_PIN_NOTE=''
 
@@ -429,6 +435,7 @@ render_workflow() {
           -e "s|__REVIEW_LINT_PATH__|$REVIEW_LINT_PATH|g" \
           -e "s|__REVIEW_ACTION_PIN__|$(sed_escape "$REVIEW_ACTION_PIN")|g" \
           -e "s|__AUTOFIX_ACTION_PIN__|$(sed_escape "$AUTOFIX_ACTION_PIN")|g" \
+          -e "s|__APP_TOKEN_ACTION_PIN__|$(sed_escape "$APP_TOKEN_ACTION_PIN")|g" \
           -e "s|__ESCALATABLE_NOTE__|$ESCALATABLE_NOTE|g" \
           -e "s,__ESCALATABLE_CODES__,$ESCALATABLE_CODES,g" \
           -e "s|__ASSIGN_FLAG__|$ASSIGN_FLAG|g"

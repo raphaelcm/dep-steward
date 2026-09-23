@@ -10,13 +10,13 @@ import { spawn } from 'node:child_process';
  *         repository under `projectRoot`.
  * Does NOT: authenticate anyone. A request with no Authorization is challenged
  *           with a 401 (so git falls back to credentials in the URL, as it would
- *           against GitHub), a credential listed in `refuse` gets a 403, and
- *           everything else is served.
+ *           against GitHub), a credential listed in `refuse` gets `refuseWith`
+ *           (403 by default), and everything else is served.
  *
  * `seen` records every request, so a test can say which token reached the
  * `git-receive-pack` POST: the push GitHub would attribute.
  */
-export async function startGitServer(projectRoot, { refuse = [] } = {}) {
+export async function startGitServer(projectRoot, { refuse = [], refuseWith = 403 } = {}) {
   const seen = [];
   const server = createServer((req, res) => {
     const auth = req.headers.authorization ?? null;
@@ -29,8 +29,11 @@ export async function startGitServer(projectRoot, { refuse = [] } = {}) {
       return;
     }
     if (refuse.some((r) => tokenOf(r) === tokenOf(auth))) {
-      record.status = 403;
-      res.writeHead(403, { 'Content-Type': 'text/plain' });
+      // 401 is what GitHub answers a bad or expired token with, and it invites
+      // git to ask a credential helper for another; 403 is a valid token
+      // without the right.
+      record.status = refuseWith;
+      res.writeHead(refuseWith, refuseWith === 401 ? { 'WWW-Authenticate': 'Basic realm="GitHub"' } : { 'Content-Type': 'text/plain' });
       res.end('Permission denied');
       return;
     }

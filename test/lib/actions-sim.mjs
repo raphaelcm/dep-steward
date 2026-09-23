@@ -393,7 +393,7 @@ export async function runJob(jobs, jobName, { github, secrets = {}, uses = {}, c
   const ctx = { github, secrets, env: {}, steps: {}, inputs: {}, vars: {}, job: {}, runner: {}, jobFailed: false };
 
   if (!conditionHolds(job.if, ctx)) return { skipped: true, steps: [], failed: false, jobEnv: {} };
-  for (const [k, v] of Object.entries(job.env ?? {})) ctx.env[k] = toText(evaluate(String(v), ctx));
+  for (const [k, v] of Object.entries(job.env ?? {})) ctx.env[k] = interpolate(v, ctx);
 
   const steps = [];
   let n = 0;

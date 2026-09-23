@@ -63,13 +63,13 @@ test('continue-on-error: a failed step does not fail the job, and a default step
   assert.match(steps[1].output, /token=\[\] outcome=failure conclusion=success/);
 });
 
-test('a job-level env expression over secrets arrives as the text "true" or "false"', async () => {
+test('a job-level env expression over secrets arrives as the text "true" or "false"; a plain value arrives as itself', async () => {
   const jobs = parseJobs(workflow(`      - name: show
-        run: echo "configured=$CONFIGURED"
-`, `    env:\n      CONFIGURED: \${{ secrets.A != '' || secrets.B != '' }}\n`));
+        run: echo "configured=$CONFIGURED author=$AUTHOR"
+`, `    env:\n      CONFIGURED: \${{ secrets.A != '' || secrets.B != '' }}\n      AUTHOR: dep-steward[bot]\n`));
   const on = await runJob(jobs, 'j', { github, cwd, secrets: { A: 'x', B: '' } });
   const off = await runJob(jobs, 'j', { github, cwd, secrets: { A: '', B: '' } });
-  assert.match(on.steps[0].output, /configured=true/);
+  assert.match(on.steps[0].output, /configured=true author=dep-steward\[bot\]/);
   assert.match(off.steps[0].output, /configured=false/);
 });
 
