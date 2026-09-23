@@ -73,6 +73,18 @@ test('a job-level env expression over secrets arrives as the text "true" or "fal
   assert.match(off.steps[0].output, /configured=false/);
 });
 
+test('a run step sees its own id as GITHUB_ACTION, as on GitHub', async () => {
+  const jobs = parseJobs(workflow(`      - name: named
+        id: push
+        run: echo "action=$GITHUB_ACTION"
+      - name: anonymous
+        run: echo "action=$GITHUB_ACTION"
+`));
+  const { steps } = await runJob(jobs, 'j', { github, cwd });
+  assert.match(steps[0].output, /action=push/);
+  assert.match(steps[1].output, /action=__run/);
+});
+
 test('the parser refuses a step key it does not simulate, rather than ignoring it', () => {
   const jobs = parseJobs(workflow(`      - name: odd
         shell: pwsh

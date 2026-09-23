@@ -432,6 +432,8 @@ export async function runJob(jobs, jobName, { github, secrets = {}, uses = {}, c
           GITHUB_WORKSPACE: cwd,
           GITHUB_REPOSITORY: github.repository,
           GITHUB_EVENT_NAME: github.event_name,
+          // GitHub names a run step by its id, or `__run` when it has none.
+          GITHUB_ACTION: step.id ?? '__run',
           CI: 'true',
           ...ctx.env,
           ...record.env,

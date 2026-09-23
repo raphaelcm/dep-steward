@@ -13,9 +13,7 @@
 #   3. Render the pipeline into .github/ (workflow, prompts, dependabot.yml,
 #      gate, review lint, and the autofix bounds check unless --no-autofix).
 #   4. Create the `needs-human-review` label.
-#   5. Set CLAUDE_CODE_OAUTH_TOKEN in BOTH the Actions and Dependabot stores,
-#      and, when given, dep-steward's GitHub App (client ID + private key) in
-#      the Actions store, so autofix's fixes start CI by themselves.
+#   5. Set CLAUDE_CODE_OAUTH_TOKEN in BOTH the Actions and Dependabot stores.
 #   6. Enable auto-merge on the repo.
 #   7. Check branch protection and advise (never mutates protection rules).
 #
@@ -23,8 +21,6 @@
 #   --dry-run            show every change without making it
 #   --ci-name NAME       the CI workflow whose green status gates merges
 #   --model NAME         Claude model for the review job (default below)
-#   --app-client-id ID --app-private-key-file FILE
-#                        a GitHub App on this repo for autofix to push as
 #   --render-only --out DIR   render those files to DIR and stop (no gh)
 #
 # It writes files and (label/secret/setting) via `gh`. It never touches your
@@ -50,11 +46,6 @@ DEFAULT_MODEL='claude-opus-4-8'
 # resolve_action_pins. Raising it is a separate, deliberate change.
 TEMPLATE_ACTION_REF='1623c36729ac1cd5895198cded705a287de7db79'
 TEMPLATE_ACTION_VERSION='v1.0.187'
-# The actions/create-github-app-token pin a first install gets, for the token
-# the autofix job pushes with when the repo has dep-steward's App. Owned by the
-# repo afterwards, exactly like the claude-code-action pin above.
-TEMPLATE_APP_TOKEN_REF='bcd2ba49218906704ab6c1aa796996da409d3eb1'
-TEMPLATE_APP_TOKEN_VERSION='v3.2.0'
 REPO_URL='https://github.com/raphaelcm/dep-steward'
 GATE_PATH='.github/dependabot-automerge/gate.cjs'
 REVIEW_LINT_PATH='.github/dependabot-automerge/review-lint.cjs'
@@ -62,8 +53,6 @@ AUTOFIX_BOUNDS_PATH='.github/dependabot-automerge/autofix-bounds.cjs'
 AUTOFIX_PROMPT_PATH='.github/dependabot-autofix-prompt.md'
 LABEL='needs-human-review'
 SECRET='CLAUDE_CODE_OAUTH_TOKEN'
-APP_CLIENT_ID_SECRET='DEP_STEWARD_APP_CLIENT_ID'
-APP_KEY_SECRET='DEP_STEWARD_APP_PRIVATE_KEY'
 
 NL='
 '
@@ -76,8 +65,6 @@ MODEL="$DEFAULT_MODEL"
 ASSIGNEE=''
 ASSIGNEE_EXPLICIT=0
 AUTOFIX=1
-APP_CLIENT_ID=''
-APP_KEY_FILE=''
 
 say()  { printf '%s\n' "$*"; }
 info() { printf '  %s\n' "$*"; }
@@ -106,11 +93,6 @@ Flags:
   --no-autofix         turn OFF autofix (it's ON by default): don't let a Claude
                        agent push mechanical fixes for CI-breaking bumps; baseline
                        review + auto-merge only.
-  --app-client-id ID --app-private-key-file FILE
-                       optional, autofix only: a GitHub App installed on this
-                       repo (Contents: read and write). Autofix pushes its fixes
-                       as the App, so CI runs on them by itself; without one, you
-                       start CI on a fix by hand. Stored in the Actions store.
   --render-only --out DIR   render into DIR and stop (no gh calls)
   -h, --help           show this help
 
@@ -134,22 +116,11 @@ while [ $# -gt 0 ]; do
     --model=*) MODEL="${1#--model=}" ;;
     --assignee) ASSIGNEE="${2:-}"; ASSIGNEE_EXPLICIT=1; shift ;;
     --assignee=*) ASSIGNEE="${1#--assignee=}"; ASSIGNEE_EXPLICIT=1 ;;
-    --app-client-id) APP_CLIENT_ID="${2:-}"; shift ;;
-    --app-client-id=*) APP_CLIENT_ID="${1#--app-client-id=}" ;;
-    --app-private-key-file) APP_KEY_FILE="${2:-}"; shift ;;
-    --app-private-key-file=*) APP_KEY_FILE="${1#--app-private-key-file=}" ;;
     -h|--help) usage ;;
     *) die "unknown argument: $1 (try --help)" ;;
   esac
   shift
 done
-
-# Resolved now, while a relative path still means what the caller typed: a
-# full install moves to the repo root before it reads the key.
-case "$APP_KEY_FILE" in
-  ''|/*) : ;;
-  *) APP_KEY_FILE="$(pwd)/$APP_KEY_FILE" ;;
-esac
 
 [ "$RENDER_ONLY" -eq 1 ] && [ -z "$OUT" ] && die "--render-only requires --out DIR"
 
@@ -276,13 +247,10 @@ else
   ESCALATABLE_NOTE='ci_failed IS here: autofix is off, so no other job is watching CI and a red build would otherwise strand silently.'
 fi
 
-# ---- action pins (the installed repo owns them) ----------------------------
-# Two actions are pinned by SHA and reach the templates through placeholders:
-# anthropics/claude-code-action in both agent jobs (__REVIEW_ACTION_PIN__,
-# __AUTOFIX_ACTION_PIN__) and actions/create-github-app-token, which mints the
-# autofix push token (__APP_TOKEN_ACTION_PIN__). After a first install the
-# repo's own Dependabot moves both, so each is resolved per job from the
-# workflow the repo already has:
+# ---- the claude-code-action pin (the installed repo owns it) ---------------
+# Both agent jobs pin anthropics/claude-code-action, and the value reaches the
+# templates through the __REVIEW_ACTION_PIN__ / __AUTOFIX_ACTION_PIN__
+# placeholders, resolved per job from the workflow the repo already has:
 #
 #   no existing workflow, or no pin in it   the template's pin
 #   an existing pin                          whichever is newer, compared on the
@@ -299,17 +267,15 @@ fi
 EXISTING_WORKFLOW='.github/workflows/dependabot-review.yml'
 REVIEW_ACTION_PIN="$TEMPLATE_ACTION_REF # $TEMPLATE_ACTION_VERSION"
 AUTOFIX_ACTION_PIN="$REVIEW_ACTION_PIN"
-APP_TOKEN_ACTION_PIN="$TEMPLATE_APP_TOKEN_REF # $TEMPLATE_APP_TOKEN_VERSION"
 REVIEW_PIN_NOTE=''
 AUTOFIX_PIN_NOTE=''
-APP_TOKEN_PIN_NOTE=''
 
 # The first pin of <owner/action> in each job of an existing workflow, as one
 # "<job><TAB><ref><TAB><version comment>" line per job ("-" for a pin outside
 # any job it can name). Line-oriented like the rest of this installer — no YAML
 # parser: jobs are the two-space keys under `jobs:`, which is how every version
 # of this workflow has been laid out. <owner/action> becomes part of a regex, so
-# it must stay within [A-Za-z0-9/_-], as both callers' names do.
+# it must stay within [A-Za-z0-9/_-].
 existing_action_pins() { # existing_action_pins <workflow> <owner/action>
   awk -v q="'" -v action="$2" '
     BEGIN { pat = "^[ \t]*(-[ \t]+)?uses:[ \t]*[\"" q "]?" action "@" }
@@ -388,19 +354,15 @@ pick_action_pin() {
 }
 
 # Resolve every rendered occurrence: the review job always, the autofix job
-# (its claude-code-action and its push-token action) when autofix is on. Reads
-# the workflow relative to the current directory, so callers run it where the
-# target repo is: before any emit, which may write over that same file.
+# when autofix is on. Reads the workflow relative to the current directory, so
+# callers run it where the target repo is: before any emit, which may write
+# over that same file.
 resolve_action_pins() {
   _cca=''
-  _tok=''
   _cca_none='no existing workflow'
-  _tok_none='no existing workflow'
   if [ -f "$EXISTING_WORKFLOW" ]; then
     _cca=$(existing_action_pins "$EXISTING_WORKFLOW" anthropics/claude-code-action)
-    _tok=$(existing_action_pins "$EXISTING_WORKFLOW" actions/create-github-app-token)
     _cca_none='the existing workflow has no claude-code-action pin'
-    _tok_none='the existing workflow has no create-github-app-token pin'
   fi
   # A job's own pin first. A job this install adds — autofix turned on after a
   # --no-autofix install — has none of its own, and takes the pin the repo
@@ -416,21 +378,13 @@ resolve_action_pins() {
     pick_action_pin anthropics/claude-code-action autofix "$TEMPLATE_ACTION_REF" "$TEMPLATE_ACTION_VERSION" "${_line:-$_any}" "$_cca_none"
     AUTOFIX_ACTION_PIN="$PICKED_PIN"
     AUTOFIX_PIN_NOTE="$PICKED_NOTE"
-    # The push token's action lives in the autofix job alone.
-    _line=$(pin_for_job autofix "$_tok")
-    pick_action_pin actions/create-github-app-token autofix "$TEMPLATE_APP_TOKEN_REF" "$TEMPLATE_APP_TOKEN_VERSION" "$_line" "$_tok_none"
-    APP_TOKEN_ACTION_PIN="$PICKED_PIN"
-    APP_TOKEN_PIN_NOTE="$PICKED_NOTE"
   fi
 }
 
 # Printed on every run: --render-only, --dry-run and a real install alike.
 report_action_pins() { # report_action_pins <say|info>
   "$1" "$REVIEW_PIN_NOTE"
-  if [ "$AUTOFIX" -eq 1 ]; then
-    "$1" "$AUTOFIX_PIN_NOTE"
-    "$1" "$APP_TOKEN_PIN_NOTE"
-  fi
+  if [ "$AUTOFIX" -eq 1 ]; then "$1" "$AUTOFIX_PIN_NOTE"; fi
 }
 
 # ---- render helpers --------------------------------------------------------
@@ -477,7 +431,6 @@ render_workflow() {
           -e "s|__REVIEW_LINT_PATH__|$REVIEW_LINT_PATH|g" \
           -e "s|__REVIEW_ACTION_PIN__|$(sed_escape "$REVIEW_ACTION_PIN")|g" \
           -e "s|__AUTOFIX_ACTION_PIN__|$(sed_escape "$AUTOFIX_ACTION_PIN")|g" \
-          -e "s|__APP_TOKEN_ACTION_PIN__|$(sed_escape "$APP_TOKEN_ACTION_PIN")|g" \
           -e "s|__ESCALATABLE_NOTE__|$ESCALATABLE_NOTE|g" \
           -e "s,__ESCALATABLE_CODES__,$ESCALATABLE_CODES,g" \
           -e "s|__ASSIGN_FLAG__|$ASSIGN_FLAG|g"
@@ -525,24 +478,7 @@ if [ "$RENDER_ONLY" -eq 1 ]; then
   fi
   report_action_pins say
   say "Rendered to $OUT (ecosystems: $ACTIVE; ci: $CI_NAME; model: $MODEL; assignee: ${ASSIGNEE:-none}; autofix: $([ "$AUTOFIX" -eq 1 ] && echo on || echo off))"
-  if [ -n "$APP_CLIENT_ID$APP_KEY_FILE" ]; then
-    warn "--render-only writes files only; the App's secrets are stored by a full install, so --app-client-id and --app-private-key-file were ignored."
-  fi
   exit 0
-fi
-
-# ---- dep-steward's GitHub App: checked before anything is touched ----------
-if [ -n "$APP_CLIENT_ID" ] || [ -n "$APP_KEY_FILE" ]; then
-  { [ -n "$APP_CLIENT_ID" ] && [ -n "$APP_KEY_FILE" ]; } \
-    || die "--app-client-id and --app-private-key-file go together: the App's Client ID, and the .pem its settings page generates"
-  [ -r "$APP_KEY_FILE" ] || die "cannot read the App's private key: $APP_KEY_FILE"
-  grep -q 'PRIVATE KEY-----' "$APP_KEY_FILE" \
-    || die "$APP_KEY_FILE is not a PEM private key (the App's settings page -> Generate a private key)"
-  if [ "$AUTOFIX" -eq 0 ]; then
-    warn "not storing the App's secrets: only the autofix job uses them, and --no-autofix is set."
-    APP_CLIENT_ID=''
-    APP_KEY_FILE=''
-  fi
 fi
 
 # ---- preflight (full install) ----------------------------------------------
@@ -603,21 +539,6 @@ info "review model: $MODEL"
 info "gate path:    $GATE_PATH"
 info "escalations:  $([ -n "$ASSIGNEE" ] && echo "assign @$ASSIGNEE + label" || echo "label only (no assignee)")"
 info "autofix:      $([ "$AUTOFIX" -eq 1 ] && echo "on — Claude pushes small mechanical fixes for you to merge" || echo "off")"
-if [ "$AUTOFIX" -eq 1 ]; then
-  # Whether CI starts on a fix by itself depends on who pushes it.
-  if [ -n "$APP_CLIENT_ID" ]; then
-    APP_NOTE='as your GitHub App (CI runs on each fix by itself)'
-  elif ! _secrets=$(gh secret list --repo "$NWO" --json name --jq '.[].name' 2>/dev/null); then
-    # Listing needs admin; "no App" would be a guess.
-    APP_NOTE="could not read this repo's secrets, so whether fixes are pushed as a GitHub App (and start CI by themselves) is unknown"
-  elif printf '%s\n' "$_secrets" | grep -qxF "$APP_CLIENT_ID_SECRET" \
-       && printf '%s\n' "$_secrets" | grep -qxF "$APP_KEY_SECRET"; then
-    APP_NOTE='as your GitHub App (its secrets are already set)'
-  else
-    APP_NOTE='with GITHUB_TOKEN, so you start CI on each fix by hand (--app-client-id and --app-private-key-file change that)'
-  fi
-  info "autofix push: $APP_NOTE"
-fi
 report_action_pins info
 say ""
 
@@ -656,10 +577,6 @@ if [ "$DRY_RUN" -eq 1 ]; then
   info "gh label create $LABEL (if missing)"
   info "gh secret set $SECRET            (Actions store)"
   info "gh secret set $SECRET --app dependabot   (Dependabot store)"
-  if [ -n "$APP_CLIENT_ID" ]; then
-    info "gh secret set $APP_CLIENT_ID_SECRET     (Actions store only)"
-    info "gh secret set $APP_KEY_SECRET   (Actions store only)"
-  fi
   info "gh api -X PATCH repos/$NWO -F allow_auto_merge=true"
   info "inspect branch protection on '$DEFAULT_BRANCH' and advise"
   say ""
@@ -797,26 +714,6 @@ else
   warn "no CLAUDE_CODE_OAUTH_TOKEN provided — set it in BOTH stores yourself:"
   info "gh secret set $SECRET --repo $NWO"
   info "gh secret set $SECRET --repo $NWO --app dependabot"
-fi
-
-# ---- dep-steward's GitHub App (optional; autofix only) ---------------------
-# With it, autofix pushes its fix as the App and CI runs on the fix by itself;
-# without it, the push uses GITHUB_TOKEN and the PR says how to start CI by
-# hand. The ACTIONS store only: the one reader is the autofix job, which runs on
-# workflow_run, and a workflow_run run reads the Actions store even when
-# Dependabot started the CI run behind it (its "Set up job" log says "Secret
-# source: Actions"). A copy in the Dependabot store would never be read.
-if [ -n "$APP_CLIENT_ID" ]; then
-  if printf '%s' "$APP_CLIENT_ID" | gh secret set "$APP_CLIENT_ID_SECRET" --repo "$NWO" >/dev/null; then
-    info "set $APP_CLIENT_ID_SECRET (Actions store)"
-  else
-    warn "could not set $APP_CLIENT_ID_SECRET (Actions store)"
-  fi
-  if gh secret set "$APP_KEY_SECRET" --repo "$NWO" <"$APP_KEY_FILE" >/dev/null; then
-    info "set $APP_KEY_SECRET (Actions store)"
-  else
-    warn "could not set $APP_KEY_SECRET (Actions store)"
-  fi
 fi
 
 # ---- enable auto-merge -----------------------------------------------------

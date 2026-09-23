@@ -52,10 +52,6 @@ case "$cmd" in
       printf '%s' "$value" > "$GH_SECRETS/$store.$name"
       exit 0
     fi
-    if [ "$sub" = list ]; then
-      [ -n "\${GH_SECRET_LIST_FAILS:-}" ] && { echo "HTTP 403: Resource not accessible by integration" >&2; exit 1; }
-      printf '%s' "\${GH_SECRET_NAMES:-}"; exit 0
-    fi
     exit 0 ;;
   api)
     case "$*" in
@@ -245,74 +241,4 @@ test('--dry-run reports the pin it would keep, and writes nothing', () => {
   assert.match(stdout, /\[dry-run\] no changes made\./);
   const onDisk = readFileSync(join(dir, '.github/workflows/dependabot-review.yml'), 'utf8');
   assert.deepEqual(pinsIn(onDisk), [RUNSENSE_PIN, RUNSENSE_PIN], 'a dry run must not touch the file');
-});
-
-// ---- dep-steward's GitHub App: optional, autofix only, Actions store only ----
-//
-// With the App's two secrets, the autofix job pushes its fix as the App, so CI
-// runs on the fix by itself. Only that job reads them, and it runs on
-// workflow_run, which reads the ACTIONS store even when Dependabot started the
-// CI run behind it (a runsense autofix run's "Set up job" log says "Secret
-// source: Actions"). A copy in the Dependabot store would never be read.
-
-const APP_PEM = '-----BEGIN RSA PRIVATE KEY-----\nMIIEdepStewardTestKey\n-----END RSA PRIVATE KEY-----\n';
-const withKeyFile = (content = APP_PEM) => (dir) => writeFileSync(join(dir, 'app.private-key.pem'), content);
-const APP_ARGS = ['--app-client-id', 'Iv23liTestClient', '--app-private-key-file', 'app.private-key.pem'];
-const appSecrets = (stored) => Object.keys(stored).filter((k) => k.includes('DEP_STEWARD_APP_')).sort();
-
-test('the App\'s client ID and private key are stored in the Actions store, and only there', () => {
-  const { stored, stdout } = runInstaller({}, { args: APP_ARGS, setup: withKeyFile() });
-  assert.deepEqual(appSecrets(stored), ['actions.DEP_STEWARD_APP_CLIENT_ID', 'actions.DEP_STEWARD_APP_PRIVATE_KEY']);
-  assert.equal(stored['actions.DEP_STEWARD_APP_CLIENT_ID'], 'Iv23liTestClient');
-  // gh drops the trailing newline of a value read from stdin.
-  assert.equal(stored['actions.DEP_STEWARD_APP_PRIVATE_KEY'], APP_PEM.trimEnd());
-  assert.match(stdout, /autofix push: +as your GitHub App/);
-});
-
-test('without the App, nothing App-related is stored, and the summary says CI on a fix is started by hand', () => {
-  const { stored: s, stdout } = runInstaller();
-  assert.deepEqual(appSecrets(s), []);
-  assert.match(stdout, /autofix push: +with GITHUB_TOKEN/);
-});
-
-test('an App whose secrets are already set is reported, not re-asked for', () => {
-  const { stored: s, stdout } = runInstaller({ GH_SECRET_NAMES: 'CLAUDE_CODE_OAUTH_TOKEN\nDEP_STEWARD_APP_CLIENT_ID\nDEP_STEWARD_APP_PRIVATE_KEY' });
-  assert.deepEqual(appSecrets(s), []);
-  assert.match(stdout, /autofix push: +as your GitHub App \(its secrets are already set\)/);
-});
-
-test('when the repo\'s secret names cannot be read, the summary says so instead of guessing', () => {
-  // Listing secrets needs admin. A maintainer without it must not be told
-  // fixes will need a manual CI start on a repo whose App is already set up.
-  const { stdout } = runInstaller({ GH_SECRET_LIST_FAILS: '1' });
-  assert.match(stdout, /autofix push: +could not read this repo's secrets/);
-  assert.doesNotMatch(stdout, /autofix push: +with GITHUB_TOKEN/);
-});
-
-test('--no-autofix with the App flags stores no App secret, and says why', () => {
-  const { stored: s, stderr } = runInstaller({}, { args: ['--no-autofix', ...APP_ARGS], setup: withKeyFile() });
-  assert.deepEqual(appSecrets(s), []);
-  assert.match(stderr, /only the autofix job uses/);
-});
-
-test('a client ID without its key stops the install before anything is written', () => {
-  const r = runInstaller({}, { args: ['--app-client-id', 'Iv23liTestClient'], expectFailure: true });
-  assert.notEqual(r.status, 0);
-  assert.match(r.stderr, /--app-client-id and --app-private-key-file go together/);
-  assert.deepEqual(r.stored, {}, 'nothing may be stored');
-  assert.ok(!existsSync(join(r.repoDir, '.github/workflows/dependabot-review.yml')), 'nothing may be written');
-});
-
-test('a key file that is not a PEM private key stops the install', () => {
-  const r = runInstaller({}, { args: APP_ARGS, setup: withKeyFile('Iv23liTestClient\n'), expectFailure: true });
-  assert.notEqual(r.status, 0);
-  assert.match(r.stderr, /not a PEM private key/);
-  assert.deepEqual(r.stored, {});
-});
-
-test('--dry-run lists the App secrets it would set, and sets nothing', () => {
-  const { stored: s, stdout } = runInstaller({}, { args: ['--dry-run', ...APP_ARGS], setup: withKeyFile() });
-  assert.deepEqual(s, {});
-  assert.match(stdout, /gh secret set DEP_STEWARD_APP_CLIENT_ID +\(Actions store only\)/);
-  assert.match(stdout, /gh secret set DEP_STEWARD_APP_PRIVATE_KEY +\(Actions store only\)/);
 });
