@@ -109,7 +109,7 @@ test('by default the autofix job and its two files render, all markers substitut
   const wf = readFileSync(join(rendered, '.github/workflows/dependabot-review.yml'), 'utf8');
   assert.match(wf, /^ {2}autofix:/m);
   assert.match(wf, /workflow_run\.conclusion == 'failure'/);
-  assert.doesNotMatch(wf, /__AUTOFIX_JOB__|__MODEL__|__CI_NAME__|__ASSIGN_FLAG__|__REVIEW_LINT_PATH__|__REVIEW_ACTION_PIN__|__AUTOFIX_ACTION_PIN__/);
+  assert.doesNotMatch(wf, /__AUTOFIX_JOB__|__MODEL__|__CI_NAME__|__ASSIGN_FLAG__|__REVIEW_LINT_PATH__|__REVIEW_ACTION_PIN__|__AUTOFIX_ACTION_PIN__|__APP_TOKEN_ACTION_PIN__/);
   assert.ok(existsSync(join(rendered, '.github/dependabot-automerge/autofix-bounds.cjs')));
   const prompt = readFileSync(join(rendered, '.github/dependabot-autofix-prompt.md'), 'utf8');
   assert.match(prompt, /--add-label needs-human-review --add-assignee octocat/);
@@ -187,12 +187,12 @@ test('the path the autofix prompt names is the path the bounds step removes', ()
   assert.equal(named[1], removed[1]);
 });
 
-test('the rendered autofix job pushes for a human to merge — it never merges', () => {
+test('the rendered autofix job never merges', () => {
+  // What it pushes, and as whom, is executed in autofix-push.test.mjs.
   const wf = readFileSync(join(rendered, '.github/workflows/dependabot-review.yml'), 'utf8');
   const autofixJob = wf.slice(wf.indexOf('\n  autofix:'));
   assert.ok(autofixJob.length > 0);
   assert.doesNotMatch(autofixJob, /gh pr merge/);
-  assert.match(autofixJob, /git push origin/);
 });
 
 test('the autofix identity guard matches Dependabot literally, not as a glob', () => {
@@ -238,8 +238,11 @@ test('the action pin is a placeholder in both templates, resolved by the install
   const autofix = readFileSync(join(REPO, 'templates/dependabot-autofix-job.yml'), 'utf8');
   assert.match(review, /uses: anthropics\/claude-code-action@__REVIEW_ACTION_PIN__$/m);
   assert.match(autofix, /uses: anthropics\/claude-code-action@__AUTOFIX_ACTION_PIN__$/m);
+  // The push token's action is owned the same way: the repo's Dependabot moves
+  // it after the first install, so the template carries a placeholder.
+  assert.match(autofix, /uses: actions\/create-github-app-token@__APP_TOKEN_ACTION_PIN__$/m);
   for (const [name, text] of [['dependabot-review.yml', review], ['dependabot-autofix-job.yml', autofix]]) {
-    assert.doesNotMatch(text, /claude-code-action@[0-9a-f]{40}/, `templates/${name} hardcodes a pin again`);
+    assert.doesNotMatch(text, /(claude-code-action|create-github-app-token)@[0-9a-f]{40}/, `templates/${name} hardcodes a pin again`);
   }
 });
 

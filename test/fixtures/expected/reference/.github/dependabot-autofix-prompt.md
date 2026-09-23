@@ -11,7 +11,7 @@ Reason from those two instants whenever the failure depends on a date, a time, o
 
 ## How this fits together
 
-A deterministic step runs after you. It checks that what you edited is small and source-only — a handful of lines, no new dependency, nothing under `.github/`, existing files only, not the bumped manifest/lockfile — then commits and pushes it to the PR branch and leaves the PR for a human to re-run CI and merge. If your edit is larger than that, the pipeline discards it and escalates instead. So keep the fix minimal, and when a clean minimal fix isn't possible, escalate yourself rather than forcing one.
+A deterministic step runs after you. It checks that what you edited is small and source-only — a handful of lines, no new dependency, nothing under `.github/`, existing files only, not the bumped manifest/lockfile — then commits and pushes it to the PR branch, where a human reviews and merges it. If your edit is larger than that, the pipeline discards it and escalates instead. So keep the fix minimal, and when a clean minimal fix isn't possible, escalate yourself rather than forcing one.
 
 Your only two outcomes are: **(a)** edit source files in place, then post one comment describing the fix; or **(b)** post one comment and add the `needs-human-review` label. You do not push and you do not merge.
 

@@ -55,6 +55,25 @@ build D (auto-merge) now.**
 5. **Wrinkle to handle:** Dependabot may force-push its branch and clobber the fix
    — detect and re-apply or escalate.
 
+### Update (2026-09-23): B pushes as a GitHub App when the repo has one
+
+The "consequence of no PAT" above cost more than it looked: on
+Runsense-ai/runsense#2693 the fix commit had zero check runs for nine days,
+because nobody closed and reopened the PR. So B gained the §10 App path as an
+**option**, still with no change to who merges:
+
+- With `DEP_STEWARD_APP_CLIENT_ID` + `DEP_STEWARD_APP_PRIVATE_KEY` in the Actions
+  store, the autofix job mints an installation token (`contents: write`, this
+  repo only) after the bounds check says push, and pushes the fix with it, so
+  CI runs on the fix by itself. Without them, B is exactly as decided above.
+- The zero-setup promise holds: the App is opt-in, and its absence changes
+  nothing.
+- An App push starts CI, and red CI starts autofix, so §7 #7's **single
+  attempt** is now enforced for B as well: a PR that already carries a
+  dep-steward commit gets no second push.
+- The human still authorizes every merge. The gate still refuses any PR that
+  touches source, and an autofixed PR always does.
+
 Everything from §4 onward is **D** and is **not being built now** — preserved as
 the deferred design for if a central GitHub App is ever added and we choose to
 remove the human.

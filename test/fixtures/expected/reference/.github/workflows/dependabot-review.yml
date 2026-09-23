@@ -86,9 +86,21 @@ permissions: {}
 jobs:
   review:
     # LLM review — comment + `needs-human-review` label only. Never merges.
+    #
+    # Starts only for pushers its Claude step will act for: people, and the
+    # bots in that step's `allowed_bots`. claude-code-action refuses any other
+    # bot actor ("Workflow initiated by non-human actor", its checkHumanActor),
+    # and the deliverable assertion below would then label and assign a PR
+    # whose review was never attempted. dep-steward's own App is such a bot:
+    # its autofix push fires `synchronize`. That push is deliberately not
+    # re-reviewed. The bump already has its verdict, and the fix waits for a
+    # person, who is assigned once CI finishes on it (by the gate when CI is
+    # green, by the autofix job's one-push guard when it is red).
     if: >
       github.event_name == 'workflow_dispatch' ||
-      (github.event_name == 'pull_request' && github.event.pull_request.user.login == 'dependabot[bot]')
+      (github.event_name == 'pull_request' &&
+       github.event.pull_request.user.login == 'dependabot[bot]' &&
+       (github.event.sender.type == 'User' || github.actor == 'dependabot[bot]'))
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
@@ -810,7 +822,7 @@ jobs:
 
   autofix:
     # Option B — when CI FAILS on a Dependabot PR, a Claude agent attempts a small
-    # mechanical fix and PUSHES it to the PR branch for a human to re-run CI and
+    # mechanical fix and PUSHES it to the PR branch for a human to review and
     # merge. It NEVER merges. Safety rests on three independent things:
     #   1. the agent's tools are allow-listed (Edit/Write/gh/grep/Read/WebFetch, no
     #      general Bash), so the PR's untrusted code is never EXECUTED here even
@@ -821,6 +833,21 @@ jobs:
     #      tiny reviewed source edit on a PR branch — never on your default branch.
     # Runs on workflow_run (base context: secrets present, token writable), which
     # also sidesteps claude-code-action's OIDC self-modification refusal.
+    #
+    # WHO PUSHES decides whether CI runs on the fix. GitHub starts no workflow
+    # for a push made with GITHUB_TOKEN, so a fix pushed that way sat with no CI
+    # run and no merge-gate wake-up until a person pushed to the branch
+    # (Runsense-ai/runsense#2693: nine days). A push made with a GitHub App's
+    # installation token does start them. So when the repo has dep-steward's App
+    # (DEP_STEWARD_APP_CLIENT_ID and DEP_STEWARD_APP_PRIVATE_KEY in the ACTIONS
+    # secret store: a workflow_run run reads that store, even when Dependabot
+    # started the CI run behind it), the fix is pushed as the App and CI starts
+    # on it by itself. Without the App the push uses GITHUB_TOKEN, and the PR is
+    # told how to start CI by hand.
+    #
+    # That GitHub rule was also the only brake on fix, CI red, autofix, fix, and
+    # so on. An App push releases it, so the brake is explicit: one autofix push
+    # per PR (the `attempt` step).
     if: >
       github.event_name == 'workflow_run' &&
       github.event.workflow_run.event == 'pull_request' &&
@@ -847,6 +874,17 @@ jobs:
       # passed, harmless to grant, and required again if that input is ever
       # dropped).
       id-token: write
+    env:
+      # A boolean, never the key: GitHub refuses `secrets` in a step `if:`, and
+      # the key itself reaches one step only, the mint. Either secret set counts,
+      # so a half-configured App fails the mint loudly instead of falling back in
+      # silence; neither set is exactly the behaviour before the App existed.
+      DEP_STEWARD_APP_CONFIGURED: ${{ secrets.DEP_STEWARD_APP_CLIENT_ID != '' || secrets.DEP_STEWARD_APP_PRIVATE_KEY != '' }}
+      # The fix commit's author. The push step writes it and the attempt step
+      # looks for it: one definition, so the guard cannot drift from the commit
+      # it guards against.
+      AUTOFIX_AUTHOR_NAME: dep-steward[bot]
+      AUTOFIX_AUTHOR_EMAIL: dep-steward@users.noreply.github.com
     concurrency:
       group: dependabot-autofix-${{ github.event.workflow_run.head_branch }}
       cancel-in-progress: true
@@ -877,8 +915,60 @@ jobs:
           echo "pr_number=$PR_NUMBER" >> "$GITHUB_OUTPUT"
           echo "head_branch=$HEAD_BRANCH" >> "$GITHUB_OUTPUT"
 
-      - name: Checkout the PR branch (the code the fixer edits)
+      - name: One autofix push per PR (refuse when dep-steward already pushed a fix here)
+        id: attempt
         if: steps.pr.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ steps.pr.outputs.pr_number }}
+        run: |
+          set -euo pipefail
+          # Reads the PR's commits. Writes `proceed`, and one escalation when it
+          # refuses. Touches no code and no token; every later step runs only on
+          # proceed=true.
+          #
+          # ANY commit on the PR written by this job counts, not only the head:
+          # a person's merge commit on top of the fix must not buy a second push.
+          # A Dependabot recreate force-pushes the fix away, and then a fresh
+          # attempt on the fresh bump is right.
+          if ! PRIOR=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json commits \
+            --jq '[.commits[] | select(any(.authors[]; .name == env.AUTOFIX_AUTHOR_NAME and .email == env.AUTOFIX_AUTHOR_EMAIL)) | .oid] | first // empty'); then
+            # Fail CLOSED: without the commits there is no proving this is the
+            # first attempt, so nothing is attempted. And fail LOUD: this job
+            # owns a red build, so going quiet here would leave nobody told.
+            echo "proceed=false" >> "$GITHUB_OUTPUT"
+            echo "::error::Could not read PR #$PR_NUMBER's commits, so autofix cannot tell whether it already pushed a fix here; attempting nothing."
+            gh pr comment "$PR_NUMBER" --repo "$REPO" --body "$(printf '%s\n' \
+              "## CI is failing and dep-steward could not check it safely" \
+              '' \
+              "dep-steward could not read this PR's commits, so it cannot tell whether it already pushed a fix here, and it attempted nothing." \
+              '' \
+              'The deterministic gate will not merge a PR with a red build, so this one waits for a person.')" || true
+            gh pr edit "$PR_NUMBER" --repo "$REPO" --add-label needs-human-review --add-assignee octocat || true
+            exit 1
+          fi
+          if [ -z "$PRIOR" ]; then
+            echo "proceed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "proceed=false" >> "$GITHUB_OUTPUT"
+          echo "dep-steward already pushed a fix to PR #$PR_NUMBER ($PRIOR). One push per PR, so escalating instead of fixing again."
+          # Idempotent: this job wakes on every failing CI run.
+          if gh pr view "$PR_NUMBER" --repo "$REPO" --json labels --jq '.labels[].name' 2>/dev/null | grep -qxF 'needs-human-review'; then
+            echo "PR #$PR_NUMBER is already labelled needs-human-review, so not commenting again."
+            exit 0
+          fi
+          gh pr comment "$PR_NUMBER" --repo "$REPO" --body "$(printf '%s\n' \
+            "## CI is failing after dep-steward's fix" \
+            '' \
+            "dep-steward already pushed a fix to this PR (${PRIOR:0:7}), and CI is failing. Autofix makes one attempt per PR, so it will not push another." \
+            '' \
+            'The deterministic gate will not merge a PR with a red build, so this one waits for a person.')" || true
+          gh pr edit "$PR_NUMBER" --repo "$REPO" --add-label needs-human-review --add-assignee octocat || true
+
+      - name: Checkout the PR branch (the code the fixer edits)
+        if: steps.attempt.outputs.proceed == 'true'
         uses: actions/checkout@v7
         with:
           ref: ${{ steps.pr.outputs.head_branch }}
@@ -886,7 +976,7 @@ jobs:
 
       - name: Snapshot the bump (its paths, and the pre-fix commit)
         id: bump
-        if: steps.pr.outputs.skip != 'true'
+        if: steps.attempt.outputs.proceed == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
@@ -898,7 +988,7 @@ jobs:
 
       - name: Load the autofix prompt
         id: load_prompt
-        if: steps.pr.outputs.skip != 'true'
+        if: steps.attempt.outputs.proceed == 'true'
         env:
           # Bake the LITERAL PR number in — same reason as the review job: Claude Code
           # 2.1.207+ denies allowlisted Bash commands that contain a `$VAR` expansion,
@@ -955,7 +1045,7 @@ jobs:
 
       - name: Run the Claude fixer (edits source in place; never pushes/merges)
         id: fixer
-        if: steps.pr.outputs.skip != 'true'
+        if: steps.attempt.outputs.proceed == 'true'
         # SHA-pinned, same as the review job — bump deliberately, not implicitly.
         uses: anthropics/claude-code-action@1623c36729ac1cd5895198cded705a287de7db79 # v1.0.187
         env:
@@ -980,8 +1070,9 @@ jobs:
             --max-turns 40 --model claude-opus-4-8
             --allowedTools "Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr checks:*),Bash(gh pr edit:*),Bash(gh pr view:*),Bash(gh release view:*),Bash(gh run view:*),Bash(gh run list:*),Bash(grep:*),Read,Grep,Glob,Edit,Write,WebFetch"
 
-      - name: Bounds-check the fix — push it, or discard and escalate
-        if: ${{ !cancelled() && steps.pr.outputs.skip != 'true' }}
+      - name: Bounds-check the fix (decide it is pushed, or discard and escalate)
+        id: bounds
+        if: ${{ !cancelled() && steps.attempt.outputs.proceed == 'true' }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
@@ -1062,15 +1153,134 @@ jobs:
             gh pr comment "$PR_NUMBER" --repo "$REPO" --body "dep-steward autofix drafted a change but it exceeded the safe bounds ($REASON), so it was discarded and left for a human."
             exit 0
           fi
-          git config user.name "dep-steward[bot]"
-          git config user.email "dep-steward@users.noreply.github.com"
+          # In bounds. Pushing is the next steps' job, after the mint: this step
+          # never holds a credential that starts workflows, and a push token
+          # exists only for a fix that will be pushed.
+          echo "Fix is within bounds ($REASON); the next steps push it."
+          {
+            echo "decision=push"
+            echo "reason=$REASON"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Mint the push token (dep-steward's GitHub App, only for a fix that will be pushed)
+        id: app_token
+        if: ${{ !cancelled() && steps.bounds.outputs.decision == 'push' && env.DEP_STEWARD_APP_CONFIGURED == 'true' }}
+        # SHA-pinned like claude-code-action, and carried forward the same way by
+        # the installer. A failure here must not strand a fix the bounds
+        # accepted: the push step falls back to GITHUB_TOKEN and goes red,
+        # naming the App.
+        continue-on-error: true
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ secrets.DEP_STEWARD_APP_CLIENT_ID }}
+          private-key: ${{ secrets.DEP_STEWARD_APP_PRIVATE_KEY }}
+          # The one permission the push needs. With no owner or repositories
+          # input the token covers this repository only, and the action revokes
+          # it when the job ends.
+          permission-contents: write
+
+      - name: Push the fix (as dep-steward's GitHub App when the repo has one, so CI runs on it)
+        if: ${{ !cancelled() && steps.bounds.outputs.decision == 'push' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ steps.pr.outputs.pr_number }}
+          HEAD_BRANCH: ${{ steps.pr.outputs.head_branch }}
+          REASON: ${{ steps.bounds.outputs.reason }}
+          # Empty unless the mint ran and succeeded.
+          APP_TOKEN: ${{ steps.app_token.outputs.token }}
+          APP_SLUG: ${{ steps.app_token.outputs.app-slug }}
+          WORKFLOW_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # Reads the staged fix and the two tokens. Writes one commit to the PR
+          # branch and one comment. Decides nothing about the fix itself.
+          git config user.name "$AUTOFIX_AUTHOR_NAME"
+          git config user.email "$AUTOFIX_AUTHOR_EMAIL"
           git commit -m "fix(deps): mechanical fix for the ${HEAD_BRANCH} bump [dep-steward autofix]"
-          git push origin "HEAD:${HEAD_BRANCH}"
-          echo "Pushed the fix ($REASON)."
-          # A GITHUB_TOKEN push starts no CI run (GitHub's recursion guard), so the
-          # fix commit has no status and the PR's required check blocks the merge
-          # until a human runs CI on it — by closing/reopening the PR or pushing any
-          # commit (both are pull_request events from a human, not GITHUB_TOKEN).
-          # "Re-run" in the UI would only replay the pre-fix commit, so it can't be
-          # used here.
-          gh pr comment "$PR_NUMBER" --repo "$REPO" --body "dep-steward autofix pushed a mechanical fix for this bump ($REASON). GitHub doesn't run CI on a workflow-pushed commit, so to check the fix: **close and reopen this PR** (or push any commit to its branch). When CI is green, review and merge."
+
+          # The push must use exactly the token chosen below. The working tree
+          # holds GITHUB_TOKEN twice by now: actions/checkout's header (in a file
+          # its config includes) and claude-code-action's `origin`, rewritten to
+          # https://x-access-token:<github_token>@... Either one would quietly
+          # make this a GITHUB_TOKEN push, which starts no CI. So the push names
+          # its URL itself, with no credential in it, resets every inherited
+          # header for this server under the same key checkout uses (an unscoped
+          # `http.extraheader=` does not reach a server-scoped one), and sends
+          # its own. An explicit Authorization header also outranks anything a
+          # credential helper supplies, so a rejected token fails as itself.
+          basic_for() { printf 'x-access-token:%s' "$1" | base64 | tr -d '\n'; }
+          push_with() { # $1 = the basic credential; prints what git said
+            GIT_TERMINAL_PROMPT=0 git \
+              -c "http.$GITHUB_SERVER_URL/.extraheader=" \
+              -c "http.$GITHUB_SERVER_URL/.extraheader=AUTHORIZATION: basic $1" \
+              push "$GITHUB_SERVER_URL/$REPO.git" "HEAD:$HEAD_BRANCH" 2>&1
+          }
+
+          PUSHED_WITH=''
+          TRAIL=''
+          if [ -n "${APP_TOKEN:-}" ]; then
+            APP_BASIC=$(basic_for "$APP_TOKEN")
+            echo "::add-mask::$APP_BASIC"
+            if OUT=$(push_with "$APP_BASIC"); then PUSHED_WITH=app; else TRAIL="as the App: $OUT"; fi
+          elif [ "$DEP_STEWARD_APP_CONFIGURED" = true ]; then
+            TRAIL='as the App: no token (the mint step failed; its log says why)'
+          fi
+          if [ -z "$PUSHED_WITH" ]; then
+            WORKFLOW_BASIC=$(basic_for "$WORKFLOW_TOKEN")
+            echo "::add-mask::$WORKFLOW_BASIC"
+            if OUT=$(push_with "$WORKFLOW_BASIC"); then
+              PUSHED_WITH=workflow
+            else
+              TRAIL=$(printf '%s\n%s' "$TRAIL" "with GITHUB_TOKEN: $OUT")
+            fi
+          fi
+
+          case "$PUSHED_WITH" in
+            app)
+              echo "Pushed the fix as ${APP_SLUG}[bot] ($REASON); CI starts on it by itself."
+              gh pr comment "$PR_NUMBER" --repo "$REPO" --body "dep-steward autofix pushed a mechanical fix for this bump ($REASON). CI is now running on the fix; when it is green, review and merge."
+              ;;
+            workflow)
+              echo "Pushed the fix with GITHUB_TOKEN ($REASON)."
+              # A GITHUB_TOKEN push starts no CI run, so the fix commit has no
+              # status and the PR's required check blocks the merge until a
+              # person runs CI on it: closing and reopening the PR, or pushing
+              # any commit, is a pull_request event from a person. "Re-run" in the
+              # UI would only replay the pre-fix commit, so it can't be used here.
+              BODY="dep-steward autofix pushed a mechanical fix for this bump ($REASON). GitHub doesn't run CI on a workflow-pushed commit, so to check the fix: **close and reopen this PR** (or push any commit to its branch). When CI is green, review and merge."
+              if [ "$DEP_STEWARD_APP_CONFIGURED" = true ]; then
+                BODY="$BODY dep-steward's GitHub App is set up for this repository but could not push this fix, so CI did not start by itself; the autofix run's log says why."
+              fi
+              gh pr comment "$PR_NUMBER" --repo "$REPO" --body "$BODY"
+              if [ "$DEP_STEWARD_APP_CONFIGURED" = true ]; then
+                # Red: the fix is out, but dep-steward's own setup failed.
+                echo "::error::dep-steward's GitHub App could not push the fix, so it went out with GITHUB_TOKEN and CI will not start by itself."
+                printf '%s\n' "$TRAIL"
+                exit 1
+              fi
+              ;;
+            *)
+              echo "::error::Could not push the fix to $HEAD_BRANCH with any token:"
+              printf '%s\n' "$TRAIL"
+              # The fixer's own comment says it fixed something, so silence here
+              # would leave a false claim standing. Once per PR, like every other
+              # escalation in this job.
+              if gh pr view "$PR_NUMBER" --repo "$REPO" --json labels --jq '.labels[].name' 2>/dev/null | grep -qxF 'needs-human-review'; then
+                echo "PR #$PR_NUMBER is already labelled needs-human-review, so not commenting again."
+              else
+                gh pr comment "$PR_NUMBER" --repo "$REPO" --body "$(printf '%s\n' \
+                  '## dep-steward drafted a fix but could not push it' \
+                  '' \
+                  "The fix was within the safe bounds ($REASON), but GitHub refused the push:" \
+                  '' \
+                  '```' \
+                  "$TRAIL" \
+                  '```' \
+                  '' \
+                  'Nothing was pushed, so this PR waits for a person.')" || true
+                gh pr edit "$PR_NUMBER" --repo "$REPO" --add-label needs-human-review --add-assignee octocat || true
+              fi
+              exit 1
+              ;;
+          esac

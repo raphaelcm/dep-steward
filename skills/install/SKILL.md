@@ -18,6 +18,7 @@ Run these and tell the user what you found. Each failure has a specific fix, so 
 - **A CI workflow exists:** `gh workflow list --json name,state`. The gate keys off one workflow's exact name and cannot fire without it. If there are several and none is obviously "the" CI, ask the user which one gates merges, then pass `--ci-name "<name>"`.
 - **The token secret:** `gh secret list --repo <NWO>` and `gh secret list --repo <NWO> --app dependabot`. `CLAUDE_CODE_OAUTH_TOKEN` must be in **both** stores. A Dependabot-triggered run reads only the Dependabot store, so a token that is only in Actions leaves the review job with an empty token on exactly the PRs it exists to review.
 - **The Claude Code GitHub App:** there is no API that reports this reliably. Treat it as required and tell the user to confirm it at <https://github.com/apps/claude> → Configure → add this repo. Without it, every review and autofix run fails with "Claude Code is not installed on this repository".
+- **Optional: an App for autofix to push as.** If `gh secret list --repo <NWO>` already shows `DEP_STEWARD_APP_CLIENT_ID` and `DEP_STEWARD_APP_PRIVATE_KEY`, autofix pushes its fixes as that App and CI runs on them by itself. If not, fixes are pushed with `GITHUB_TOKEN` and the user starts CI on each by hand. Mention it; don't block on it. Setting one up needs github.com (README, "CI on the fix"), then `--app-client-id <ID> --app-private-key-file <file>.pem`.
 
 ## 2. Show what will change, before changing it
 
