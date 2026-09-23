@@ -695,12 +695,15 @@ if [ -z "$TOKEN" ] && [ -t 0 ]; then
   done
 fi
 if [ -n "$TOKEN" ]; then
-  if printf '%s' "$TOKEN" | gh secret set "$SECRET" --repo "$NWO" --body - >/dev/null; then
+  # Piped, with NO --body: gh reads the value from stdin only when --body is
+  # absent, and stores a non-empty --body verbatim. `--body -` therefore stored
+  # the one-character string "-" in both stores, never the token verified above.
+  if printf '%s' "$TOKEN" | gh secret set "$SECRET" --repo "$NWO" >/dev/null; then
     info "set $SECRET (Actions store)"
   else
     warn "could not set $SECRET (Actions store)"
   fi
-  if printf '%s' "$TOKEN" | gh secret set "$SECRET" --repo "$NWO" --app dependabot --body - >/dev/null; then
+  if printf '%s' "$TOKEN" | gh secret set "$SECRET" --repo "$NWO" --app dependabot >/dev/null; then
     info "set $SECRET (Dependabot store)"
   else
     warn "could not set $SECRET (Dependabot store)"

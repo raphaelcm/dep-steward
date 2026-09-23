@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, chmodSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, readdirSync, existsSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -33,7 +33,27 @@ case "$cmd" in
       list) exit 0 ;;
       create) exit 0 ;;
     esac ;;
-  secret) cat >/dev/null 2>&1 || true; exit 0 ;;
+  secret)
+    # Record the VALUE each store would hold, not just the command line: the
+    # command can look right while storing the wrong thing. Mirrors gh: a
+    # non-empty --body is stored verbatim; without --body, stdin is read and
+    # its trailing newlines are dropped (cli/cli pkg/cmd/secret/set getBody).
+    if [ "$sub" = set ]; then
+      name="$3"; store=actions; has_body=''; body=''
+      shift 3
+      while [ $# -gt 0 ]; do
+        case "$1" in
+          --app) store="$2"; shift ;;
+          --body) has_body=1; body="$2"; shift ;;
+        esac
+        shift
+      done
+      if [ -n "$has_body" ]; then value="$body"; else value=$(cat); fi
+      printf '%s' "$value" > "$GH_SECRETS/$store.$name"
+      exit 0
+    fi
+    if [ "$sub" = list ]; then printf '%s' "\${GH_SECRET_NAMES:-}"; exit 0; fi
+    exit 0 ;;
   api)
     case "$*" in
       *"-X PATCH"*) exit 0 ;;
@@ -70,6 +90,8 @@ exit 0
 function runInstaller(extraEnv = {}, { args = [], setup = () => {} } = {}) {
   const bin = mkdtempSync(join(tmpdir(), 'ds-bin-'));
   const ghLog = join(bin, 'gh.log');
+  const secretsDir = join(bin, 'secrets');
+  mkdirSync(secretsDir);
   writeFileSync(join(bin, 'gh'), FAKE_GH);
   chmodSync(join(bin, 'gh'), 0o755);
   writeFileSync(join(bin, 'claude'), FAKE_CLAUDE);
@@ -87,6 +109,7 @@ function runInstaller(extraEnv = {}, { args = [], setup = () => {} } = {}) {
       ...process.env,
       PATH: `${bin}:${process.env.PATH}`,
       GH_LOG: ghLog,
+      GH_SECRETS: secretsDir,
       DEP_STEWARD_SRC: REPO,
       CLAUDE_CODE_OAUTH_TOKEN: 'oauth-tok-xyz',
       ...extraEnv,
@@ -95,16 +118,34 @@ function runInstaller(extraEnv = {}, { args = [], setup = () => {} } = {}) {
     stdio: 'pipe',
   });
 
-  return { log: readFileSync(ghLog, 'utf8'), repoDir, stdout };
+  // `<store>.<NAME>` -> the value that store would hold.
+  const stored = Object.fromEntries(
+    readdirSync(secretsDir).map((f) => [f, readFileSync(join(secretsDir, f), 'utf8')]),
+  );
+  return { log: readFileSync(ghLog, 'utf8'), repoDir, stdout, stored };
 }
 
-const { log, repoDir } = runInstaller();
+const { log, repoDir, stored } = runInstaller();
 const lines = log.split('\n');
 
 test('sets the secret in the Actions store (no --app)', () => {
   assert.ok(
-    lines.some((l) => l === 'secret set CLAUDE_CODE_OAUTH_TOKEN --repo acme/widgets --body -'),
+    lines.some((l) => l === 'secret set CLAUDE_CODE_OAUTH_TOKEN --repo acme/widgets'),
     `Actions-store secret set not found. gh log:\n${log}`,
+  );
+});
+
+test('both stores hold the token itself, the one the installer just verified', () => {
+  // The command line proves only which store was addressed. What the review
+  // and fixer jobs authenticate with is the stored value, and gh stores a
+  // non-empty `--body` VERBATIM: `--body -` stored the one-character string
+  // "-" in both stores, while the token verified a few lines earlier was
+  // piped to a gh that never read it. Every review then 401s, the assertion
+  // step says to re-mint and re-run the installer, and the re-run stores "-"
+  // again.
+  assert.deepEqual(
+    { actions: stored['actions.CLAUDE_CODE_OAUTH_TOKEN'], dependabot: stored['dependabot.CLAUDE_CODE_OAUTH_TOKEN'] },
+    { actions: 'oauth-tok-xyz', dependabot: 'oauth-tok-xyz' },
   );
 });
 
