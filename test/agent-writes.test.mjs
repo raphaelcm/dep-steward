@@ -11,9 +11,10 @@ import { parseJobs, runJob } from './lib/actions-sim.mjs';
  * Nothing an agent writes is ever run.
  *
  * Both agents can write files: the reviewer its comment draft, the fixer the
- * source it fixes. Claude Code lets them write anywhere in the checkout except
- * a few protected paths (.git, .claude, ...), and the checkout also holds this
- * pipeline's own scripts. So a script a job runs after its agent has started
+ * source it fixes. Their Write and Edit rules name no path, and Claude Code
+ * matches such a rule everywhere, so they can write any file but its
+ * protected ones (.git, .claude, shell rc files): the checkout, which holds
+ * this pipeline's own scripts, and outside it too. So a script a job runs after its agent has started
  * could be one the agent rewrote, and the rewrite would run with whatever the
  * caller holds:
  *   - the review step's lint hook runs inside the Claude session, whose
@@ -25,8 +26,7 @@ import { parseJobs, runJob } from './lib/actions-sim.mjs';
  * with a token that can push to the PR it is reviewing.
  *
  * So every such script runs from a copy taken before the agent starts, kept
- * outside the checkout, where Claude Code does not let the agent write, and
- * made read-only as well. This file runs the review job with a reviewer that
+ * outside the checkout and read-only (the agent has no shell to change that). This file runs the review job with a reviewer that
  * rewrites every pipeline script it can reach, and checks that none of the
  * rewrites runs while the real scripts still do their jobs. The autofix job's
  * bounds check gets the same test in autofix-push.test.mjs.

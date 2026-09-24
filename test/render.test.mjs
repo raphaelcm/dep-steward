@@ -192,6 +192,16 @@ test('the path the autofix prompt names is the path the bounds step removes', ()
   assert.equal(named[1], removed[1]);
 });
 
+test('neither checkout persists its credential where an agent can write', () => {
+  // actions/checkout keeps a persisted credential in a RUNNER_TEMP file the
+  // repo's git config includes, and an agent's Write reaches RUNNER_TEMP.
+  const wf = readFileSync(join(rendered, '.github/workflows/dependabot-review.yml'), 'utf8');
+  const checkouts = wf.split(/\n(?=\s+- name: )/).filter((step) => /uses: actions\/checkout@/.test(step));
+  const agentJobCheckouts = checkouts.filter((step) => !/Checkout default branch/.test(step));
+  assert.equal(agentJobCheckouts.length, 2, 'the review and autofix checkouts');
+  for (const step of agentJobCheckouts) assert.match(step, /\n\s+persist-credentials: false(\n|$)/, step);
+});
+
 test('the rendered autofix job never merges', () => {
   // What it pushes, and as whom, is executed in autofix-push.test.mjs.
   const wf = readFileSync(join(rendered, '.github/workflows/dependabot-review.yml'), 'utf8');
