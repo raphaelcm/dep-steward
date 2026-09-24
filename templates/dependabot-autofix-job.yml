@@ -4,8 +4,10 @@
     # mechanical fix and PUSHES it to the PR branch for a human to review and
     # merge. It NEVER merges. Safety rests on three independent things:
     #   1. the agent's tools are allow-listed (Edit/Write/gh/grep/Read/WebFetch, no
-    #      general Bash), so the PR's untrusted code is never EXECUTED here even
-    #      though this job holds a writable token;
+    #      general Bash), and nothing it writes is run: the steps after it run
+    #      only copies of this job's own files taken before it started. So
+    #      neither the PR's untrusted code nor the agent's output is EXECUTED
+    #      here, though this job holds a writable token;
     #   2. the pushed change is bounds-limited by autofix-bounds.cjs (small,
     #      source-only, not the bumped manifests, nothing under .github/);
     #   3. a human authorizes every merge, so an injected "fix" can at most land a
@@ -149,7 +151,7 @@
           ref: ${{ steps.pr.outputs.head_branch }}
           fetch-depth: 0
 
-      - name: Snapshot the bump (its paths, and the pre-fix commit)
+      - name: Snapshot the bump and this job's own files (before the fixer can touch anything)
         id: bump
         if: steps.attempt.outputs.proceed == 'true'
         env:
@@ -158,7 +160,29 @@
           PR_NUMBER: ${{ steps.pr.outputs.pr_number }}
         run: |
           set -euo pipefail
-          gh pr diff "$PR_NUMBER" --repo "$REPO" --name-only > "$RUNNER_TEMP/bump_paths.txt"
+          # Reads the bump's paths, the pre-fix commit, and the prompt and
+          # bounds script from the commit this workflow runs from. Writes
+          # read-only copies outside the checkout, and base_sha. Touches
+          # nothing else.
+          #
+          # The fixer can write anywhere in the checkout, pipeline files
+          # included, and the bounds check runs after it. A bounds script it
+          # rewrote would decide what is pushed, and would run with what that
+          # step holds: GITHUB_TOKEN, and this job's OIDC token, which buys a
+          # Claude App token. So the bounds step reads only these copies, kept
+          # where Claude Code does not let the fixer write, and read-only
+          # besides. They come from the workflow's own commit (the default
+          # branch's, as the gate's do), not the PR head, which on a branch cut
+          # before the install has neither file.
+          #
+          # A runner that keeps its temp directory between jobs (self-hosted)
+          # can still hold the last job's read-only copies.
+          chmod -R u+w "$RUNNER_TEMP/dep-steward" 2>/dev/null || true
+          mkdir -p "$RUNNER_TEMP/dep-steward"
+          gh pr diff "$PR_NUMBER" --repo "$REPO" --name-only > "$RUNNER_TEMP/dep-steward/bump-paths.txt"
+          git show "$GITHUB_SHA:.github/dependabot-autofix-prompt.md" > "$RUNNER_TEMP/dep-steward/dependabot-autofix-prompt.md"
+          git show "$GITHUB_SHA:.github/dependabot-automerge/autofix-bounds.cjs" > "$RUNNER_TEMP/dep-steward/autofix-bounds.cjs"
+          chmod -R a-w "$RUNNER_TEMP/dep-steward"
           echo "base_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: Load the autofix prompt
@@ -214,7 +238,7 @@
                 -e "s|\$CI_RUN_WEEKDAY|$CI_RUN_WEEKDAY|g" \
                 -e "s|\$NOW_UTC|$NOW_UTC|g" \
                 -e "s|\$NOW_WEEKDAY|$NOW_WEEKDAY|g" \
-                .github/dependabot-autofix-prompt.md
+                "$RUNNER_TEMP/dep-steward/dependabot-autofix-prompt.md"
             echo 'PROMPT_EOF_9Z3Q'
           } >> "$GITHUB_OUTPUT"
 
@@ -256,6 +280,8 @@
           BASE_SHA: ${{ steps.bump.outputs.base_sha }}
           # The real error on a failed fixer run lives here, not in the run log.
           EXEC_FILE: ${{ steps.fixer.outputs.execution_file }}
+          # `skipped` when a step before it failed: nothing was diagnosed.
+          FIXER_OUTCOME: ${{ steps.fixer.outcome }}
         run: |
           set -euo pipefail
           # The agent's comment draft is not part of the fix. It writes one to
@@ -271,14 +297,25 @@
           # file at this exact path would see it staged as D and escalate,
           # which is the safe direction.)
           rm -f .dep-steward-autofix-comment.md
-          git add -A
-          FIX_NAME_STATUS=$(git diff --cached --name-status "$BASE_SHA")
-          FIX_NUMSTAT=$(git diff --cached --numstat "$BASE_SHA")
+          FIX_NAME_STATUS=''
+          FIX_NUMSTAT=''
+          # A fixer that never ran edited nothing, and the step that failed
+          # before it may not have recorded the pre-fix commit, so there is
+          # nothing to diff.
+          if [ "${FIXER_OUTCOME:-}" != skipped ]; then
+            git add -A
+            FIX_NAME_STATUS=$(git diff --cached --name-status "$BASE_SHA")
+            FIX_NUMSTAT=$(git diff --cached --numstat "$BASE_SHA")
+          fi
           if [ -z "$FIX_NAME_STATUS" ]; then
             echo "The fixer made no edits."
             # Distinguish "agent genuinely found nothing" from "agent never ran" (e.g.
             # an invalid token). Without this, a 401 looks identical to a clean no-op.
             DETAIL='It found nothing it could safely fix.'
+            if [ "${FIXER_OUTCOME:-}" = skipped ]; then
+              echo "The fixer never ran: a step before it failed."
+              DETAIL='The fixer never ran, because a step before it failed, so the build was never diagnosed. The autofix run log says which step.'
+            fi
             if [ -n "${EXEC_FILE:-}" ] && [ -f "$EXEC_FILE" ]; then
               AGENT_ERR=$(jq -rs '[.. | objects | select(.is_error == true) | (.result // .error)] | map(select(. != null)) | .[0] // empty' "$EXEC_FILE" 2>/dev/null || true)
               if [ -n "$AGENT_ERR" ]; then
@@ -316,9 +353,10 @@
             fi
             exit 0
           fi
-          BUMP_PATHS=$(cat "$RUNNER_TEMP/bump_paths.txt")
+          BUMP_PATHS=$(cat "$RUNNER_TEMP/dep-steward/bump-paths.txt")
           export FIX_NAME_STATUS FIX_NUMSTAT BUMP_PATHS
-          OUT=$(node .github/dependabot-automerge/autofix-bounds.cjs)
+          # The copy taken before the fixer started, never the checkout's.
+          OUT=$(node "$RUNNER_TEMP/dep-steward/autofix-bounds.cjs")
           echo "$OUT"
           DECISION=$(echo "$OUT" | sed -n 's/^decision=//p')
           REASON=$(echo "$OUT" | sed -n 's/^reason=//p')

@@ -105,7 +105,7 @@ sh -c "$(curl -fsSL https://raw.githubusercontent.com/raphaelcm/dep-steward/main
 
 **It never merges — you authorize every merge.** Three things keep that safe:
 
-- **The agent's tools are allow-listed** (edit/read/`grep`/`gh`, no general shell), so your PR's untrusted code is never *executed* while the job holds a writable token.
+- **The agent's tools are allow-listed** (edit/read/`grep`/`gh`, no general shell), and nothing it writes is run: the steps after it run only copies of dep-steward's own files, taken before it started. So neither your PR's untrusted code nor the agent's output is *executed* while the job holds a writable token.
 - **The fix is bounds-limited** — a handful of lines, existing source files only, never the bumped manifest/lockfile, never anything under `.github/`. A larger or out-of-scope change is discarded and escalated to you instead.
 - **An autofixed PR can't be auto-merged.** Because the fix adds source changes, the gate's path whitelist refuses to auto-merge it — by construction it always waits for your review. So even a maximally prompt-injected "fix" can at most land a tiny, reviewed source edit on a PR branch, never on your default branch.
 
@@ -212,9 +212,10 @@ node --test test/*.test.mjs
 
 - `test/gate.test.mjs` — the gate's decision logic (rendered fresh from the templates, so it tests what actually ships).
 - `test/render.test.mjs` — render parity: the installer reproduces a known-good reference pipeline byte-for-byte.
-- `test/wiring.test.mjs` — the installer stores the verified token itself in both secret stores (the value, not just the command), stores the optional App secrets in the Actions store only, creates the label, and enables auto-merge (stubbed `gh`).
+- `test/wiring.test.mjs` — the installer stores the verified token itself in both secret stores (the value, not just the command), creates the label, and enables auto-merge (stubbed `gh`).
 - `test/workflow-shell.test.mjs` — every `run:` block in the rendered workflow parses under `bash -n` (the shell GitHub actually runs `run:` blocks with). Nothing else parses the shell the templates generate.
-- `test/autofix-push.test.mjs` — runs the rendered autofix job end to end (only the agent is simulated), pushing through real `git` to a local `git http-backend` that records who pushed: the fix lands as the App when one is configured and as `GITHUB_TOKEN` otherwise, though the working tree still holds `GITHUB_TOKEN` where checkout and claude-code-action leave it; a push token exists only for a fix that will be pushed; a PR gets one autofix push; the review job starts only for pushers its action accepts.
+- `test/autofix-push.test.mjs` — runs the rendered autofix job end to end (only the agent is simulated), pushing through real `git` to a local `git http-backend` that records who pushed: the fix lands as the Claude GitHub App, though the working tree still holds `GITHUB_TOKEN` where checkout and claude-code-action leave it, and falls back loudly when it cannot; the App token exists only for a fix that will be pushed, scoped to `contents: write`; a PR gets one autofix push; the review job starts only for pushers its action accepts.
+- `test/agent-writes.test.mjs` — runs the rendered review job with a reviewer that rewrites every pipeline script it can reach: none of the rewrites runs, and the real lint and gate still do their jobs (the autofix bounds check has the same test in `autofix-push.test.mjs`).
 - `test/actions-sim.test.mjs` — the GitHub rules the step simulator (`test/lib/actions-sim.mjs`) copies: implicit `success()`, `continue-on-error`, unset outputs, case-insensitive comparison, loud refusal of anything it does not simulate.
 - `test/permissions.test.mjs` — each agent job grants every GitHub scope the commands in its own prompt need, and an agent left on the Claude App token (no `github_token` passthrough) allow-lists nothing that could reach — even via a flag on a wildcard entry — a scope that token lacks, nor any `gh` command its prompt never orders. Derived from the rendered workflow and prompt rather than hardcoded.
 - `test/plugin.test.mjs` — the plugin and marketplace manifests parse and agree, every skill carries a description, and the README's raw-file links resolve on disk.

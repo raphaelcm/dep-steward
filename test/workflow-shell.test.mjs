@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, writeFileSync, readFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -299,6 +299,12 @@ function runAssertStep({ prState, headBranch, comments, since }) {
   const workflow = readFileSync(join(out, '.github/workflows/dependabot-review.yml'), 'utf8');
   const block = runBlocks(workflow).find((b) => b.stepName.startsWith('Assert the review deliverable exists'));
   assert.ok(block, 'the deliverable-assertion step must exist — the rest of this test is vacuous without it');
+  // The assertion runs the copies the step after checkout makes, so that step
+  // runs first, as in the job.
+  const keep = runBlocks(workflow).find((b) => b.stepName.startsWith("Keep this job's scripts"));
+  assert.ok(keep, 'the step that copies the scripts must exist');
+  const runnerTemp = mkdtempSync(join(tmpdir(), 'ds-art-'));
+  execFileSync('bash', ['-e', '-c', stripActionsExpressions(keep.script)], { cwd: out, stdio: 'pipe', env: { ...process.env, RUNNER_TEMP: runnerTemp } });
 
   const bin = mkdtempSync(join(tmpdir(), 'ds-abin-'));
   writeFileSync(join(bin, 'gh'), ASSERT_GH_STUB, { mode: 0o755 });
@@ -319,6 +325,7 @@ function runAssertStep({ prState, headBranch, comments, since }) {
         PATH: `${bin}:${process.env.PATH}`,
         GH_LOG: ghLog,
         GH_TOKEN: 'x',
+        RUNNER_TEMP: runnerTemp,
         REPO: 'octocat/repo',
         PR_NUMBER: '1',
         PR_STATE: prState,
@@ -717,6 +724,10 @@ function runAutofixPromptLoadStep({ runStartedAt = '', createdAt = '', realDate 
 
   const bin = mkdtempSync(join(tmpdir(), 'ds-afp-'));
   if (!realDate) writeFileSync(join(bin, 'date'), AUTOFIX_DATE_STUB, { mode: 0o755 });
+  // The snapshot step's copy of the prompt, where this step reads it.
+  const runnerTemp = mkdtempSync(join(tmpdir(), 'ds-afp-rt-'));
+  mkdirSync(join(runnerTemp, 'dep-steward'));
+  writeFileSync(join(runnerTemp, 'dep-steward/dependabot-autofix-prompt.md'), readFileSync(join(out, '.github/dependabot-autofix-prompt.md')));
   const githubOutput = join(bin, 'github_output');
   writeFileSync(githubOutput, '');
   const script = join(bin, 'step.sh');
@@ -733,6 +744,7 @@ function runAutofixPromptLoadStep({ runStartedAt = '', createdAt = '', realDate 
         ...process.env,
         PATH: `${bin}:${process.env.PATH}`,
         PR_NUMBER: '123',
+        RUNNER_TEMP: runnerTemp,
         CI_RUN_STARTED_AT: runStartedAt,
         CI_RUN_CREATED_AT: createdAt,
         GITHUB_OUTPUT: githubOutput,
