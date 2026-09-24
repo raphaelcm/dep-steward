@@ -126,21 +126,25 @@ jobs:
         uses: actions/checkout@v7
         with:
           fetch-depth: 0
+          # No later step fetches or pushes, and a persisted credential would
+          # be GITHUB_TOKEN in a RUNNER_TEMP file within the agent's reach.
+          persist-credentials: false
 
       - name: Keep this job's scripts where the agent cannot write them
         # Reads the gate and the lint from the checkout. Writes read-only
         # copies outside it. Touches nothing else.
         #
-        # The reviewer can write files (its comment draft), and Claude Code
-        # lets it write anywhere in this checkout, pipeline scripts included.
+        # The reviewer can write files (its comment draft). Its Write rule
+        # names no path, so it can write any file but Claude Code's protected
+        # ones (.git, .claude, shell rc files), pipeline scripts included.
         # Every script this job runs once the agent has started (the lint hook
         # before each Bash call, the gate and the lint in the deliverable
         # assertion) would run an agent's rewrite with what its caller holds:
         # in the hook, the Claude session's environment (the Claude App token,
         # GITHUB_TOKEN, CLAUDE_CODE_OAUTH_TOKEN); in a step, GITHUB_TOKEN and
         # this job's OIDC token. So they run from these copies, taken before
-        # the agent starts, outside the checkout, where Claude Code does not
-        # let the agent write, and read-only besides.
+        # the agent starts and read-only, and the agent has no shell to change
+        # that.
         run: |
           set -euo pipefail
           # A runner that keeps its temp directory between jobs (self-hosted)

