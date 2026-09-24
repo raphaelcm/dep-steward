@@ -429,7 +429,7 @@
           TRAIL=''
           APP_TOKEN=''
           if [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ]; then
-            TRAIL='as the Claude GitHub App: no OIDC token (this job needs `id-token: write`)'
+            TRAIL='as the Claude GitHub App: no OIDC token (this job needs the id-token: write permission)'
           elif ! OIDC=$(curl -q -sS --fail-with-body -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
                  "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=claude-code-github-action" 2>&1); then
             TRAIL="as the Claude GitHub App: the OIDC request failed: $OIDC"
