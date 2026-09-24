@@ -390,18 +390,32 @@
           else
             OIDC=$(printf '%s' "$OIDC" | jq -r '.value // empty' 2>/dev/null || true)
             echo "::add-mask::$OIDC"
-            # Retried like claude-code-action retries it: a blip here would
-            # otherwise cost the fix its CI run.
-            for ATTEMPT in 1 2 3; do
-              if EXCHANGED=$(curl -sS --fail-with-body -X POST -H "Authorization: Bearer $OIDC" \
+            exchange() { # "$@" = extra curl arguments; sets EXCHANGED and APP_TOKEN
+              if EXCHANGED=$(curl -sS --fail-with-body -X POST -H "Authorization: Bearer $OIDC" "$@" \
                    https://api.anthropic.com/api/github/github-app-token-exchange 2>&1); then
                 APP_TOKEN=$(printf '%s' "$EXCHANGED" | jq -r '.token // .app_token // empty' 2>/dev/null || true)
-                [ -n "$APP_TOKEN" ] && break
               fi
+              [ -n "$APP_TOKEN" ]
+            }
+            # Scoped to what a push needs, asked for the way claude-code-action
+            # asks for a scope, and retried the way it retries: a blip here
+            # would otherwise cost the fix its CI run.
+            SCOPE='contents: write'
+            for ATTEMPT in 1 2 3; do
+              exchange -H 'Content-Type: application/json' --data '{"permissions":{"contents":"write"}}' && break
               [ "$ATTEMPT" -lt 3 ] && sleep $((ATTEMPT * 2))
             done
+            # An endpoint that will not narrow the token still grants its
+            # default scope, the one every claude-code-action run here holds.
+            if [ -z "$APP_TOKEN" ]; then
+              NARROW_REFUSAL=$EXCHANGED
+              if exchange; then
+                SCOPE="the exchange's default scope, since it would not narrow the token to contents: write ($NARROW_REFUSAL)"
+              fi
+            fi
             if [ -n "$APP_TOKEN" ]; then
               echo "::add-mask::$APP_TOKEN"
+              echo "Got the Claude GitHub App's token for this push, scoped to $SCOPE."
             else
               TRAIL="as the Claude GitHub App: the token exchange failed: $EXCHANGED"
             fi

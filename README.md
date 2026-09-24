@@ -117,7 +117,7 @@ When autofix can't produce a clean, minimal fix — the break isn't clearly the 
 
 Who pushes the fix decides whether CI runs on it: GitHub starts no workflow for a commit a workflow pushes with its own `GITHUB_TOKEN`. So autofix pushes the fix **as the Claude Code GitHub App** — the one you installed for dep-steward anyway — and CI starts on it by itself. You're assigned when CI finishes: by the gate when it's green (an autofixed PR always waits for you), by the one-attempt rule when it's red.
 
-The App token comes from the same exchange `claude-code-action` uses for every review: the job's OIDC identity traded at Anthropic's endpoint for an installation token on this repository. It is asked for only after the bounds check accepts a fix, used for that one push, and revoked right after; the fixer never sees it.
+The App token comes from the same exchange `claude-code-action` uses for every review: the job's OIDC identity traded at Anthropic's endpoint for an installation token on this repository. It is asked for only after the bounds check accepts a fix, scoped to `contents: write`, used for that one push, and revoked right after; the fixer never sees it.
 
 If that token can't be had or the push is refused, the fix still goes out with `GITHUB_TOKEN`, the PR says to start CI by **closing and reopening it** (or pushing any commit to its branch) and why, and the job goes red so you notice. Nothing merges un-tested either way. Because CI on the fix is started by an App rather than by Dependabot, it runs with your Actions secrets, just as it would after a person's push — see [SECURITY.md](SECURITY.md).
 

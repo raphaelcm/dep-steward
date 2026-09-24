@@ -65,8 +65,8 @@ the one App every install already has:
 - The push step exchanges the job's OIDC token for an installation token of the
   **Claude Code GitHub App** (the exchange `claude-code-action` performs,
   `src/github/token.ts`; Anthropic's own CI auto-fix example uses it on
-  `workflow_run`), pushes the fix with it, and revokes it. A push by an App
-  starts CI.
+  `workflow_run`), scoped to `contents: write`, pushes the fix with it, and
+  revokes it. A push by an App starts CI.
 - The zero-setup promise holds: no App to register, no secret, no flag. (v0.10.0
   briefly asked each adopter to register their own App; that was withdrawn.)
 - An App push starts CI, and red CI starts autofix, so §7 #7's **single

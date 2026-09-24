@@ -124,18 +124,19 @@ if [ -n "$expr" ]; then printf '%s' "$doc" | jq -r "$expr"; else printf '%s\\n' 
 // revoke. Every call is logged with the step that made it ($GITHUB_ACTION),
 // so a test can say which step asked for a token, and when.
 const CURL_STUB = `#!/usr/bin/env bash
-method=GET; url=''; auth=''
+method=GET; url=''; auth=''; ctype=''; body=''
 while [ $# -gt 0 ]; do
   case "$1" in
     -X) method="$2"; shift ;;
-    -H) case "$2" in [Aa]uthorization:*) auth="\${2#*: }" ;; esac; shift ;;
+    -H) case "$2" in [Aa]uthorization:*) auth="\${2#*: }" ;; [Cc]ontent-[Tt]ype:*) ctype="\${2#*: }" ;; esac; shift ;;
+    -d|--data|--data-raw) body="$2"; shift ;;
     -o) shift ;;
     -*) ;;
     *) url="$1" ;;
   esac
   shift
 done
-printf '%s\\t%s\\t%s\\t%s\\n' "\${GITHUB_ACTION:-}" "$method" "$url" "$auth" >> "$CURL_LOG"
+printf '%s\\t%s\\t%s\\t%s\\t%s\\n' "\${GITHUB_ACTION:-}" "$method" "$url" "$auth" "$body" >> "$CURL_LOG"
 case "$url" in
   "$ACTIONS_ID_TOKEN_REQUEST_URL"*)
     [ "$auth" = "Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" ] || { echo '{"message":"Bad credentials"}'; exit 22; }
@@ -143,6 +144,13 @@ case "$url" in
   https://api.anthropic.com/api/github/github-app-token-exchange)
     if [ "$EXCHANGE" = fails ]; then printf '{"error":{"message":"Claude Code is not installed on this repository"}}'; exit 22; fi
     { [ "$method" = POST ] && [ "$auth" = "Bearer $OIDC_JWT" ]; } || { printf '{"error":{"message":"invalid OIDC token"}}'; exit 22; }
+    # A scope is asked for the way claude-code-action asks for one: a JSON
+    # \`permissions\` body. EXCHANGE=narrow-refused is an endpoint that grants
+    # only its default scope.
+    if [ -n "$body" ]; then
+      [ "$ctype" = application/json ] || { printf '{"error":{"message":"expected a JSON body"}}'; exit 22; }
+      [ "$EXCHANGE" = narrow-refused ] && { printf '{"error":{"message":"Invalid permissions requested"}}'; exit 22; }
+    fi
     printf '{"token":"%s"}' "$CLAUDE_APP_TOKEN" ;;
   "$GITHUB_API_URL/installation/token")
     [ "$method" = DELETE ] || exit 22 ;;
@@ -322,11 +330,11 @@ async function runAutofix({ edits = IN_BOUNDS_FIX, commits = [DEPENDABOT_COMMIT]
       comments: readdirSync(commentsDir).sort().map((f) => readFileSync(join(commentsDir, f), 'utf8')),
       ghCalls: readFileSync(ghLog, 'utf8').split('\n').filter(Boolean),
       tokenCalls: readFileSync(curlLog, 'utf8').split('\n').filter(Boolean).map((l) => {
-        const [step, method, url, auth] = l.split('\t');
+        const [step, method, url, auth, body] = l.split('\t');
         const kind = url.startsWith(OIDC_REQUEST_URL) ? 'oidc'
           : url.endsWith('/github-app-token-exchange') ? 'exchange'
             : url.endsWith('/installation/token') ? 'revoke' : 'other';
-        return { step, method, url, auth, kind };
+        return { step, method, url, auth, body, kind };
       }),
       log: result.steps.map((s) => `--- ${s.name} [${s.status}]\n${s.output}`).join('\n'),
     };
@@ -439,6 +447,33 @@ test('the Claude App token is asked for only by the push step, only for a fix th
     assert.deepEqual(x.tokenCalls, [], `no token may be asked for on ${what}`);
     assert.equal(x.pushed, false, `${what} is never pushed`);
   }
+});
+
+test('the token asked for can push code and nothing else: contents: write', async () => {
+  // It lives for one push, and a push needs nothing more: not the comment,
+  // label and issue scopes the exchange grants by default. The scope is asked
+  // for the way claude-code-action asks for one (src/github/token.ts: a JSON
+  // `permissions` body).
+  const r = await plainRun();
+  const asked = r.tokenCalls.filter((c) => c.kind === 'exchange').map((c) => c.body);
+  assert.deepEqual(asked, ['{"permissions":{"contents":"write"}}'], r.log);
+  assert.deepEqual(r.pushedAs, [CLAUDE_APP_TOKEN]);
+});
+
+test('an exchange that will not narrow the token still gets the fix out as the App, on the scope claude-code-action runs already hold', async () => {
+  // Narrowing is the endpoint's to grant. Refused, the push takes the
+  // endpoint's default scope, which every claude-code-action run in this repo
+  // already holds, rather than giving up the fix's CI run.
+  const r = await runAutofix({ exchange: 'narrow-refused' });
+  assert.equal(r.failed, false, r.log);
+  assert.deepEqual(r.pushedAs, [CLAUDE_APP_TOKEN], r.log);
+  assert.match(r.comments.join('\n'), /CI is now running on the fix/);
+  const asked = r.tokenCalls.filter((c) => c.kind === 'exchange').map((c) => c.body);
+  assert.ok(asked.length >= 2, `the narrow ask, then the default one:\n${r.log}`);
+  assert.ok(asked.slice(0, -1).every((b) => b === '{"permissions":{"contents":"write"}}'), 'contents: write is asked for first');
+  assert.equal(asked.at(-1), '', 'and only then the default scope');
+  assert.match(r.log, /default scope/, 'the log says which scope the push used');
+  assert.deepEqual(r.tokenCalls.filter((c) => c.kind === 'revoke').map((c) => c.auth), [`Bearer ${CLAUDE_APP_TOKEN}`], 'it is revoked like any other');
 });
 
 test('the Claude App token never enters any step\'s inputs, env or outputs', async () => {
