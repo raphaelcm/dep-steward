@@ -17,12 +17,11 @@
     # for a push made with GITHUB_TOKEN, so a fix pushed that way sat with no CI
     # run and no merge-gate wake-up until a person pushed to the branch
     # (Runsense-ai/runsense#2693: nine days). A push made with a GitHub App's
-    # installation token does start them. So when the repo has dep-steward's App
-    # (DEP_STEWARD_APP_CLIENT_ID and DEP_STEWARD_APP_PRIVATE_KEY in the ACTIONS
-    # secret store: a workflow_run run reads that store, even when Dependabot
-    # started the CI run behind it), the fix is pushed as the App and CI starts
-    # on it by itself. Without the App the push uses GITHUB_TOKEN, and the PR is
-    # told how to start CI by hand.
+    # installation token does start them, and one App is already on every repo
+    # this pipeline runs in: the Claude Code GitHub App, which both agent jobs
+    # need. So the fix is pushed as that App, with a token from the same OIDC
+    # exchange claude-code-action performs (its src/github/token.ts; Anthropic's
+    # own CI auto-fix example relies on it on workflow_run). Nothing to set up.
     #
     # That GitHub rule was also the only brake on fix, CI red, autofix, fix, and
     # so on. An App push releases it, so the brake is explicit: one autofix push
@@ -49,16 +48,13 @@
       # (permissions.test.mjs enforces the mapping).
       checks: read
       actions: read
-      # For claude-code-action's OIDC flow (unused when github_token is
-      # passed, harmless to grant, and required again if that input is ever
-      # dropped).
+      # The push step exchanges this job's OIDC token for the Claude GitHub
+      # App's installation token: the credential that makes CI run on the fix.
+      # Without this grant there is no OIDC token and every fix falls back to a
+      # push that starts no CI. (claude-code-action's own OIDC flow is unused
+      # here, since the fixer passes github_token.)
       id-token: write
     env:
-      # A boolean, never the key: GitHub refuses `secrets` in a step `if:`, and
-      # the key itself reaches one step only, the mint. Either secret set counts,
-      # so a half-configured App fails the mint loudly instead of falling back in
-      # silence; neither set is exactly the behaviour before the App existed.
-      DEP_STEWARD_APP_CONFIGURED: ${{ secrets.DEP_STEWARD_APP_CLIENT_ID != '' || secrets.DEP_STEWARD_APP_PRIVATE_KEY != '' }}
       # The fix commit's author. The push step writes it and the attempt step
       # looks for it: one definition, so the guard cannot drift from the commit
       # it guards against.
@@ -341,24 +337,8 @@
             echo "reason=$REASON"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Mint the push token (dep-steward's GitHub App, only for a fix that will be pushed)
-        id: app_token
-        if: ${{ !cancelled() && steps.bounds.outputs.decision == 'push' && env.DEP_STEWARD_APP_CONFIGURED == 'true' }}
-        # SHA-pinned like claude-code-action, and carried forward the same way by
-        # the installer. A failure here must not strand a fix the bounds
-        # accepted: the push step falls back to GITHUB_TOKEN and goes red,
-        # naming the App.
-        continue-on-error: true
-        uses: actions/create-github-app-token@__APP_TOKEN_ACTION_PIN__
-        with:
-          client-id: ${{ secrets.DEP_STEWARD_APP_CLIENT_ID }}
-          private-key: ${{ secrets.DEP_STEWARD_APP_PRIVATE_KEY }}
-          # The one permission the push needs. With no owner or repositories
-          # input the token covers this repository only, and the action revokes
-          # it when the job ends.
-          permission-contents: write
-
-      - name: Push the fix (as dep-steward's GitHub App when the repo has one, so CI runs on it)
+      - name: Push the fix (as the Claude GitHub App, so CI runs on it)
+        id: push
         if: ${{ !cancelled() && steps.bounds.outputs.decision == 'push' }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -366,14 +346,13 @@
           PR_NUMBER: ${{ steps.pr.outputs.pr_number }}
           HEAD_BRANCH: ${{ steps.pr.outputs.head_branch }}
           REASON: ${{ steps.bounds.outputs.reason }}
-          # Empty unless the mint ran and succeeded.
-          APP_TOKEN: ${{ steps.app_token.outputs.token }}
-          APP_SLUG: ${{ steps.app_token.outputs.app-slug }}
           WORKFLOW_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          # Reads the staged fix and the two tokens. Writes one commit to the PR
-          # branch and one comment. Decides nothing about the fix itself.
+          # Reads the staged fix, this job's OIDC token and GITHUB_TOKEN. Writes
+          # one commit to the PR branch and one comment. Decides nothing about
+          # the fix itself. The Claude App token it pushes with is asked for,
+          # used and revoked inside this step: no other step ever holds it.
           git config user.name "$AUTOFIX_AUTHOR_NAME"
           git config user.email "$AUTOFIX_AUTHOR_EMAIL"
           git commit -m "fix(deps): mechanical fix for the ${HEAD_BRANCH} bump [dep-steward autofix]"
@@ -396,14 +375,58 @@
               push "$GITHUB_SERVER_URL/$REPO.git" "HEAD:$HEAD_BRANCH" 2>&1
           }
 
+          # The Claude GitHub App's installation token, asked for exactly as
+          # claude-code-action asks for it: this job's OIDC token (audience
+          # claude-code-github-action) exchanged at Anthropic's endpoint, which
+          # answers for any repo the Claude App is installed on.
           PUSHED_WITH=''
           TRAIL=''
-          if [ -n "${APP_TOKEN:-}" ]; then
+          APP_TOKEN=''
+          if [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ]; then
+            TRAIL='as the Claude GitHub App: no OIDC token (this job needs `id-token: write`)'
+          elif ! OIDC=$(curl -sS --fail-with-body -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+                 "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=claude-code-github-action" 2>&1); then
+            TRAIL="as the Claude GitHub App: the OIDC request failed: $OIDC"
+          else
+            OIDC=$(printf '%s' "$OIDC" | jq -r '.value // empty' 2>/dev/null || true)
+            echo "::add-mask::$OIDC"
+            exchange() { # "$@" = extra curl arguments; sets EXCHANGED and APP_TOKEN
+              if EXCHANGED=$(curl -sS --fail-with-body -X POST -H "Authorization: Bearer $OIDC" "$@" \
+                   https://api.anthropic.com/api/github/github-app-token-exchange 2>&1); then
+                APP_TOKEN=$(printf '%s' "$EXCHANGED" | jq -r '.token // .app_token // empty' 2>/dev/null || true)
+              fi
+              [ -n "$APP_TOKEN" ]
+            }
+            # Scoped to what a push needs, asked for the way claude-code-action
+            # asks for a scope, and retried the way it retries: a blip here
+            # would otherwise cost the fix its CI run.
+            SCOPE='contents: write'
+            for ATTEMPT in 1 2 3; do
+              exchange -H 'Content-Type: application/json' --data '{"permissions":{"contents":"write"}}' && break
+              [ "$ATTEMPT" -lt 3 ] && sleep $((ATTEMPT * 2))
+            done
+            # An endpoint that will not narrow the token still grants its
+            # default scope, the one every claude-code-action run here holds.
+            if [ -z "$APP_TOKEN" ]; then
+              NARROW_REFUSAL=$EXCHANGED
+              if exchange; then
+                SCOPE="the exchange's default scope, since it would not narrow the token to contents: write ($NARROW_REFUSAL)"
+              fi
+            fi
+            if [ -n "$APP_TOKEN" ]; then
+              echo "::add-mask::$APP_TOKEN"
+              echo "Got the Claude GitHub App's token for this push, scoped to $SCOPE."
+            else
+              TRAIL="as the Claude GitHub App: the token exchange failed: $EXCHANGED"
+            fi
+          fi
+          if [ -n "$APP_TOKEN" ]; then
             APP_BASIC=$(basic_for "$APP_TOKEN")
             echo "::add-mask::$APP_BASIC"
-            if OUT=$(push_with "$APP_BASIC"); then PUSHED_WITH=app; else TRAIL="as the App: $OUT"; fi
-          elif [ "$DEP_STEWARD_APP_CONFIGURED" = true ]; then
-            TRAIL='as the App: no token (the mint step failed; its log says why)'
+            if OUT=$(push_with "$APP_BASIC"); then PUSHED_WITH=app; else TRAIL="as the Claude GitHub App: $OUT"; fi
+            # Its one use is over; it does not outlive the push.
+            curl -sS -o /dev/null -X DELETE -H "Authorization: Bearer $APP_TOKEN" \
+              "${GITHUB_API_URL:-https://api.github.com}/installation/token" 2>/dev/null || true
           fi
           if [ -z "$PUSHED_WITH" ]; then
             WORKFLOW_BASIC=$(basic_for "$WORKFLOW_TOKEN")
@@ -417,7 +440,7 @@
 
           case "$PUSHED_WITH" in
             app)
-              echo "Pushed the fix as ${APP_SLUG}[bot] ($REASON); CI starts on it by itself."
+              echo "Pushed the fix as the Claude GitHub App ($REASON); CI starts on it by itself."
               gh pr comment "$PR_NUMBER" --repo "$REPO" --body "dep-steward autofix pushed a mechanical fix for this bump ($REASON). CI is now running on the fix; when it is green, review and merge."
               ;;
             workflow)
@@ -427,17 +450,11 @@
               # person runs CI on it: closing and reopening the PR, or pushing
               # any commit, is a pull_request event from a person. "Re-run" in the
               # UI would only replay the pre-fix commit, so it can't be used here.
-              BODY="dep-steward autofix pushed a mechanical fix for this bump ($REASON). GitHub doesn't run CI on a workflow-pushed commit, so to check the fix: **close and reopen this PR** (or push any commit to its branch). When CI is green, review and merge."
-              if [ "$DEP_STEWARD_APP_CONFIGURED" = true ]; then
-                BODY="$BODY dep-steward's GitHub App is set up for this repository but could not push this fix, so CI did not start by itself; the autofix run's log says why."
-              fi
-              gh pr comment "$PR_NUMBER" --repo "$REPO" --body "$BODY"
-              if [ "$DEP_STEWARD_APP_CONFIGURED" = true ]; then
-                # Red: the fix is out, but dep-steward's own setup failed.
-                echo "::error::dep-steward's GitHub App could not push the fix, so it went out with GITHUB_TOKEN and CI will not start by itself."
-                printf '%s\n' "$TRAIL"
-                exit 1
-              fi
+              gh pr comment "$PR_NUMBER" --repo "$REPO" --body "dep-steward autofix pushed a mechanical fix for this bump ($REASON). GitHub doesn't run CI on a workflow-pushed commit, so to check the fix: **close and reopen this PR** (or push any commit to its branch). When CI is green, review and merge. (dep-steward could not push it as the Claude GitHub App, so CI did not start by itself; the autofix run's log says why.)"
+              # Red: the fix is out, but the push that starts CI failed.
+              echo "::error::dep-steward could not push the fix as the Claude GitHub App, so it went out with GITHUB_TOKEN and CI will not start by itself."
+              printf '%s\n' "$TRAIL"
+              exit 1
               ;;
             *)
               echo "::error::Could not push the fix to $HEAD_BRANCH with any token:"

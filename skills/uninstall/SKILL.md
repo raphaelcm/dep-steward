@@ -2,7 +2,7 @@
 description: Remove the dep-steward pipeline from the current repository — delete its files, label, and secrets, leaving no footprint.
 ---
 
-Remove **dep-steward** from the repository the user is working in. Its whole footprint is a handful of files under `.github/`, one label, one secret stored in two places, and, if the user set one up for autofix, a GitHub App with two more secrets. Nothing else was ever touched, so nothing else needs undoing.
+Remove **dep-steward** from the repository the user is working in. Its whole footprint is a handful of files under `.github/`, one label, and one secret stored in two places. Nothing else was ever touched, so nothing else needs undoing.
 
 The half-uninstall to avoid is leaving the token behind: `CLAUDE_CODE_OAUTH_TOKEN` lives in the Actions store **and** the Dependabot store, and deleting one leaves a live credential in the other.
 
@@ -12,7 +12,7 @@ Report what exists before removing anything — the repo may have only some of i
 
 - Files: `.github/workflows/dependabot-review.yml`, `.github/dependabot-review-prompt.md`, `.github/dependabot.yml`, `.github/dependabot-automerge/` (the gate and the reviewer's prose lint, plus `autofix-bounds.cjs` and `.github/dependabot-autofix-prompt.md` when autofix is on).
 - Label: `gh label list --search needs-human-review`.
-- Secrets: `gh secret list` and `gh secret list --app dependabot` (the Actions store may also hold `DEP_STEWARD_APP_CLIENT_ID` and `DEP_STEWARD_APP_PRIVATE_KEY`).
+- Secrets: `gh secret list` and `gh secret list --app dependabot`.
 - Open PRs still carrying the label: `gh pr list --label needs-human-review --state open`.
 
 ## 2. Confirm before acting
@@ -35,12 +35,7 @@ rm -f .github/dependabot.yml
 gh label delete needs-human-review --yes
 gh secret delete CLAUDE_CODE_OAUTH_TOKEN
 gh secret delete CLAUDE_CODE_OAUTH_TOKEN --app dependabot
-# only if `gh secret list` showed them (autofix's App, Actions store only):
-gh secret delete DEP_STEWARD_APP_CLIENT_ID
-gh secret delete DEP_STEWARD_APP_PRIVATE_KEY
 ```
-
-If the App secrets existed, the App itself is still installed and holds a private key: tell the user to uninstall it from the repository (the App's page → Install App → Configure) and, if nothing else uses it, delete it. That part needs github.com.
 
 The file deletions are working-tree changes the user commits like any other change; the pipeline stops when that commit reaches the default branch.
 

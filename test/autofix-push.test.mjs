@@ -15,8 +15,11 @@ import { startGitServer, tokenOf, basicFor } from './lib/git-http-server.mjs';
  * pushed that way, so its fix sat with no CI run, no re-review and no merge-gate
  * wake-up until a person pushed to the branch: Runsense-ai/runsense#2693, fix
  * commit 9d4c6668, zero check runs for nine days. A push made with a GitHub App
- * installation token does start workflows, so the job now pushes as
- * dep-steward's App when the repo has one.
+ * installation token does start workflows, and one App is on every repo this
+ * pipeline runs in: the Claude Code GitHub App, which the review and fix jobs
+ * already need. So the job pushes as that App, with a token from the same
+ * OIDC exchange claude-code-action performs. Nothing to configure: a one-line
+ * install is all it takes.
  *
  * That GitHub rule was also the only brake on fix -> CI red -> autofix -> fix.
  * An App push releases it, so the job now makes ONE push per PR.
@@ -32,7 +35,10 @@ import { startGitServer, tokenOf, basicFor } from './lib/git-http-server.mjs';
  *   - claude-code-action rewrites `origin` to embed the job's github_token
  *     (src/github/operations/git-config.ts).
  * So "the App pushed" is observed at the remote, not inferred from argv.
- * Only the agent itself is simulated: it writes the files a test names.
+ * Only the agent and the two token endpoints are simulated: the agent writes
+ * the files a test names, and a `curl` stub answers the OIDC request and the
+ * exchange the way GitHub and Anthropic do (claude-code-action,
+ * src/github/token.ts), recording which step asked.
  */
 
 const REPO = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -55,9 +61,11 @@ const JOBS = parseJobs(readFileSync(join(RENDERED, '.github/workflows/dependabot
 
 const HEAD_BRANCH = 'dependabot/npm_and_yarn/ioredis-6.0.0';
 const WORKFLOW_TOKEN = 'ghs_workflowTokenOfThisRun0000001';
-const APP_TOKEN = 'ghs_appInstallationTokenOfThisRun02';
-const APP_CLIENT_ID = 'Iv23liDepStewardTest';
-const APP_PRIVATE_KEY = '-----BEGIN RSA PRIVATE KEY-----\nMIIEdepStewardTestKeyNotARealKey\n-----END RSA PRIVATE KEY-----';
+const CLAUDE_APP_TOKEN = 'ghs_claudeAppInstallationToken02';
+const OIDC_REQUEST_URL = 'https://pipelines.actions.test/idtoken/1?api-version=2.0';
+const OIDC_REQUEST_TOKEN = 'oidc-request-token-3';
+const OIDC_JWT = 'eyJoidcJwtOfThisJob4';
+const GITHUB_API_URL = 'https://api.github.test';
 
 // The comment a person gets when CI cannot start on its own. With no App it
 // must stay byte-identical to the text installs already post. The reason is
@@ -112,6 +120,44 @@ expr=$(flag --jq "$@")
 if [ -n "$expr" ]; then printf '%s' "$doc" | jq -r "$expr"; else printf '%s\\n' "$doc"; fi
 `;
 
+// The two token endpoints, as GitHub and Anthropic answer them, plus the
+// revoke. Every call is logged with the step that made it ($GITHUB_ACTION),
+// so a test can say which step asked for a token, and when.
+const CURL_STUB = `#!/usr/bin/env bash
+method=GET; url=''; auth=''; ctype=''; body=''
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -X) method="$2"; shift ;;
+    -H) case "$2" in [Aa]uthorization:*) auth="\${2#*: }" ;; [Cc]ontent-[Tt]ype:*) ctype="\${2#*: }" ;; esac; shift ;;
+    -d|--data|--data-raw) body="$2"; shift ;;
+    -o) shift ;;
+    -*) ;;
+    *) url="$1" ;;
+  esac
+  shift
+done
+printf '%s\\t%s\\t%s\\t%s\\t%s\\n' "\${GITHUB_ACTION:-}" "$method" "$url" "$auth" "$body" >> "$CURL_LOG"
+case "$url" in
+  "$ACTIONS_ID_TOKEN_REQUEST_URL"*)
+    [ "$auth" = "Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" ] || { echo '{"message":"Bad credentials"}'; exit 22; }
+    printf '{"count":1,"value":"%s"}' "$OIDC_JWT" ;;
+  https://api.anthropic.com/api/github/github-app-token-exchange)
+    if [ "$EXCHANGE" = fails ]; then printf '{"error":{"message":"Claude Code is not installed on this repository"}}'; exit 22; fi
+    { [ "$method" = POST ] && [ "$auth" = "Bearer $OIDC_JWT" ]; } || { printf '{"error":{"message":"invalid OIDC token"}}'; exit 22; }
+    # A scope is asked for the way claude-code-action asks for one: a JSON
+    # \`permissions\` body. EXCHANGE=narrow-refused is an endpoint that grants
+    # only its default scope.
+    if [ -n "$body" ]; then
+      [ "$ctype" = application/json ] || { printf '{"error":{"message":"expected a JSON body"}}'; exit 22; }
+      [ "$EXCHANGE" = narrow-refused ] && { printf '{"error":{"message":"Invalid permissions requested"}}'; exit 22; }
+    fi
+    printf '{"token":"%s"}' "$CLAUDE_APP_TOKEN" ;;
+  "$GITHUB_API_URL/installation/token")
+    [ "$method" = DELETE ] || exit 22 ;;
+  *) echo "curl stub: unexpected URL $url" >&2; exit 2 ;;
+esac
+`;
+
 // Keep the developer's own git config (credential helpers, above all) out of it.
 const GIT_ISOLATION = {
   GIT_CONFIG_GLOBAL: '/dev/null',
@@ -131,13 +177,13 @@ const IN_BOUNDS_FIX = { 'src/client.ts': 'export const timeout = 2000;\n' };
  *   edits    files the agent writes (path -> content)
  *   commits  the PR's commits as gh reports them
  *   labels   the PR's labels
- *   app      whether dep-steward's App secrets are set
- *   mint     'ok' or 'fails' (create-github-app-token's outcome)
+ *   exchange 'ok' or 'fails' (Anthropic's answer to the token exchange)
  *   refuse   credentials the remote refuses, with `refuseWith` (403 or 401)
  *   helper   leave a credential helper in the tree, as claude-code-action's
  *            allowed_non_write_users mode does, instead of a token in origin
+ *   jobs     the parsed workflow to run (a test may take a permission away)
  */
-async function runAutofix({ edits = IN_BOUNDS_FIX, commits = [DEPENDABOT_COMMIT], labels = [], app = false, mint = 'ok', refuse = [], refuseWith = 403, helper = false } = {}) {
+async function runAutofix({ edits = IN_BOUNDS_FIX, commits = [DEPENDABOT_COMMIT], labels = [], exchange = 'ok', refuse = [], refuseWith = 403, helper = false, jobs = JOBS } = {}) {
   const root = mkdtempSync(join(tmpdir(), 'ds-autofix-'));
   const srv = join(root, 'srv');
   const bare = join(srv, 'octocat', 'repo.git');
@@ -180,7 +226,7 @@ async function runAutofix({ edits = IN_BOUNDS_FIX, commits = [DEPENDABOT_COMMIT]
       'harness: the checkout credential must be live in the working tree, or the identity tests are vacuous',
     );
 
-    const calls = { fixer: [], mint: [] };
+    const calls = { fixer: [] };
     const uses = {
       // The tree above already is the checkout.
       'actions/checkout': async () => ({ exitCode: 0 }),
@@ -206,21 +252,23 @@ async function runAutofix({ edits = IN_BOUNDS_FIX, commits = [DEPENDABOT_COMMIT]
         }
         return { exitCode: 0, outputs: { execution_file: '' } };
       },
-      'actions/create-github-app-token': async ({ with: w }) => {
-        calls.mint.push({ ...w });
-        // The real action throws on an empty client-id or private-key.
-        if (!w['client-id'] || !w['private-key'] || mint === 'fails') {
-          return { exitCode: 1, output: '::error::the App token could not be minted' };
-        }
-        return { exitCode: 0, outputs: { token: APP_TOKEN, 'app-slug': 'dep-steward-test', 'installation-id': '42' } };
-      },
     };
 
     writeFileSync(join(bin, 'gh'), GH_STUB, { mode: 0o755 });
     const ghLog = join(bin, 'gh.log');
     writeFileSync(ghLog, '');
+    writeFileSync(join(bin, 'curl'), CURL_STUB, { mode: 0o755 });
+    const curlLog = join(bin, 'curl.log');
+    writeFileSync(curlLog, '');
+    // Retries back off with sleep; the waiting is not what is under test.
+    writeFileSync(join(bin, 'sleep'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+    // GitHub hands a job the OIDC request variables only when it grants
+    // `id-token: write`, so the harness does the same.
+    const oidc = jobs.autofix.permissions?.['id-token'] === 'write'
+      ? { ACTIONS_ID_TOKEN_REQUEST_URL: OIDC_REQUEST_URL, ACTIONS_ID_TOKEN_REQUEST_TOKEN: OIDC_REQUEST_TOKEN }
+      : {};
 
-    const result = await runJob(JOBS, 'autofix', {
+    const result = await runJob(jobs, 'autofix', {
       github: {
         event_name: 'workflow_run',
         repository: 'octocat/repo',
@@ -239,8 +287,6 @@ async function runAutofix({ edits = IN_BOUNDS_FIX, commits = [DEPENDABOT_COMMIT]
       secrets: {
         GITHUB_TOKEN: WORKFLOW_TOKEN,
         CLAUDE_CODE_OAUTH_TOKEN: 'sk-ant-oat01-test',
-        DEP_STEWARD_APP_CLIENT_ID: app ? APP_CLIENT_ID : '',
-        DEP_STEWARD_APP_PRIVATE_KEY: app ? APP_PRIVATE_KEY : '',
       },
       uses,
       cwd: work,
@@ -255,6 +301,12 @@ async function runAutofix({ edits = IN_BOUNDS_FIX, commits = [DEPENDABOT_COMMIT]
         BUMP_PATHS: 'package.json',
         RUNNER_TEMP: runnerTemp,
         GITHUB_SERVER_URL: server.url,
+        GITHUB_API_URL,
+        CURL_LOG: curlLog,
+        EXCHANGE: exchange,
+        OIDC_JWT,
+        CLAUDE_APP_TOKEN,
+        ...oidc,
       },
     });
 
@@ -277,6 +329,13 @@ async function runAutofix({ edits = IN_BOUNDS_FIX, commits = [DEPENDABOT_COMMIT]
       pushedAuthor: pushed ? git(['--git-dir', bare, 'log', '-1', '--format=%an <%ae>', HEAD_BRANCH]).trim() : null,
       comments: readdirSync(commentsDir).sort().map((f) => readFileSync(join(commentsDir, f), 'utf8')),
       ghCalls: readFileSync(ghLog, 'utf8').split('\n').filter(Boolean),
+      tokenCalls: readFileSync(curlLog, 'utf8').split('\n').filter(Boolean).map((l) => {
+        const [step, method, url, auth, body] = l.split('\t');
+        const kind = url.startsWith(OIDC_REQUEST_URL) ? 'oidc'
+          : url.endsWith('/github-app-token-exchange') ? 'exchange'
+            : url.endsWith('/installation/token') ? 'revoke' : 'other';
+        return { step, method, url, auth, body, kind };
+      }),
       log: result.steps.map((s) => `--- ${s.name} [${s.status}]\n${s.output}`).join('\n'),
     };
   } finally {
@@ -284,91 +343,82 @@ async function runAutofix({ edits = IN_BOUNDS_FIX, commits = [DEPENDABOT_COMMIT]
   }
 }
 
-// The plain App-configured, in-bounds run: several tests read it, none
+// The plain in-bounds run on a one-line install: several tests read it, none
 // changes it, so it runs once.
-let appConfigured;
-const appConfiguredRun = () => (appConfigured ??= runAutofix({ app: true }));
+let plain;
+const plainRun = () => (plain ??= runAutofix());
 
 const labelledAndAssigned = (ghCalls) =>
   ghCalls.some((c) => /^pr edit 1 --repo octocat\/repo --add-label needs-human-review --add-assignee octocat$/.test(c));
 
 // ---- who pushes -----------------------------------------------------------
 
-test('with the App configured, the fix reaches the PR branch as the App, not as GITHUB_TOKEN', async () => {
-  // The whole point. GitHub starts CI for a push by the App's installation
-  // token and not for one by GITHUB_TOKEN, and the working tree still holds
-  // GITHUB_TOKEN twice (checkout's header, the fixer's origin URL). Either one
-  // winning is the #2693 defect again, silently.
-  const r = await appConfiguredRun();
+test('with nothing configured, the fix reaches the PR branch as the Claude GitHub App, not as GITHUB_TOKEN', async () => {
+  // The whole point, on a one-line install. GitHub starts CI for a push by an
+  // App's installation token and not for one by GITHUB_TOKEN, and the working
+  // tree still holds GITHUB_TOKEN twice (checkout's header, the fixer's origin
+  // URL). Either one winning is the #2693 defect again, silently.
+  const r = await plainRun();
   assert.equal(r.failed, false, r.log);
   assert.equal(r.calls.fixer.length, 1, 'a PR with only Dependabot\'s commits gets its one attempt');
-  assert.deepEqual(r.pushedAs, [APP_TOKEN], `the remote must see the App token on the push:\n${r.log}`);
+  assert.deepEqual(r.pushedAs, [CLAUDE_APP_TOKEN], `the remote must see the Claude App token on the push:\n${r.log}`);
   assert.deepEqual(r.pushedFiles, ['src/client.ts']);
   assert.equal(r.pushedAuthor, 'dep-steward[bot] <dep-steward@users.noreply.github.com>');
   assert.equal(r.comments.length, 1);
   assert.match(r.comments[0], /CI is now running on the fix/);
+  assert.doesNotMatch(r.comments[0], /close and reopen/);
 });
 
-test('the close-and-reopen comment is posted exactly when no App is configured', async () => {
-  // Without the App nothing may change for an existing install: GITHUB_TOKEN
-  // pushes, and the person is told how to start CI, in the words installs
-  // already post. With the App that instruction is false (CI starts on its
-  // own) and must not appear.
-  const without = await runAutofix({ app: false });
-  assert.equal(without.failed, false, without.log);
-  assert.deepEqual(without.pushedAs, [WORKFLOW_TOKEN]);
-  assert.deepEqual(without.comments, [CLOSE_AND_REOPEN]);
-  assert.equal(without.calls.mint.length, 0, 'no App, no token');
-
-  const withApp = await appConfiguredRun();
-  assert.ok(
-    !withApp.comments.some((c) => c.includes('close and reopen')),
-    `an App push must not tell anyone to start CI by hand:\n${withApp.comments.join('\n---\n')}`,
-  );
-});
-
-test('an App that cannot mint a token still lands the fix, and says the App is at fault', async () => {
-  // A broken App must neither strand a fix the bounds accepted nor pass for a
-  // working one. The fix goes out the old way, the person gets the old
-  // instruction plus the reason, and the job is red: dep-steward's own setup
-  // failed.
-  const r = await runAutofix({ app: true, mint: 'fails' });
-  assert.deepEqual(r.pushedAs, [WORKFLOW_TOKEN], `the fix must not be lost to a broken App:\n${r.log}`);
-  assert.equal(r.failed, true, 'a configured App that cannot push is a malfunction and must look like one');
+test('when the Claude App token cannot be had, the fix still lands, the PR says how to start CI and why, and the job goes red', async () => {
+  // A push that cannot start CI is dep-steward not doing its job, so it must
+  // not look like success; but it must not cost the person the fix either.
+  const r = await runAutofix({ exchange: 'fails' });
+  assert.deepEqual(r.pushedAs, [WORKFLOW_TOKEN], `the fix must not be lost:\n${r.log}`);
+  assert.equal(r.failed, true);
   assert.equal(r.comments.length, 1);
   assert.ok(r.comments[0].startsWith(CLOSE_AND_REOPEN), r.comments[0]);
-  assert.match(r.comments[0], /GitHub App/);
+  assert.match(r.comments[0], /Claude GitHub App/);
 });
 
-test('a refused App push falls back to GITHUB_TOKEN, and goes red', async () => {
-  // The token minted, but the push was refused (an App without Contents:
-  // write, a branch rule that exempts only github-actions). Same outcome as a
-  // failed mint: deliver the fix, name the App, go red.
-  const r = await runAutofix({ app: true, refuse: [basicFor(APP_TOKEN)] });
+test('without id-token: write there is no OIDC token, and the job falls back the same loud way', async () => {
+  // The permission is what lets the job ask for its OIDC token at all. Trimmed
+  // away, every fix would quietly stop starting CI.
+  const trimmed = structuredClone(JOBS);
+  delete trimmed.autofix.permissions['id-token'];
+  const r = await runAutofix({ jobs: trimmed });
+  assert.deepEqual(r.pushedAs, [WORKFLOW_TOKEN], r.log);
+  assert.equal(r.failed, true);
+  assert.match(r.log, /id-token: write/);
+});
+
+test('a refused Claude App push falls back to GITHUB_TOKEN, and goes red', async () => {
+  // The token came back, but the push was refused (a branch rule that exempts
+  // only github-actions, say). Deliver the fix, name the cause, go red.
+  const r = await runAutofix({ refuse: [basicFor(CLAUDE_APP_TOKEN)] });
   const refused = r.seen.filter((s) => s.status === 403).map((s) => tokenOf(s.auth));
-  assert.ok(refused.includes(APP_TOKEN), `the App push must be tried first:\n${r.log}`);
+  assert.ok(refused.includes(CLAUDE_APP_TOKEN), `the Claude App push must be tried first:\n${r.log}`);
   assert.deepEqual(r.pushedAs, [WORKFLOW_TOKEN]);
   assert.equal(r.failed, true);
-  assert.match(r.comments.join('\n'), /GitHub App/);
+  assert.match(r.comments.join('\n'), /Claude GitHub App/);
 });
 
-test('a credential helper in the tree cannot turn a rejected App token into a GITHUB_TOKEN push that claims to be the App', async () => {
+test('a credential helper in the tree cannot turn a rejected Claude App token into a GITHUB_TOKEN push that claims to be the App', async () => {
   // GitHub answers an expired or revoked token with 401, and git answers a
   // 401 by asking its credential helpers for another. If the one
   // claude-code-action leaves could answer, the push would succeed as
   // GITHUB_TOKEN while the step reported the App: "CI is now running" on a
   // commit where CI never starts.
-  const r = await runAutofix({ app: true, helper: true, refuse: [basicFor(APP_TOKEN)], refuseWith: 401 });
+  const r = await runAutofix({ helper: true, refuse: [basicFor(CLAUDE_APP_TOKEN)], refuseWith: 401 });
   assert.equal(r.failed, true, r.log);
   assert.deepEqual(r.pushedAs, [WORKFLOW_TOKEN], 'the fallback push is the explicit one');
   assert.doesNotMatch(r.comments.join('\n'), /CI is now running/);
-  assert.match(r.comments.join('\n'), /GitHub App/);
+  assert.match(r.comments.join('\n'), /Claude GitHub App/);
 });
 
 test('when every push is refused, nothing lands and a person is told once', async () => {
   // A fix the bounds accepted and nobody could push used to end as a red step
   // nobody watches, with the fixer's own comment claiming a fix.
-  const r = await runAutofix({ app: true, refuse: [basicFor(APP_TOKEN), basicFor(WORKFLOW_TOKEN)] });
+  const r = await runAutofix({ refuse: [basicFor(CLAUDE_APP_TOKEN), basicFor(WORKFLOW_TOKEN)] });
   assert.equal(r.pushed, false);
   assert.equal(r.failed, true);
   assert.equal(r.comments.length, 1, r.log);
@@ -378,51 +428,74 @@ test('when every push is refused, nothing lands and a person is told once', asyn
 
 // ---- when a token exists at all --------------------------------------------
 
-test('the push token is minted exactly when a fix will be pushed, and only for contents: write', async () => {
-  const inBounds = await appConfiguredRun();
+test('the Claude App token is asked for only by the push step, only for a fix that will be pushed, and revoked right after', async () => {
+  const r = await plainRun();
   assert.deepEqual(
-    inBounds.calls.mint,
-    [{ 'client-id': APP_CLIENT_ID, 'private-key': APP_PRIVATE_KEY, 'permission-contents': 'write' }],
-    'one token, for this repository (no owner/repositories), able to push and nothing else',
+    r.tokenCalls.map((c) => [c.step, c.method, c.kind]),
+    [['push', 'GET', 'oidc'], ['push', 'POST', 'exchange'], ['push', 'DELETE', 'revoke']],
+    'one OIDC request, one exchange, one revoke, all from the push step',
   );
+  assert.match(r.tokenCalls[0].url, /[?&]audience=claude-code-github-action$/, 'the audience claude-code-action uses');
+  assert.equal(r.tokenCalls[1].auth, `Bearer ${OIDC_JWT}`, 'the exchange presents this job\'s OIDC token');
+  assert.equal(r.tokenCalls[2].auth, `Bearer ${CLAUDE_APP_TOKEN}`, 'and the token it got back is the one revoked');
   for (const [what, scenario] of [
-    ['a fix outside the bounds', { app: true, edits: { '.github/dependabot-autofix-prompt.md': 'rewritten\n' } }],
-    ['a fixer that made no edits', { app: true, edits: {} }],
-    ['a repo with no App', { app: false }],
+    ['a fix outside the bounds', { edits: { '.github/dependabot-autofix-prompt.md': 'rewritten\n' } }],
+    ['a fixer that made no edits', { edits: {} }],
+    ['a PR that already carries a dep-steward fix', { commits: [DEPENDABOT_COMMIT, AUTOFIX_COMMIT] }],
   ]) {
-    const r = await runAutofix(scenario);
-    assert.equal(r.calls.mint.length, 0, `no token may exist for ${what}`);
-    if (what !== 'a repo with no App') assert.equal(r.pushed, false, `${what} is never pushed`);
+    const x = await runAutofix(scenario);
+    assert.deepEqual(x.tokenCalls, [], `no token may be asked for on ${what}`);
+    assert.equal(x.pushed, false, `${what} is never pushed`);
   }
 });
 
-test('the App\'s key and token reach only the steps that use them', async () => {
-  // The fixer reads attacker-influenced text with an allow-listed toolset;
-  // nothing it can see may carry a credential that starts workflows.
-  const r = await appConfiguredRun();
-  // Raw values, not JSON: the key's newlines would be escaped in JSON text.
-  const carries = (map, secret) => Object.values(map ?? {}).some((v) => String(v).includes(secret));
-  const holders = (secret) => r.result.steps.filter((s) => carries(s.env, secret) || carries(s.with, secret));
-  const keyHolders = holders(APP_PRIVATE_KEY);
-  assert.deepEqual(keyHolders.map((s) => s.uses?.split('@')[0]), ['actions/create-github-app-token'], 'only the mint sees the key');
-  const tokenHolders = holders(APP_TOKEN);
-  assert.equal(tokenHolders.length, 1, `exactly one step receives the token: ${tokenHolders.map((s) => s.name).join(', ')}`);
-  assert.equal(tokenHolders[0].uses, null, 'the push is a run step');
-  const fixerIndex = r.result.steps.findIndex((s) => s.uses?.startsWith('anthropics/claude-code-action'));
-  assert.ok(r.result.steps.indexOf(tokenHolders[0]) > fixerIndex, 'and it runs after the fixer, never before');
-  for (const secret of [APP_PRIVATE_KEY, APP_TOKEN]) {
-    assert.ok(!carries(r.result.jobEnv, secret), 'no credential in the job-level env, which every step inherits');
-  }
+test('the token asked for can push code and nothing else: contents: write', async () => {
+  // It lives for one push, and a push needs nothing more: not the comment,
+  // label and issue scopes the exchange grants by default. The scope is asked
+  // for the way claude-code-action asks for one (src/github/token.ts: a JSON
+  // `permissions` body).
+  const r = await plainRun();
+  const asked = r.tokenCalls.filter((c) => c.kind === 'exchange').map((c) => c.body);
+  assert.deepEqual(asked, ['{"permissions":{"contents":"write"}}'], r.log);
+  assert.deepEqual(r.pushedAs, [CLAUDE_APP_TOKEN]);
+});
+
+test('an exchange that will not narrow the token still gets the fix out as the App, on the scope claude-code-action runs already hold', async () => {
+  // Narrowing is the endpoint's to grant. Refused, the push takes the
+  // endpoint's default scope, which every claude-code-action run in this repo
+  // already holds, rather than giving up the fix's CI run.
+  const r = await runAutofix({ exchange: 'narrow-refused' });
+  assert.equal(r.failed, false, r.log);
+  assert.deepEqual(r.pushedAs, [CLAUDE_APP_TOKEN], r.log);
+  assert.match(r.comments.join('\n'), /CI is now running on the fix/);
+  const asked = r.tokenCalls.filter((c) => c.kind === 'exchange').map((c) => c.body);
+  assert.ok(asked.length >= 2, `the narrow ask, then the default one:\n${r.log}`);
+  assert.ok(asked.slice(0, -1).every((b) => b === '{"permissions":{"contents":"write"}}'), 'contents: write is asked for first');
+  assert.equal(asked.at(-1), '', 'and only then the default scope');
+  assert.match(r.log, /default scope/, 'the log says which scope the push used');
+  assert.deepEqual(r.tokenCalls.filter((c) => c.kind === 'revoke').map((c) => c.auth), [`Bearer ${CLAUDE_APP_TOKEN}`], 'it is revoked like any other');
+});
+
+test('the Claude App token never enters any step\'s inputs, env or outputs', async () => {
+  // It is asked for, used and revoked inside the push step's own shell. The
+  // fixer reads attacker-influenced text; nothing it can see may carry a
+  // credential that starts workflows.
+  const r = await plainRun();
+  const carries = (map) => Object.values(map ?? {}).some((v) => String(v).includes(CLAUDE_APP_TOKEN));
+  assert.deepEqual(r.result.steps.filter((s) => carries(s.env) || carries(s.with) || carries(s.outputs)).map((s) => s.name), []);
+  assert.ok(!carries(r.result.jobEnv), 'nor the job-level env, which every step inherits');
+  assert.deepEqual(r.pushedAs, [CLAUDE_APP_TOKEN], 'and yet the push used it');
 });
 
 // ---- one push per PR ---------------------------------------------------------
 
 test('a PR that already carries a dep-steward fix gets no second attempt, and a person is told once', async () => {
-  // With the App, a fix that CI rejects would start another autofix run, and
-  // another fix, and another. The job must stop before the fixer even runs.
-  const r = await runAutofix({ app: true, commits: [DEPENDABOT_COMMIT, AUTOFIX_COMMIT] });
+  // A fix pushed as the App starts CI, so a fix CI rejects would start another
+  // autofix run, and another fix, and another. The job must stop before the
+  // fixer even runs.
+  const r = await runAutofix({ commits: [DEPENDABOT_COMMIT, AUTOFIX_COMMIT] });
   assert.equal(r.calls.fixer.length, 0, `the fixer must not run a second time:\n${r.log}`);
-  assert.equal(r.calls.mint.length, 0);
+  assert.deepEqual(r.tokenCalls, []);
   assert.equal(r.pushed, false);
   assert.equal(r.failed, false, 'refusing is the guard working, not a malfunction');
   assert.equal(r.comments.length, 1);
@@ -433,7 +506,7 @@ test('a PR that already carries a dep-steward fix gets no second attempt, and a 
 test('a person\'s commit on top of the fix does not buy a second attempt', async () => {
   // #2693's shape: a person merged main into the branch after the fix. The
   // head is no longer the fix, and a head-only check would try again.
-  const r = await runAutofix({ app: true, commits: [DEPENDABOT_COMMIT, AUTOFIX_COMMIT, PERSON_MERGE_COMMIT] });
+  const r = await runAutofix({ commits: [DEPENDABOT_COMMIT, AUTOFIX_COMMIT, PERSON_MERGE_COMMIT] });
   assert.equal(r.calls.fixer.length, 0, r.log);
   assert.equal(r.pushed, false);
 });
@@ -442,7 +515,7 @@ test('when the PR\'s commits cannot be read, the job attempts nothing and tells 
   // The guard cannot prove this is the first attempt, so it must not let the
   // fixer run; and since autofix owns a red build, staying silent would strand
   // the PR with nobody told.
-  const r = await runAutofix({ app: true, commits: 'unreadable' });
+  const r = await runAutofix({ commits: 'unreadable' });
   assert.equal(r.calls.fixer.length, 0, r.log);
   assert.equal(r.pushed, false);
   assert.equal(r.failed, true, 'dep-steward could not do its job, and must look like it');
@@ -453,7 +526,7 @@ test('when the PR\'s commits cannot be read, the job attempts nothing and tells 
 
 test('a PR already waiting for a person is refused quietly', async () => {
   // The job wakes on every failing CI run; the notice is posted once.
-  const r = await runAutofix({ app: true, commits: [DEPENDABOT_COMMIT, AUTOFIX_COMMIT], labels: ['needs-human-review'] });
+  const r = await runAutofix({ commits: [DEPENDABOT_COMMIT, AUTOFIX_COMMIT], labels: ['needs-human-review'] });
   assert.equal(r.calls.fixer.length, 0, r.log);
   assert.equal(r.comments.length, 0);
   assert.ok(!r.ghCalls.some((c) => c.startsWith('pr edit')), r.ghCalls.join('\n'));
@@ -477,10 +550,10 @@ test('bounds: the prescribed draft is discarded, and the real fix is pushed with
 });
 
 test('bounds: a scratch file the pipeline did not prescribe still escalates, and nothing is pushed', async () => {
-  const r = await runAutofix({ app: true, edits: { ...IN_BOUNDS_FIX, '.autofix-comment.md': '## dep-steward autofix\n' } });
+  const r = await runAutofix({ edits: { ...IN_BOUNDS_FIX, '.autofix-comment.md': '## dep-steward autofix\n' } });
   assert.equal(r.pushed, false);
   assert.match(r.comments.join('\n'), /fix changes file status "A" \(\.autofix-comment\.md\)/);
-  assert.equal(r.calls.mint.length, 0);
+  assert.deepEqual(r.tokenCalls, []);
 });
 
 test('bounds: a draft with no fix beside it is "no edits", not a push', async () => {
@@ -494,8 +567,8 @@ test('bounds: a draft with no fix beside it is "no edits", not a push', async ()
 
 test('the review job starts only for pushers its Claude step will act for', () => {
   // claude-code-action refuses any bot actor not in its allowed_bots
-  // (checkHumanActor: "Workflow initiated by non-human actor"). The App's
-  // push fires pull_request synchronize with the App as the actor, so a job
+  // (checkHumanActor: "Workflow initiated by non-human actor"). Autofix's push
+  // fires pull_request synchronize with the Claude App as the actor, so a job
   // that started anyway would fail, and its deliverable assertion would label
   // and assign a PR whose review was never attempted: on every autofix push.
   const review = JOBS.review;
@@ -510,7 +583,7 @@ test('the review job starts only for pushers its Claude step will act for', () =
     });
   for (const bot of allowed) assert.equal(runsFor({ login: bot, type: 'Bot' }), true, `${bot} is in allowed_bots`);
   assert.equal(runsFor({ login: 'raphaelcm', type: 'User' }), true, 'a person pushing to the PR');
-  assert.equal(runsFor({ login: 'dep-steward-runsense[bot]', type: 'Bot' }), false, 'dep-steward\'s own App pushing a fix');
+  assert.equal(runsFor({ login: 'claude[bot]', type: 'Bot' }), false, 'the Claude App pushing autofix\'s fix');
   assert.equal(
     conditionHolds(review.if, { github: { event_name: 'workflow_dispatch', actor: 'raphaelcm', event: {} }, env: {}, steps: {}, jobFailed: false }),
     true,

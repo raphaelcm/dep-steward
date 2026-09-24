@@ -16,7 +16,7 @@ Run this in the repo you want to protect:
 sh -c "$(curl -fsSL https://raw.githubusercontent.com/raphaelcm/dep-steward/main/install.sh)"
 ```
 
-It inspects your repo, shows what it will change, and does it. Re-running is safe (every step is idempotent), and it is how you upgrade. A re-run keeps the action versions your repo's Dependabot has already moved to (`anthropics/claude-code-action`, and `actions/create-github-app-token` for autofix) whenever they are newer than the ones dep-steward ships, so an upgrade never downgrades an action; every run says which pin it kept. Preview without touching anything:
+It inspects your repo, shows what it will change, and does it. Re-running is safe (every step is idempotent), and it is how you upgrade. A re-run keeps the `anthropics/claude-code-action` version your repo's Dependabot has already moved to whenever that is newer than the one dep-steward ships, so an upgrade never downgrades the action; every run says which pin it kept. Preview without touching anything:
 
 ```sh
 sh -c "$(curl -fsSL https://raw.githubusercontent.com/raphaelcm/dep-steward/main/install.sh)" -- --dry-run
@@ -28,7 +28,6 @@ sh -c "$(curl -fsSL https://raw.githubusercontent.com/raphaelcm/dep-steward/main
 - **[GitHub CLI](https://cli.github.com) (`gh`), authenticated** with `repo` + `workflow` scopes (`gh auth login`). The installer uses it to write the label, secrets, and repo settings.
 - **A `CLAUDE_CODE_OAUTH_TOKEN`** — the OAuth token `anthropics/claude-code-action` uses, from a Claude Pro/Max subscription. If [Claude Code](https://claude.com/claude-code) is installed, the installer offers to mint one for you inline via `claude setup-token` and reads it from the prompt — no separate step; otherwise `export CLAUDE_CODE_OAUTH_TOKEN=…` beforehand. Minting is browser-interactive by design, so expect one paste — it can't be captured unattended. The installer then **verifies the token authenticates before storing it** (a quick `claude -p` probe), so a wrong or expired token fails at install with a clear message rather than silently breaking the pipeline in CI later. Setup-token OAuth tokens are long-lived (a year); a copied keychain access token is short-lived and will expire.
 - **A CI workflow** whose green status should gate merges. The installer detects it or asks; pass `--ci-name "<name>"` to be explicit.
-- **Optional: a GitHub App for autofix to push as**, so CI runs on its fixes without you. See [CI on the fix](#ci-on-the-fix).
 
 ## How it works
 
@@ -87,7 +86,6 @@ GitHub settings it configures (via `gh`):
 
 - Creates the `needs-human-review` label.
 - Sets `CLAUDE_CODE_OAUTH_TOKEN` in **both** the Actions secret store **and** the Dependabot secret store (see FAQ — this is the #1 thing people get wrong).
-- With `--app-client-id` and `--app-private-key-file`, sets `DEP_STEWARD_APP_CLIENT_ID` and `DEP_STEWARD_APP_PRIVATE_KEY` in the Actions store only (see [CI on the fix](#ci-on-the-fix)).
 - Enables "Allow auto-merge" on the repo.
 - Checks branch protection and **advises** if CI isn't a required check (it never changes your protection rules).
 
@@ -95,7 +93,7 @@ It does not touch your source, your existing CI workflow, or your git history.
 
 ## Autofix (on by default)
 
-When a dependency bump **breaks your CI** in a small, mechanical way — a renamed export, a changed signature, a moved default — a Claude agent makes the minimal fix, pushes it to the PR branch, and leaves it for **you** to review and merge. It turns "escalate, go diagnose and fix it yourself" into "here's an already-fixed PR, take a look." It works with **no extra credential** beyond the token the review job already uses; add a GitHub App and CI also runs on the fix without you ([CI on the fix](#ci-on-the-fix)).
+When a dependency bump **breaks your CI** in a small, mechanical way — a renamed export, a changed signature, a moved default — a Claude agent makes the minimal fix, pushes it to the PR branch, and leaves it for **you** to review and merge. It turns "escalate, go diagnose and fix it yourself" into "here's an already-fixed PR, take a look." It needs **nothing beyond the install**: the fix is pushed as the Claude Code GitHub App you already installed, so CI runs on it by itself ([CI on the fix](#ci-on-the-fix)).
 
 The fixer is also told the failing run's own timestamp and weekday rather than left to work them out, because a bump that breaks a time-dependent test is exactly where a guessed weekday turns into a confident, wrong diagnosis.
 
@@ -117,21 +115,11 @@ When autofix can't produce a clean, minimal fix — the break isn't clearly the 
 
 ### CI on the fix
 
-Who pushes the fix decides whether CI runs on it. GitHub starts no workflow for a commit pushed with a workflow's own `GITHUB_TOKEN`, so out of the box the fix arrives with no CI run: the PR says so, and you start CI by **closing and reopening the PR** (or pushing any commit to its branch). The "re-run" button only replays the *pre-fix* commit, so it doesn't help. Nothing merges un-tested either way.
+Who pushes the fix decides whether CI runs on it: GitHub starts no workflow for a commit a workflow pushes with its own `GITHUB_TOKEN`. So autofix pushes the fix **as the Claude Code GitHub App** — the one you installed for dep-steward anyway — and CI starts on it by itself. You're assigned when CI finishes: by the gate when it's green (an autofixed PR always waits for you), by the one-attempt rule when it's red.
 
-With a GitHub App, autofix pushes the fix **as the App**, and CI starts on it by itself. You're assigned when CI finishes: by the gate when it's green (an autofixed PR always waits for you), by the one-attempt rule when it's red. To set one up:
+The App token comes from the same exchange `claude-code-action` uses for every review: the job's OIDC identity traded at Anthropic's endpoint for an installation token on this repository. It is asked for only after the bounds check accepts a fix, scoped to `contents: write`, used for that one push, and revoked right after; the fixer never sees it.
 
-1. **Create a GitHub App** owned by the account that owns the repo (for an organization: Settings → Developer settings → GitHub Apps → New GitHub App). Any name and homepage URL. Under **Webhook**, clear **Active**. Under **Repository permissions**, set **Contents: Read and write**; Metadata: Read-only is added for you. Leave everything else at **No access** — in particular **Workflows**. Choose **Only on this account**.
-2. On the App's page, note the **Client ID** and use **Generate a private key** to download a `.pem`.
-3. **Install App** → choose the account → **Only select repositories** → this repository.
-4. Re-run the installer with `--app-client-id <client ID> --app-private-key-file <file>.pem`, or set the two secrets yourself in the **Actions** store (not the Dependabot store — the autofix job runs on `workflow_run`, which reads the Actions store):
-   ```sh
-   gh secret set DEP_STEWARD_APP_CLIENT_ID --body '<client ID>'
-   gh secret set DEP_STEWARD_APP_PRIVATE_KEY < <file>.pem
-   ```
-   Then delete the `.pem`, or move it into a password manager.
-
-The token autofix mints from the App can only push code (`contents: write`), only to this repository, exists only for a fix the bounds check accepted, and is revoked when the job ends. If the App is configured but can't mint or push, the fix still goes out the old way, the PR is told to start CI by hand and why, and the job goes red so you notice. With the App, CI on the fix runs as a normal run with your Actions secrets, just as it would after a person's push — see [SECURITY.md](SECURITY.md).
+If that token can't be had or the push is refused, the fix still goes out with `GITHUB_TOKEN`, the PR says to start CI by **closing and reopening it** (or pushing any commit to its branch) and why, and the job goes red so you notice. Nothing merges un-tested either way. Because CI on the fix is started by an App rather than by Dependabot, it runs with your Actions secrets, just as it would after a person's push — see [SECURITY.md](SECURITY.md).
 
 ## Claude Code plugin
 
@@ -211,7 +199,7 @@ The review job's final step prints the agent's *actual* error, read from `claude
 It's conservative by default: a major bump merges only if the model affirmatively recommends it *and* finds no affected usage. To make majors always wait for a human, tell the reviewer to always escalate majors (edit `.github/dependabot-review-prompt.md`), or require human review on those PRs via branch protection.
 
 **How do I uninstall?**
-Delete the files above, remove the `needs-human-review` label, and delete the `CLAUDE_CODE_OAUTH_TOKEN` secret from both stores (and `DEP_STEWARD_APP_CLIENT_ID` / `DEP_STEWARD_APP_PRIVATE_KEY` from the Actions store, plus the App itself, if you set one up). No other footprint. `/dep-steward:uninstall` walks it for you, including the second secret store people forget.
+Delete the files above, remove the `needs-human-review` label, and delete the `CLAUDE_CODE_OAUTH_TOKEN` secret from both stores . No other footprint. `/dep-steward:uninstall` walks it for you, including the second secret store people forget.
 
 ## Development
 
@@ -230,7 +218,7 @@ node --test test/*.test.mjs
 - `test/actions-sim.test.mjs` — the GitHub rules the step simulator (`test/lib/actions-sim.mjs`) copies: implicit `success()`, `continue-on-error`, unset outputs, case-insensitive comparison, loud refusal of anything it does not simulate.
 - `test/permissions.test.mjs` — each agent job grants every GitHub scope the commands in its own prompt need, and an agent left on the Claude App token (no `github_token` passthrough) allow-lists nothing that could reach — even via a flag on a wildcard entry — a scope that token lacks, nor any `gh` command its prompt never orders. Derived from the rendered workflow and prompt rather than hardcoded.
 - `test/plugin.test.mjs` — the plugin and marketplace manifests parse and agree, every skill carries a description, and the README's raw-file links resolve on disk.
-- `test/action-pin.test.mjs` — a reinstall keeps the repo's own `claude-code-action` and `create-github-app-token` pins when they are newer than the template's, takes the template's when older, keeps the repo's and warns when the versions cannot be compared, and renders a fresh install byte-for-byte as before.
+- `test/action-pin.test.mjs` — a reinstall keeps the repo's own `claude-code-action` pin when it is newer than the template's, takes the template's when it is older, keeps the repo's and warns when the versions cannot be compared, and renders a fresh install byte-for-byte as before.
 - `test/review-lint.test.mjs` — the reviewer's prose guard, in both of its modes: it refuses the comment that actually leaked and passes verbatim changelog text that merely mentions CI, and as a hook it blocks only the comment post and never blocks on its own failure.
 - `test/prompt-hygiene.test.mjs` — the rendered review prompt never raises CI as something to consider, with a self-check that its patterns still catch what leaked (so it cannot go quietly vacuous).
 
