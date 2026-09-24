@@ -131,7 +131,7 @@ test('--no-autofix removes the job, its files, and leaves no marker', () => {
 
 // ---- the reviewer's prose guard is wired where it can refuse --------------
 
-test('the review step wires the prose lint as a PreToolUse hook at the installed path', () => {
+test('the review step wires the prose lint as a PreToolUse hook, run from the copy the agent cannot write', () => {
   const wf = readFileSync(join(rendered, '.github/workflows/dependabot-review.yml'), 'utf8');
   // The action writes this input to ~/.claude/settings.json and Claude Code
   // loads it. If it is not valid JSON the action treats it as a FILE PATH,
@@ -143,7 +143,12 @@ test('the review step wires the prose lint as a PreToolUse hook at the installed
   const entry = hook.hooks.PreToolUse[0];
   assert.equal(entry.matcher, 'Bash', 'the comment is posted through Bash; any other matcher never fires');
   assert.equal(entry.hooks[0].type, 'command');
-  assert.match(entry.hooks[0].command, /\.github\/dependabot-automerge\/review-lint\.cjs/);
+  // Never the checkout's lint, which the agent can rewrite: the copy the step
+  // after checkout takes of the installed lint, before the agent starts.
+  assert.equal(entry.hooks[0].command, 'node "$RUNNER_TEMP/dep-steward/review-lint.cjs"');
+  const review = wf.slice(wf.indexOf('\n  review:'), wf.indexOf('- name: Run Claude review'));
+  assert.match(review, /cp \.github\/dependabot-automerge\/review-lint\.cjs "\$RUNNER_TEMP\/dep-steward\/review-lint\.cjs"/,
+    'the copy is taken from the installed lint, in a step before the review step');
   // `$CLAUDE_PROJECT_DIR` is the hook's own shell expanding it; a `${{ }}`
   // here would be GitHub substituting at render time, which is a different
   // (and wrong) thing.
@@ -162,7 +167,7 @@ test('the deliverable assertion re-runs the same lint over what was posted', () 
   // One rule, two callers: the hook refuses before the post, this catches a
   // hook that silently stopped firing. A refusal here is red WITHOUT a label —
   // the verdict is valid; dep-steward's own guard is what broke.
-  assert.match(wf, /REVIEW_LINT_MODE=body REVIEW_BODY="\$V1_BODIES" node \.github\/dependabot-automerge\/review-lint\.cjs/);
+  assert.match(wf, /REVIEW_LINT_MODE=body REVIEW_BODY="\$V1_BODIES" node "\$RUNNER_TEMP\/dep-steward\/review-lint\.cjs"/);
   assert.match(wf, /select\(\.body \| contains\("<!-- AUTOMERGE-DECISION-V1 -->"\)\)/,
     'only V1-bearing comments are the deliverable — the gate\'s own notices share that window');
   const assertStep = wf.slice(wf.indexOf('Assert the review deliverable exists'), wf.indexOf('\n  auto-merge:'));
@@ -182,8 +187,8 @@ test('the path the autofix prompt names is the path the bounds step removes', ()
   // the same path or the removal misses and the discard comes back.
   const named = /gh pr comment \$PR_NUMBER --body-file ([^\s`]+)/.exec(prompt);
   assert.ok(named, 'the autofix prompt must name a body file');
-  const removed = /rm -f (\S+)\n\s*git add -A/.exec(wf);
-  assert.ok(removed, 'the bounds step must remove the draft immediately before staging');
+  const removed = /rm -f (\S+)\n(?:(?!\s*git add)[^\n]*\n)*\s*git add -A/.exec(wf);
+  assert.ok(removed, 'the bounds step must remove the draft before it stages anything');
   assert.equal(named[1], removed[1]);
 });
 

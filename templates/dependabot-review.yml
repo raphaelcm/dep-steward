@@ -127,6 +127,30 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Keep this job's scripts where the agent cannot write them
+        # Reads the gate and the lint from the checkout. Writes read-only
+        # copies outside it. Touches nothing else.
+        #
+        # The reviewer can write files (its comment draft), and Claude Code
+        # lets it write anywhere in this checkout, pipeline scripts included.
+        # Every script this job runs once the agent has started (the lint hook
+        # before each Bash call, the gate and the lint in the deliverable
+        # assertion) would run an agent's rewrite with what its caller holds:
+        # in the hook, the Claude session's environment (the Claude App token,
+        # GITHUB_TOKEN, CLAUDE_CODE_OAUTH_TOKEN); in a step, GITHUB_TOKEN and
+        # this job's OIDC token. So they run from these copies, taken before
+        # the agent starts, outside the checkout, where Claude Code does not
+        # let the agent write, and read-only besides.
+        run: |
+          set -euo pipefail
+          # A runner that keeps its temp directory between jobs (self-hosted)
+          # can still hold the last job's read-only copies.
+          chmod -R u+w "$RUNNER_TEMP/dep-steward" 2>/dev/null || true
+          mkdir -p "$RUNNER_TEMP/dep-steward"
+          cp __GATE_PATH__ "$RUNNER_TEMP/dep-steward/gate.cjs"
+          cp __REVIEW_LINT_PATH__ "$RUNNER_TEMP/dep-steward/review-lint.cjs"
+          chmod -R a-w "$RUNNER_TEMP/dep-steward"
+
       - name: Load agent prompt
         id: load_prompt
         env:
@@ -191,10 +215,12 @@ jobs:
           #
           # Shell form, not the exec form's `args`: a Claude Code that predates
           # `args` would ignore it, run `node` with no argv, and pass every
-          # comment silently. `$CLAUDE_PROJECT_DIR` is inert to YAML and to the
-          # action's JSON.parse; the hook's own shell expands it.
+          # comment silently. `$RUNNER_TEMP` is inert to YAML and to the
+          # action's JSON.parse; the hook's own shell expands it. The script is
+          # the copy the step after checkout made, never the checkout's, which
+          # the agent can rewrite.
           settings: |
-            {"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"node \"$CLAUDE_PROJECT_DIR/__REVIEW_LINT_PATH__\"","timeout":30}]}]}}
+            {"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"node \"$RUNNER_TEMP/dep-steward/review-lint.cjs\"","timeout":30}]}]}}
           # 60-turn budget: a thorough major-bump review (read diff, fetch
           # changelog for each version in the range, grep each affected API,
           # enumerate breaking changes, emit V1 block) routinely needs ~30-50
@@ -336,7 +362,7 @@ jobs:
             echo "PR #$PR_NUMBER is $PR_STATE, not OPEN — the gate cannot merge it, so no verdict is owed; nothing to assert."
             exit 0
           fi
-          if [ "$(HEAD_BRANCH="$HEAD_BRANCH" GATE_MODE=classify node __GATE_PATH__)" = "group=true" ]; then
+          if [ "$(HEAD_BRANCH="$HEAD_BRANCH" GATE_MODE=classify node "$RUNNER_TEMP/dep-steward/gate.cjs")" = "group=true" ]; then
             echo "PR #$PR_NUMBER ($HEAD_BRANCH) is a minor/patch group — the gate merges it with no verdict; nothing to assert."
             exit 0
           fi
@@ -362,7 +388,7 @@ jobs:
             # The lint's own failure (missing node, a bug in it) is fail-OPEN,
             # matching the hook: a broken guard must not strand a PR whose
             # review delivered.
-            if ! LINT_OUT=$(REVIEW_LINT_MODE=body REVIEW_BODY="$V1_BODIES" node __REVIEW_LINT_PATH__ 2>&1); then
+            if ! LINT_OUT=$(REVIEW_LINT_MODE=body REVIEW_BODY="$V1_BODIES" node "$RUNNER_TEMP/dep-steward/review-lint.cjs" 2>&1); then
               echo "::warning::Could not run the review prose lint on PR #$PR_NUMBER ($LINT_OUT) — the deliverable is present, so this step is not failing on the guard's own failure."
               exit 0
             fi

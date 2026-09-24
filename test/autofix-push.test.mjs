@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, readdirSync, realpathSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, readdirSync, realpathSync, existsSync, accessSync, constants } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -182,14 +182,18 @@ const IN_BOUNDS_FIX = { 'src/client.ts': 'export const timeout = 2000;\n' };
  *   helper   leave a credential helper in the tree, as claude-code-action's
  *            allowed_non_write_users mode does, instead of a token in origin
  *   jobs     the parsed workflow to run (a test may take a permission away)
+ *   pipelineOnBranch  false for a Dependabot branch cut before dep-steward
+ *            was installed: the PR head lacks the autofix prompt and bounds
+ *   workflowSha  the commit the workflow runs from, when not the seeded one
+ *   runnerTemp  a runner temp directory to reuse, as a self-hosted runner can
  */
-async function runAutofix({ edits = IN_BOUNDS_FIX, commits = [DEPENDABOT_COMMIT], labels = [], exchange = 'ok', refuse = [], refuseWith = 403, helper = false, jobs = JOBS } = {}) {
+async function runAutofix({ edits = IN_BOUNDS_FIX, commits = [DEPENDABOT_COMMIT], labels = [], exchange = 'ok', refuse = [], refuseWith = 403, helper = false, jobs = JOBS, pipelineOnBranch = true, workflowSha, runnerTemp: sharedTemp } = {}) {
   const root = mkdtempSync(join(tmpdir(), 'ds-autofix-'));
   const srv = join(root, 'srv');
   const bare = join(srv, 'octocat', 'repo.git');
   const work = join(root, 'work');
   const bin = join(root, 'bin');
-  const runnerTemp = join(root, 'runner-temp');
+  const runnerTemp = sharedTemp ?? join(root, 'runner-temp');
   const commentsDir = join(root, 'comments');
   for (const d of [srv, work, bin, runnerTemp, commentsDir, join(work, 'src'), join(work, '.github/dependabot-automerge')]) {
     mkdirSync(d, { recursive: true });
@@ -208,6 +212,11 @@ async function runAutofix({ edits = IN_BOUNDS_FIX, commits = [DEPENDABOT_COMMIT]
   git(['add', '-A'], work);
   git(['commit', '-q', '-m', 'bump ioredis 5 -> 6'], work);
   const baseSha = git(['rev-parse', 'HEAD'], work).trim();
+  if (!pipelineOnBranch) {
+    git(['rm', '-q', '.github/dependabot-autofix-prompt.md', '.github/dependabot-automerge/autofix-bounds.cjs'], work);
+    git(['commit', '-q', '-m', 'a branch cut before dep-steward was installed'], work);
+  }
+  const headSha = git(['rev-parse', 'HEAD'], work).trim();
   git(['init', '-q', '--bare', bare]);
   git(['push', '-q', bare, `HEAD:refs/heads/${HEAD_BRANCH}`], work);
 
@@ -300,6 +309,9 @@ async function runAutofix({ edits = IN_BOUNDS_FIX, commits = [DEPENDABOT_COMMIT]
         PR_LABELS_JSON: JSON.stringify({ labels: labels.map((name) => ({ name })) }),
         BUMP_PATHS: 'package.json',
         RUNNER_TEMP: runnerTemp,
+        // A workflow_run job runs the default branch's workflow at its latest
+        // commit. Here that is the seeded commit, which holds the pipeline.
+        GITHUB_SHA: workflowSha ?? baseSha,
         GITHUB_SERVER_URL: server.url,
         GITHUB_API_URL,
         CURL_LOG: curlLog,
@@ -311,7 +323,7 @@ async function runAutofix({ edits = IN_BOUNDS_FIX, commits = [DEPENDABOT_COMMIT]
     });
 
     const head = git(['--git-dir', bare, 'rev-parse', HEAD_BRANCH]).trim();
-    const pushed = head !== baseSha;
+    const pushed = head !== headSha;
     return {
       result,
       failed: result.failed,
@@ -337,6 +349,7 @@ async function runAutofix({ edits = IN_BOUNDS_FIX, commits = [DEPENDABOT_COMMIT]
         return { step, method, url, auth, body, kind };
       }),
       log: result.steps.map((s) => `--- ${s.name} [${s.status}]\n${s.output}`).join('\n'),
+      runnerTemp,
     };
   } finally {
     await server.close();
@@ -561,6 +574,67 @@ test('bounds: a draft with no fix beside it is "no edits", not a push', async ()
   assert.equal(r.pushed, false);
   assert.match(r.log, /The fixer made no edits/);
   assert.ok(r.ghCalls.some((c) => c.includes('needs-human-review')), 'a red build with no fix still reaches a person');
+});
+
+test('bounds: a fixer that rewrites the bounds check can neither run code with it nor talk its way past it', async () => {
+  // The bounds step runs after the fixer, and the fixer can write any file in
+  // the checkout, this script included. Whatever the script runs with, the
+  // fixer's code would run with: GITHUB_TOKEN, and this job's OIDC token,
+  // which buys a Claude App token. And its verdict decides what is pushed.
+  const ran = join(mkdtempSync(join(tmpdir(), 'ds-ran-')), 'ran');
+  const rewrite = `require('fs').writeFileSync(${JSON.stringify(ran)}, 'ran');\nconsole.log('decision=push');\nconsole.log('reason=looks fine');\n`;
+  const r = await runAutofix({ edits: { ...IN_BOUNDS_FIX, '.github/dependabot-automerge/autofix-bounds.cjs': rewrite } });
+  assert.ok(!existsSync(ran), `the fixer's rewrite of the bounds script ran:\n${r.log}`);
+  assert.equal(r.pushed, false, 'a fix that touches .github/ is out of bounds, whatever the rewrite says');
+  assert.deepEqual(r.tokenCalls, [], 'and no token is asked for');
+  assert.match(r.comments.join('\n'), /exceeded the safe bounds/);
+});
+
+test('bounds: what decides the push is kept where the fixer cannot write it', async () => {
+  // Claude Code already keeps the fixer's writes inside the checkout; the
+  // bounds script and the bump's paths are read-only as well, so that stays
+  // true if the fixer is ever given the runner's temp directory.
+  const r = await plainRun();
+  const dir = join(r.runnerTemp, 'dep-steward');
+  for (const p of [dir, join(dir, 'autofix-bounds.cjs'), join(dir, 'bump-paths.txt')]) {
+    assert.ok(existsSync(p), `${p} must exist: the bounds step reads it from there`);
+    assert.throws(() => accessSync(p, constants.W_OK), `${p} must not be writable`);
+  }
+});
+
+test('a runner that kept the last autofix job\'s read-only copies still takes fresh ones', async () => {
+  // A self-hosted runner can keep its temp directory between jobs. The copies
+  // are read-only, so copying over them would fail every autofix after the first.
+  const runnerTemp = mkdtempSync(join(tmpdir(), 'ds-af-rt-'));
+  await runAutofix({ runnerTemp });
+  const r = await runAutofix({ runnerTemp });
+  assert.equal(r.failed, false, r.log);
+  assert.deepEqual(r.pushedAs, [CLAUDE_APP_TOKEN]);
+});
+
+test('a Dependabot branch cut before the install still gets its attempt: the job takes its own files from the commit its workflow runs from', async () => {
+  // On a fresh install every open Dependabot PR predates it, so its head has
+  // no autofix prompt and no bounds script. The workflow itself runs from the
+  // default branch, and so do the files it needs.
+  const r = await runAutofix({ pipelineOnBranch: false });
+  assert.equal(r.calls.fixer.length, 1, r.log);
+  assert.equal(r.failed, false, r.log);
+  assert.deepEqual(r.pushedAs, [CLAUDE_APP_TOKEN]);
+  assert.deepEqual(r.pushedFiles, ['src/client.ts']);
+});
+
+test('a step that fails before the fixer runs is reported as that, not as a fix the fixer declined', async () => {
+  // The files come from the workflow's commit; if that commit cannot be read,
+  // the fixer never starts. "It found nothing it could safely fix" would send
+  // the person looking for a diagnosis that never happened.
+  const r = await runAutofix({ workflowSha: '0000000000000000000000000000000000000001' });
+  assert.equal(r.calls.fixer.length, 0, r.log);
+  assert.equal(r.pushed, false);
+  assert.equal(r.failed, true, 'a step failed, and the job says so');
+  assert.equal(r.comments.length, 1, r.log);
+  assert.match(r.comments[0], /The fixer never ran/);
+  assert.doesNotMatch(r.comments[0], /found nothing it could safely fix/);
+  assert.ok(labelledAndAssigned(r.ghCalls), r.ghCalls.join('\n'));
 });
 
 // ---- the review job and the App's push ---------------------------------------
