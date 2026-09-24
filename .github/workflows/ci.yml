@@ -18,5 +18,16 @@ jobs:
           node-version: '24'
       - name: Shellcheck the installer
         run: shellcheck -s sh install.sh
-      - name: Run tests (gate logic, render parity, installer wiring)
+      # Adopters lint the workflow this repo renders, so the tests lint it too
+      # (test/actionlint.test.mjs). Checksummed by the Go module proxy.
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - name: Install actionlint
+        run: |
+          go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+      - name: Run tests (gate logic, render parity, installer wiring, actionlint)
+        env:
+          REQUIRE_ACTIONLINT: '1'
         run: node --test test/*.test.mjs
