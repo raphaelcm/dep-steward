@@ -16,11 +16,12 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
  * store, and no person handles a value: a short-lived run seals each one with
  * the store's public key, and the installer uploads only the sealed copy.
  *
- * Here the run is real in every part but the cipher. The installer pushes to a
- * real (local, bare) origin. When it asks gh for the run, a stand-in gh runs
- * the workflow the installer actually pushed, through the actions simulator,
- * with a stand-in `nacl` whose "sealed box" records which key sealed which
- * value. The cipher itself is libsodium's.
+ * Here the run is real in every part but the cipher. The installer creates
+ * the branch through GitHub's git data API (no local push, so no local hook
+ * runs). When it asks gh for the run, a stand-in gh runs the workflow the
+ * installer actually created, through the actions simulator, with a stand-in
+ * `nacl` whose "sealed box" records which key sealed which value. The cipher
+ * itself is libsodium's.
  */
 
 const REPO = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -76,19 +77,20 @@ jobs:
           NOT_CI_SECRET: \${{ secrets.NOT_CI_SECRET }}
 `;
 
-// Runs the workflow the installer pushed, as GitHub would run it on that push.
-const SIMULATE_RUN = `import { execFileSync } from 'node:child_process';
-import { mkdtempSync, writeFileSync } from 'node:fs';
+// Runs the workflow on the branch the installer created, as GitHub would run
+// it on that push: ref -> commit -> tree -> blob, as the API calls stored them.
+const SIMULATE_RUN = `import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { parseJobs, runJob } from '${SIM}';
 
+const state = process.env.GH_STATE;
+const read = (f) => JSON.parse(readFileSync(join(state, f), 'utf8'));
 const branch = process.argv[2];
-const bare = process.env.ORIGIN_BARE;
-const files = execFileSync('git', ['-C', bare, 'ls-tree', '-r', '--name-only', branch], { encoding: 'utf8' }).trim().split('\\n');
-writeFileSync(process.env.SEAL_TREE_FILE, JSON.stringify(files));
-const wfPath = files.find((f) => f.startsWith('.github/workflows/'));
-const wf = execFileSync('git', ['-C', bare, 'show', branch + ':' + wfPath], { encoding: 'utf8' });
+const commit = read('commit.' + read('ref.' + branch).sha + '.json');
+const tree = read('tree.' + commit.tree + '.json');
+const entry = tree.tree[0];
+const wf = Buffer.from(readFileSync(join(state, 'blob.' + entry.sha), 'utf8'), 'base64').toString('utf8');
 writeFileSync(process.env.SEAL_WORKFLOW_FILE, wf);
 const jobs = parseJobs(wf);
 const [jobName] = Object.keys(jobs);
@@ -144,6 +146,21 @@ case "$1" in
     exit 0 ;;
   api)
     case "$*" in
+      # The git data API, as GitHub answers it: each object kept, a sha back.
+      "api --method POST repos/acme/widgets/git/blobs "*)
+        n=$(ls "$GH_STATE" | grep -c '^blob\\.' || true); sha="b$n$n$n$n"
+        printf '%s' "$(printf '%s\\n' "$@" | sed -n 's/^content=//p')" > "$GH_STATE/blob.$sha"
+        printf '{"sha":"%s"}' "$sha" | answer "$@"; exit 0 ;;
+      "api --method POST repos/acme/widgets/git/trees "*)
+        sha="t1111"; cat > "$GH_STATE/tree.$sha.json"; printf '{"sha":"%s"}' "$sha" | answer "$@"; exit 0 ;;
+      "api --method POST repos/acme/widgets/git/commits "*)
+        sha="c1111"; cat > "$GH_STATE/commit.$sha.json"; printf '{"sha":"%s"}' "$sha" | answer "$@"; exit 0 ;;
+      "api --method POST repos/acme/widgets/git/refs "*)
+        body=$(cat); ref=$(printf '%s' "$body" | jq -r '.ref | sub("^refs/heads/"; "")')
+        printf '%s' "$body" > "$GH_STATE/ref.$ref"; printf '%s\\n' "$ref" >> "$GH_STATE/created-branches"
+        printf '%s' "$body" | answer "$@"; exit 0 ;;
+      "api --method DELETE repos/acme/widgets/git/refs/heads/"*)
+        path=$(printf '%s\\n' "$@" | grep '^repos/' | head -1); rm -f "$GH_STATE/ref.\${path##*/}"; exit 0 ;;
       *dependabot/secrets/public-key*)
         printf '{"key_id":"%s","key":"%s"}' "$KEY_ID" "$PUBLIC_KEY" | answer "$@"; exit 0 ;;
       "api --method PUT repos/acme/widgets/dependabot/secrets/"*)
@@ -201,6 +218,13 @@ function runInstaller({ args = ['--copy-ci-secrets'], dependabotNames = 'CLAUDE_
 
   const origin = join(root, 'origin.git');
   execFileSync('git', ['init', '-q', '--bare', '-b', 'main', origin]);
+  const state = join(root, 'gh-state');
+  mkdirSync(state);
+  // A pre-push hook that refuses everything, as runsense's refuses a push with
+  // no test attestation: the installer must get by without pushing.
+  const hooks = join(root, 'hooks');
+  mkdirSync(hooks);
+  writeFileSync(join(hooks, 'pre-push'), '#!/bin/sh\necho "pre-push: refused" >&2\nexit 1\n', { mode: 0o755 });
   const repoDir = join(root, 'widgets');
   mkdirSync(join(repoDir, '.github', 'workflows'), { recursive: true });
   writeFileSync(join(repoDir, 'package.json'), '{}\n');
@@ -214,10 +238,11 @@ function runInstaller({ args = ['--copy-ci-secrets'], dependabotNames = 'CLAUDE_
   git('commit', '-qm', 'base');
   git('remote', 'add', 'origin', origin);
   git('push', '-q', 'origin', 'main');
+  git('config', 'core.hooksPath', hooks);
   const headBefore = git('rev-parse', 'HEAD');
 
   const files = {
-    log: join(root, 'gh.log'), aptLog: join(root, 'apt.log'), tree: join(root, 'seal-tree.json'),
+    log: join(root, 'gh.log'), aptLog: join(root, 'apt.log'),
     workflow: join(root, 'seal-workflow.yml'), sealLog: join(root, 'seal-run.log'), run: join(root, 'seal-run.json'),
   };
   writeFileSync(files.log, '');
@@ -235,23 +260,26 @@ function runInstaller({ args = ['--copy-ci-secrets'], dependabotNames = 'CLAUDE_
       DEPENDABOT_SECRET_NAMES: dependabotNames,
       ACTIONS_SECRETS: JSON.stringify(ACTIONS_SECRETS),
       PUBLIC_KEY, KEY_ID,
-      ORIGIN_BARE: origin,
+      GH_STATE: state,
       SIMULATE_RUN: join(root, 'simulate-run.mjs'),
       RUNNER_BIN: runnerBin,
       STUB_NACL: stubNacl,
       APT_LOG: files.aptLog,
-      SEAL_TREE_FILE: files.tree,
       SEAL_WORKFLOW_FILE: files.workflow,
       SEAL_LOG_FILE: files.sealLog,
       SEAL_RUN_FILE: files.run,
     },
   });
   const stored = Object.fromEntries(readdirSync(secretsDir).map((f) => [f, readFileSync(join(secretsDir, f), 'utf8')]));
-  const branches = execFileSync('git', ['-C', origin, 'for-each-ref', '--format=%(refname:short)', 'refs/heads'], { encoding: 'utf8' }).trim().split('\n');
+  const kept = (prefix) => readdirSync(state).filter((f) => f.startsWith(prefix));
+  const json = (f) => JSON.parse(readFileSync(join(state, f), 'utf8'));
+  const createdFile = join(state, 'created-branches');
+  const created = existsSync(createdFile) ? readFileSync(createdFile, 'utf8').split('\n').filter(Boolean) : [];
   const read = (f) => (existsSync(f) ? readFileSync(f, 'utf8') : '');
   return {
-    status: r.status, out: `${r.stdout}${r.stderr}`, stored, branches, headBefore, headAfter: git('rev-parse', 'HEAD'),
-    ghLog: read(files.log), aptLog: read(files.aptLog), sealTree: read(files.tree), sealWorkflow: read(files.workflow),
+    status: r.status, out: `${r.stdout}${r.stderr}`, stored, headBefore, headAfter: git('rev-parse', 'HEAD'),
+    created, openRefs: kept('ref.').map((f) => f.slice(4)), trees: kept('tree.').map(json), commits: kept('commit.').map(json),
+    ghLog: read(files.log), aptLog: read(files.aptLog), sealWorkflow: read(files.workflow),
   };
 }
 
@@ -260,6 +288,7 @@ const sealedFor = (value) => `${Buffer.from(`SEALED:${'kkkk'}:${value}`).toStrin
 const run = runInstaller();
 
 test('copies into Dependabot\'s store exactly the secrets CI reads that it lacks', () => {
+  // ...from a checkout whose pre-push hook refuses everything: it never pushes.
   assert.equal(run.status, 0, run.out);
   const copied = Object.keys(run.stored).filter((k) => k.startsWith('dependabot.') && k !== 'dependabot.CLAUDE_CODE_OAUTH_TOKEN').sort();
   assert.deepEqual(copied, ['dependabot.FROM_REUSABLE', 'dependabot.OPENAI_API_KEY'], run.out);
@@ -283,8 +312,12 @@ test('says what it copied and why, in the install output', () => {
 test('the run that seals them is one workflow on a branch of its own, with no parent and nothing else in it', () => {
   // With no parent commit, none of the repository's own workflows exist on
   // that branch, so nothing else runs on the push.
-  assert.deepEqual(JSON.parse(run.sealTree).length, 1);
-  assert.match(JSON.parse(run.sealTree)[0], /^\.github\/workflows\/[^/]+\.yml$/);
+  assert.equal(run.created.length, 1);
+  assert.equal(run.trees.length, 1);
+  assert.equal(run.trees[0].base_tree, undefined, 'a tree of its own, not one built on the repository');
+  assert.equal(run.trees[0].tree.length, 1);
+  assert.match(run.trees[0].tree[0].path, /^\.github\/workflows\/[^/]+\.yml$/);
+  assert.deepEqual(run.commits.map((c) => c.parents), [[]]);
 });
 
 test('the sealing run holds no token permissions, checks out nothing, and installs only Ubuntu\'s signed NaCl package', () => {
@@ -299,7 +332,7 @@ test('the sealing run holds no token permissions, checks out nothing, and instal
 });
 
 test('the branch and the run are deleted afterwards, and the local checkout is untouched', () => {
-  assert.deepEqual(run.branches, ['main']);
+  assert.deepEqual(run.openRefs, []);
   assert.match(run.ghLog, /^api --method DELETE repos\/acme\/widgets\/actions\/runs\/4242$/m);
   assert.equal(run.headAfter, run.headBefore);
 });
@@ -308,14 +341,14 @@ test('without consent nothing is copied, and the output says how to give it', ()
   const r = runInstaller({ args: [] });
   assert.equal(r.status, 0, r.out);
   assert.equal(r.stored['dependabot.OPENAI_API_KEY'], undefined);
-  assert.deepEqual(r.branches, ['main'], 'nothing is pushed without consent');
+  assert.deepEqual(r.created, [], 'no branch is created without consent');
   assert.match(r.out, /--copy-ci-secrets/);
 });
 
 test('nothing to copy when Dependabot\'s store already has every secret CI reads', () => {
   const r = runInstaller({ dependabotNames: 'CLAUDE_CODE_OAUTH_TOKEN ALREADY_THERE OPENAI_API_KEY FROM_REUSABLE NEVER_SET' });
   assert.equal(r.status, 0, r.out);
-  assert.deepEqual(r.branches, ['main']);
+  assert.deepEqual(r.created, []);
   assert.doesNotMatch(r.ghLog, /dependabot\/secrets\/public-key/);
 });
 
@@ -323,6 +356,6 @@ test('--dry-run names what it would copy and pushes nothing', () => {
   const r = runInstaller({ args: ['--copy-ci-secrets', '--dry-run'] });
   assert.equal(r.status, 0, r.out);
   assert.match(r.out, /OPENAI_API_KEY/);
-  assert.deepEqual(r.branches, ['main']);
+  assert.deepEqual(r.created, []);
   assert.deepEqual(Object.keys(r.stored), []);
 });

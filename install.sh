@@ -572,18 +572,21 @@ copy_ci_secrets() {
   case "$_key" in ''|*[!A-Za-z0-9+/=]*) warn "the Dependabot store's public key looks wrong; nothing copied."; return 0 ;; esac
 
   # One commit, no parent, holding only the sealing workflow: none of this
-  # repository's own workflows exist on that branch, so nothing else runs.
+  # repository's own workflows exist on that branch, so nothing else runs. It
+  # is made through GitHub's git data API rather than pushed from here, so no
+  # local hook runs and no local state changes. Every value in these bodies is
+  # base64, hex or a fixed path, so none needs escaping.
   _branch="dep-steward-copy-ci-secrets-$(date +%s)$$"
   # shellcheck disable=SC2086
-  if ! { _sha=$(render_copy_ci_secrets "$_branch" "$_key" $_need | git hash-object -w --stdin) \
-    && _sha=$(printf '100644 blob %s\t%s.yml\n' "$_sha" "$_branch" | git mktree) \
-    && _sha=$(printf '040000 tree %s\tworkflows\n' "$_sha" | git mktree) \
-    && _sha=$(printf '040000 tree %s\t.github\n' "$_sha" | git mktree) \
-    && _sha=$(GIT_AUTHOR_NAME=dep-steward GIT_AUTHOR_EMAIL=dep-steward@users.noreply.github.com \
-      GIT_COMMITTER_NAME=dep-steward GIT_COMMITTER_EMAIL=dep-steward@users.noreply.github.com \
-      git commit-tree "$_sha" -m "dep-steward: copy CI secrets for Dependabot (deleted once run)") \
-    && git push -q origin "$_sha:refs/heads/$_branch" 2>/dev/null; }; then
-    warn "could not push the short-lived branch that seals them; nothing copied."
+  _content=$(render_copy_ci_secrets "$_branch" "$_key" $_need | base64 | tr -d '\n')
+  if ! { _sha=$(gh api --method POST "repos/$NWO/git/blobs" -f content="$_content" -f encoding=base64 --jq .sha) \
+    && _sha=$(printf '{"tree":[{"path":".github/workflows/%s.yml","mode":"100644","type":"blob","sha":"%s"}]}' "$_branch" "$_sha" \
+      | gh api --method POST "repos/$NWO/git/trees" --input - --jq .sha) \
+    && _sha=$(printf '{"message":"dep-steward: copy CI secrets for Dependabot (deleted once run)","tree":"%s","parents":[]}' "$_sha" \
+      | gh api --method POST "repos/$NWO/git/commits" --input - --jq .sha) \
+    && printf '{"ref":"refs/heads/%s","sha":"%s"}' "$_branch" "$_sha" \
+      | gh api --method POST "repos/$NWO/git/refs" --input - >/dev/null; } 2>/dev/null; then
+    warn "could not create the short-lived branch that seals them; nothing copied."
     return 0
   fi
   say "Sealing them in a short-lived run on branch $_branch..."
@@ -595,7 +598,7 @@ copy_ci_secrets() {
     _tries=$((_tries + 1))
     sleep 5
   done
-  git push -q origin --delete "$_branch" 2>/dev/null || warn "could not delete the branch $_branch."
+  gh api --method DELETE "repos/$NWO/git/refs/heads/$_branch" >/dev/null 2>&1 || warn "could not delete the branch $_branch."
   if [ -z "$_run" ]; then
     warn "the sealing run did not finish within five minutes; nothing copied. Its log: https://github.com/$NWO/actions"
     return 0

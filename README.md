@@ -93,7 +93,7 @@ GitHub settings it configures (via `gh`):
 - Enables "Allow auto-merge" on the repo.
 - Checks branch protection and **advises** if CI isn't a required check (it never changes your protection rules).
 
-It does not touch your source, your existing CI workflow, or your git history. (Copying the CI secrets pushes one short-lived branch, holding only the sealing workflow and sharing no history with yours, and deletes it with its run.)
+It does not touch your source, your existing CI workflow, or your git history. (Copying the CI secrets creates one short-lived branch through GitHub's API, holding only the sealing workflow and sharing no history with yours, and deletes it with its run. Nothing is pushed from your checkout, so your git hooks never run.)
 
 ## Autofix (on by default)
 
