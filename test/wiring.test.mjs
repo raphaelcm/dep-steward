@@ -225,6 +225,20 @@ test('a reinstall without the token, where both stores already hold it, keeps it
   assert.doesNotMatch(reLog, /secret set CLAUDE_CODE_OAUTH_TOKEN/);
 });
 
+test('a reinstall that changes no file says so, and asks for no commit', () => {
+  // The installed state, committed: the same files a full install renders.
+  const committed = (repoDir) => {
+    execFileSync('sh', [join(REPO, 'install.sh'), '--render-only', '--out', repoDir, '--ci-name', 'CI', '--assignee', 'octomaintainer'],
+      { cwd: repoDir, env: { ...process.env, DEP_STEWARD_SRC: REPO }, stdio: 'pipe' });
+    const env = { ...process.env, GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@t', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@t' };
+    execFileSync('git', ['add', '-A'], { cwd: repoDir });
+    execFileSync('git', ['commit', '-qm', 'installed'], { cwd: repoDir, env });
+  };
+  const { stdout, stderr } = runInstaller({}, { setup: committed });
+  assert.match(stdout, /already match what is committed/);
+  assert.doesNotMatch(`${stdout}${stderr}`, /git add|git commit|git push/);
+});
+
 // ---- the claude-code-action pin survives a real reinstall --------------------
 //
 // action-pin.test.mjs covers the choice itself through --render-only. These two
