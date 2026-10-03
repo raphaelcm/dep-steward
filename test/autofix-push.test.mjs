@@ -192,12 +192,19 @@ const IN_BOUNDS_FIX = { 'src/client.ts': 'export const timeout = 2000;\n' };
  *            was installed: the PR head lacks the autofix prompt and bounds
  *   workflowSha  the commit the workflow runs from, when not the seeded one
  *   runnerTemp  a runner temp directory to reuse, as a self-hosted runner can
+ *   forge    replace what the agent job hands the push job: { edits } becomes
+ *            a patch against the commit the fixer saw, { patch } is used as
+ *            given, each with decision=push, as a turned agent job could
+ *            hand over
+ *   moveBranch  push a new commit to the PR branch between the two jobs
+ *   commitsSeenByPush  the PR's commits as the push job reads them, when a
+ *            push landed in between
  *   outsideWrites  files the agent writes outside the checkout, keyed by a
  *            path relative to HOME or RUNNER_TEMP ('~/x', '$RUNNER_TEMP/x').
  *            A bare Write or Edit allow rule matches every path but Claude
  *            Code's protected ones, so the agent can.
  */
-async function runAutofix({ edits = IN_BOUNDS_FIX, commits = [DEPENDABOT_COMMIT], labels = [], exchange = 'ok', refuse = [], refuseWith = 403, helper = false, jobs = JOBS, pipelineOnBranch = true, workflowSha, runnerTemp: sharedTemp, outsideWrites = {} } = {}) {
+async function runAutofix({ edits = IN_BOUNDS_FIX, commits = [DEPENDABOT_COMMIT], labels = [], exchange = 'ok', refuse = [], refuseWith = 403, helper = false, jobs = JOBS, pipelineOnBranch = true, workflowSha, runnerTemp: sharedTemp, outsideWrites = {}, forge, moveBranch = false, commitsSeenByPush } = {}) {
   const root = mkdtempSync(join(tmpdir(), 'ds-autofix-'));
   const srv = join(root, 'srv');
   const bare = join(srv, 'octocat', 'repo.git');
@@ -214,7 +221,7 @@ async function runAutofix({ edits = IN_BOUNDS_FIX, commits = [DEPENDABOT_COMMIT]
   // committed (uncommitted, `git add -A` would stage them as additions).
   writeFileSync(join(work, 'src/client.ts'), 'export const timeout = 1000;\n');
   writeFileSync(join(work, 'package.json'), '{"name":"app","dependencies":{"ioredis":"^6.0.0"}}\n');
-  for (const f of ['.github/dependabot-automerge/autofix-bounds.cjs', '.github/dependabot-autofix-prompt.md']) {
+  for (const f of ['.github/dependabot-automerge/autofix-bounds.cjs', '.github/dependabot-automerge/review-lint.cjs', '.github/dependabot-autofix-prompt.md']) {
     writeFileSync(join(work, f), readFileSync(join(RENDERED, f), 'utf8'));
   }
   git(['init', '-q', '-b', 'main', work]);
@@ -224,7 +231,7 @@ async function runAutofix({ edits = IN_BOUNDS_FIX, commits = [DEPENDABOT_COMMIT]
   git(['commit', '-q', '-m', 'bump ioredis 5 -> 6'], work);
   const baseSha = git(['rev-parse', 'HEAD'], work).trim();
   if (!pipelineOnBranch) {
-    git(['rm', '-q', '.github/dependabot-autofix-prompt.md', '.github/dependabot-automerge/autofix-bounds.cjs'], work);
+    git(['rm', '-q', '.github/dependabot-autofix-prompt.md', '.github/dependabot-automerge/autofix-bounds.cjs', '.github/dependabot-automerge/review-lint.cjs'], work);
     git(['commit', '-q', '-m', 'a branch cut before dep-steward was installed'], work);
   }
   const headSha = git(['rev-parse', 'HEAD'], work).trim();
@@ -241,12 +248,12 @@ async function runAutofix({ edits = IN_BOUNDS_FIX, commits = [DEPENDABOT_COMMIT]
       // The tree above already is the checkout. What actions/checkout v7 adds
       // unless told not to persist credentials: GITHUB_TOKEN as an
       // extraheader in a RUNNER_TEMP file the repo's config includes.
-      'actions/checkout': async ({ with: w }) => {
+      'actions/checkout': async ({ with: w, cwd: tree }) => {
         if (w['persist-credentials'] !== 'false') {
           git(['config', '--file', creds, `http.${server.url}/.extraheader`, `AUTHORIZATION: ${basicFor(WORKFLOW_TOKEN)}`]);
-          git(['config', '--local', `includeIf.gitdir:${realpathSync(work)}/.git.path`, creds], work);
+          git(['config', '--local', `includeIf.gitdir:${realpathSync(tree)}/.git.path`, creds], tree);
           assert.equal(
-            git(['config', '--get-all', `http.${server.url}/.extraheader`], work).trim(),
+            git(['config', '--get-all', `http.${server.url}/.extraheader`], tree).trim(),
             `AUTHORIZATION: ${basicFor(WORKFLOW_TOKEN)}`,
             'harness: the checkout credential must be live in the working tree',
           );
@@ -290,60 +297,111 @@ async function runAutofix({ edits = IN_BOUNDS_FIX, commits = [DEPENDABOT_COMMIT]
     writeFileSync(curlLog, '');
     // Retries back off with sleep; the waiting is not what is under test.
     writeFileSync(join(bin, 'sleep'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
-    // GitHub hands a job the OIDC request variables only when it grants
-    // `id-token: write`, so the harness does the same.
-    const oidc = jobs.autofix.permissions?.['id-token'] === 'write'
+    // GitHub hands a job the OIDC request variables only when that job grants
+    // `id-token: write`, so the harness decides per job too.
+    const oidcFor = (job) => (jobs[job].permissions?.['id-token'] === 'write'
       ? { ACTIONS_ID_TOKEN_REQUEST_URL: OIDC_REQUEST_URL, ACTIONS_ID_TOKEN_REQUEST_TOKEN: OIDC_REQUEST_TOKEN }
-      : {};
+      : {});
 
-    const result = await runJob(jobs, 'autofix', {
-      github: {
-        event_name: 'workflow_run',
-        repository: 'octocat/repo',
-        event: {
-          workflow_run: {
-            event: 'pull_request',
-            conclusion: 'failure',
-            head_branch: HEAD_BRANCH,
-            run_started_at: '2026-09-21T04:41:00Z',
-            created_at: '2026-09-21T04:40:12Z',
-            actor: { login: 'dependabot[bot]', type: 'Bot' },
-          },
-          repository: { default_branch: 'main' },
+    const github = {
+      event_name: 'workflow_run',
+      repository: 'octocat/repo',
+      event: {
+        workflow_run: {
+          event: 'pull_request',
+          conclusion: 'failure',
+          head_branch: HEAD_BRANCH,
+          run_started_at: '2026-09-21T04:41:00Z',
+          created_at: '2026-09-21T04:40:12Z',
+          actor: { login: 'dependabot[bot]', type: 'Bot' },
         },
+        repository: { default_branch: 'main' },
       },
-      secrets: {
-        GITHUB_TOKEN: WORKFLOW_TOKEN,
-        CLAUDE_CODE_OAUTH_TOKEN: 'sk-ant-oat01-test',
-      },
-      uses,
-      cwd: work,
-      env: {
-        ...process.env,
-        ...GIT_ISOLATION,
-        PATH: `${bin}:${process.env.PATH}`,
-        GH_LOG: ghLog,
-        GH_COMMENTS: commentsDir,
-        PR_COMMITS_JSON: commits === 'unreadable' ? 'unreadable' : JSON.stringify({ commits }),
-        PR_LABELS_JSON: JSON.stringify({ labels: labels.map((name) => ({ name })) }),
-        BUMP_PATHS: 'package.json',
-        RUNNER_TEMP: runnerTemp,
-        HOME: home,
-        // A workflow_run job runs the default branch's workflow at its latest
-        // commit. Here that is the seeded commit, which holds the pipeline.
-        GITHUB_SHA: workflowSha ?? baseSha,
-        GITHUB_SERVER_URL: server.url,
-        GITHUB_API_URL,
-        CURL_LOG: curlLog,
-        EXCHANGE: exchange,
-        OIDC_JWT,
-        CLAUDE_APP_TOKEN,
-        ...oidc,
-      },
+    };
+    const secrets = { GITHUB_TOKEN: WORKFLOW_TOKEN, CLAUDE_CODE_OAUTH_TOKEN: 'sk-ant-oat01-test' };
+    const env = {
+      ...process.env,
+      ...GIT_ISOLATION,
+      PATH: `${bin}:${process.env.PATH}`,
+      GH_LOG: ghLog,
+      GH_COMMENTS: commentsDir,
+      PR_COMMITS_JSON: commits === 'unreadable' ? 'unreadable' : JSON.stringify({ commits }),
+      PR_LABELS_JSON: JSON.stringify({ labels: labels.map((name) => ({ name })) }),
+      BUMP_PATHS: 'package.json',
+      RUNNER_TEMP: runnerTemp,
+      HOME: home,
+      // A workflow_run job runs the default branch's workflow at its latest
+      // commit. Here that is the seeded commit, which holds the pipeline.
+      GITHUB_SHA: workflowSha ?? baseSha,
+      GITHUB_SERVER_URL: server.url,
+      GITHUB_API_URL,
+      CURL_LOG: curlLog,
+      EXCHANGE: exchange,
+      OIDC_JWT,
+      CLAUDE_APP_TOKEN,
+    };
+    const agent = await runJob(jobs, 'autofix', { github, secrets, uses, cwd: work, env: { ...env, ...oidcFor('autofix') } });
+    // What the fixer faced, before the push job (which shares this temp
+    // directory here, as a self-hosted runner can) touches it.
+    const copies = join(runnerTemp, 'dep-steward');
+    const copiesAfterAgent = ['', 'autofix-bounds.cjs', 'bump-paths.txt', 'review-lint.cjs', 'dependabot-autofix-prompt.md'].map((f) => {
+      const path = join(copies, f);
+      let writable = false;
+      try { accessSync(path, constants.W_OK); writable = true; } catch { /* read-only, or absent */ }
+      return { file: f || '.', exists: existsSync(path), writable };
     });
 
+    // What the push job receives: the agent job's outputs, or what a turned
+    // agent job could hand over instead.
+    let handedOver = agent.outputs;
+    if (forge?.patch !== undefined) {
+      handedOver = { decision: 'push', base_sha: headSha, patch: Buffer.from(forge.patch).toString('base64') };
+    } else if (forge) {
+      const scratch = join(root, 'forge');
+      git(['clone', '-q', '--branch', HEAD_BRANCH, bare, scratch]);
+      for (const [path, content] of Object.entries(forge.edits)) {
+        mkdirSync(dirname(join(scratch, path)), { recursive: true });
+        writeFileSync(join(scratch, path), content);
+      }
+      git(['add', '-A'], scratch);
+      const patch = execFileSync('git', ['diff', '--cached', '--binary', headSha], { cwd: scratch, env: { ...process.env, ...GIT_ISOLATION } }).toString('base64');
+      handedOver = { decision: 'push', base_sha: headSha, patch };
+    }
+    if (moveBranch) {
+      const mover = join(root, 'mover');
+      git(['clone', '-q', '--branch', HEAD_BRANCH, bare, mover]);
+      git(['config', 'user.email', 'dependabot@example.invalid'], mover);
+      git(['config', 'user.name', 'dependabot[bot]'], mover);
+      writeFileSync(join(mover, 'package-lock.json'), '{"lockfileVersion":3}\n');
+      git(['add', '-A'], mover);
+      git(['commit', '-q', '-m', 'rebase'], mover);
+      git(['push', '-q', bare, `HEAD:refs/heads/${HEAD_BRANCH}`], mover);
+    }
+    const headBeforePush = git(['--git-dir', bare, 'rev-parse', HEAD_BRANCH]).trim();
+
+    // The push job runs on a fresh runner: a clean clone, no agent ever near it.
+    const pushTree = join(root, 'push-tree');
+    git(['clone', '-q', '--branch', HEAD_BRANCH, bare, pushTree]);
+    git(['remote', 'set-url', 'origin', `${server.url}/octocat/repo.git`], pushTree);
+    const pushEnv = {
+      ...env,
+      ...oidcFor('autofix-push'),
+      ...(commitsSeenByPush ? { PR_COMMITS_JSON: JSON.stringify({ commits: commitsSeenByPush }) } : {}),
+    };
+    const push = await runJob(jobs, 'autofix-push', {
+      github, secrets, uses, cwd: pushTree, env: pushEnv,
+      needs: { autofix: { outputs: handedOver, result: agent.failed ? 'failure' : 'success' } },
+    });
+    const result = {
+      steps: [...agent.steps, ...push.steps],
+      failed: agent.failed || push.failed,
+      jobEnv: { ...agent.jobEnv, ...push.jobEnv },
+      outputs: agent.outputs,
+      pushJob: push,
+    };
+
     const head = git(['--git-dir', bare, 'rev-parse', HEAD_BRANCH]).trim();
-    const pushed = head !== headSha;
+    const pushed = head !== headBeforePush;
     return {
       result,
       failed: result.failed,
@@ -370,6 +428,7 @@ async function runAutofix({ edits = IN_BOUNDS_FIX, commits = [DEPENDABOT_COMMIT]
       }),
       log: result.steps.map((s) => `--- ${s.name} [${s.status}]\n${s.output}`).join('\n'),
       runnerTemp,
+      copiesAfterAgent,
     };
   } finally {
     await server.close();
@@ -417,7 +476,7 @@ test('without id-token: write there is no OIDC token, and the job falls back the
   // The permission is what lets the job ask for its OIDC token at all. Trimmed
   // away, every fix would quietly stop starting CI.
   const trimmed = structuredClone(JOBS);
-  delete trimmed.autofix.permissions['id-token'];
+  delete trimmed['autofix-push'].permissions['id-token'];
   const r = await runAutofix({ jobs: trimmed });
   assert.deepEqual(r.pushedAs, [WORKFLOW_TOKEN], r.log);
   assert.equal(r.failed, true);
@@ -463,8 +522,10 @@ test('a checkout that persists its credential still cannot make the push a GITHU
   // The job's checkout does not persist it; the push step resets that header
   // anyway, so a workflow edit that brings it back does not bring #2693 back.
   const persisted = structuredClone(JOBS);
-  for (const step of persisted.autofix.steps) {
-    if (step.uses?.startsWith('actions/checkout')) delete step.with['persist-credentials'];
+  for (const job of ['autofix', 'autofix-push']) {
+    for (const step of persisted[job].steps) {
+      if (step.uses?.startsWith('actions/checkout')) delete step.with['persist-credentials'];
+    }
   }
   const r = await runAutofix({ jobs: persisted });
   assert.deepEqual(r.pushedAs, [CLAUDE_APP_TOKEN], r.log);
@@ -654,14 +715,12 @@ test('bounds: a fixer that rewrites the bounds check can neither run code with i
 });
 
 test('bounds: what decides the push is kept where the fixer cannot write it', async () => {
-  // Claude Code already keeps the fixer's writes inside the checkout; the
-  // bounds script and the bump's paths are read-only as well, so that stays
-  // true if the fixer is ever given the runner's temp directory.
+  // Claude Code may let the fixer's writes reach the runner's temp directory;
+  // the copies are read-only, and the fixer has no shell to change that.
   const r = await plainRun();
-  const dir = join(r.runnerTemp, 'dep-steward');
-  for (const p of [dir, join(dir, 'autofix-bounds.cjs'), join(dir, 'bump-paths.txt')]) {
-    assert.ok(existsSync(p), `${p} must exist: the bounds step reads it from there`);
-    assert.throws(() => accessSync(p, constants.W_OK), `${p} must not be writable`);
+  for (const c of r.copiesAfterAgent) {
+    assert.ok(c.exists, `${c.file} must exist when the fixer runs`);
+    assert.equal(c.writable, false, `${c.file} must not be writable by the fixer`);
   }
 });
 
@@ -698,6 +757,59 @@ test('a step that fails before the fixer runs is reported as that, not as a fix 
   assert.match(r.comments[0], /The fixer never ran/);
   assert.doesNotMatch(r.comments[0], /found nothing it could safely fix/);
   assert.ok(labelledAndAssigned(r.ghCalls), r.ghCalls.join('\n'));
+});
+
+// ---- the push job trusts nothing the agent job says -------------------------
+//
+// The autofix job runs an agent over attacker-influenced text, so a turned
+// agent can make that job hand over anything: any patch, decision=push. The
+// push job, which can push and runs no agent, re-derives everything it pushes
+// on. These hand it what a turned agent job could.
+
+const PUSH_JOB_TEXT = (() => {
+  const wf = readFileSync(join(RENDERED, '.github/workflows/dependabot-review.yml'), 'utf8');
+  return wf.slice(wf.indexOf('\n  autofix-push:'));
+})();
+
+test('push job: it takes only a patch and the commit it was drafted for from the agent job', () => {
+  // Not the PR, not the branch, not the words of its comment: those it reads
+  // from the event and from its own checks, so a turned agent job cannot aim
+  // the push or speak through the github-actions identity the gate trusts.
+  const used = new Set([...PUSH_JOB_TEXT.matchAll(/needs\.autofix\.outputs\.([a-z_]+)/g)].map((m) => m[1]));
+  assert.deepEqual([...used].sort(), ['base_sha', 'decision', 'patch']);
+  assert.match(PUSH_JOB_TEXT, /^    if: needs\.autofix\.outputs\.decision == 'push'$/m, 'the decision only decides whether to look');
+});
+
+test('push job: a patch outside the bounds is not pushed, whatever the agent job said', async () => {
+  for (const edits of [
+    { 'package.json': '{"name":"app","dependencies":{"ioredis":"^6.0.0","left-pad":"1.0.0"}}\n' },
+    { 'src/client.ts': 'export const timeout = 2000;\n', 'src/new-file.ts': 'export {};\n' },
+  ]) {
+    const r = await runAutofix({ forge: { edits } });
+    assert.equal(r.pushed, false, `pushed ${Object.keys(edits)}:\n${r.log}`);
+    assert.equal(r.failed, true, 'an agent job that vouched for an out-of-bounds fix is a malfunction');
+    assert.match(r.comments.join('\n'), /did not push its fix[\s\S]*outside the safe bounds/);
+    assert.deepEqual(r.tokenCalls, [], 'and no push token is asked for');
+  }
+});
+
+test('push job: a patch that does not apply is not pushed', async () => {
+  const r = await runAutofix({ forge: { patch: 'not a patch at all\n' } });
+  assert.equal(r.pushed, false, r.log);
+  assert.match(r.comments.join('\n'), /does not apply|changes nothing/);
+});
+
+test('push job: a branch that moved while the fixer worked is not pushed to', async () => {
+  const r = await runAutofix({ moveBranch: true });
+  assert.equal(r.pushed, false, `the fix was drafted for an older commit:\n${r.log}`);
+  assert.match(r.log, /moved to [0-9a-f]+ while the fixer worked/);
+  assert.equal(r.failed, false, 'the next CI failure gets the next attempt; nothing broke');
+});
+
+test('push job: when a fix landed after the agent job looked, it does not push a second', async () => {
+  const r = await runAutofix({ commitsSeenByPush: [DEPENDABOT_COMMIT, AUTOFIX_COMMIT] });
+  assert.equal(r.pushed, false, r.log);
+  assert.deepEqual(r.tokenCalls, []);
 });
 
 // ---- the review job and the App's push ---------------------------------------

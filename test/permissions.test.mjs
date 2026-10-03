@@ -30,15 +30,17 @@ import { fileURLToPath } from 'node:url';
  *     command's scope granted by the job's `permissions:` block (a job-level
  *     block makes every unlisted scope `none`).
  *
- * And the passthrough itself is a contract, not a preference:
- *   - the REVIEW step must never take it. Its comment must be posted by the
- *     Claude App identity, because a comment created with GITHUB_TOKEN fires
- *     no workflow triggers (GitHub's recursion guard) and the auto-merge
- *     job's issue_comment wake-up would silently die — any review finishing
- *     after CI would strand its PR until the next push.
- *   - the AUTOFIX step must take it. Reading the failing run log is that
- *     job's entire first step, and its comments carry no decision block, so
- *     nothing needs to wake on them.
+ * And the passthrough itself is a contract, not a preference: BOTH agent steps
+ * take it. Without it the action mints the Claude App's installation token
+ * (contents, pull requests and issues write) and hands it to an agent reading
+ * attacker-influenced text. With it the agent holds its job's token, and no
+ * job that runs an agent may grant contents: write or id-token: write (the
+ * invariant at the bottom), so no agent ever holds a token that can push or
+ * merge, or can mint one. The review comment then fires no workflow trigger
+ * (GitHub's recursion guard), which nothing needs: the gate wakes when the
+ * review workflow finishes. The fixer's job grants checks and actions read,
+ * because reading the failing run is its entire first step; the review job
+ * grants neither, because the reviewer never judges CI.
  *
  * And the no-passthrough half is FLAG-granular, not verb-granular: an
  * allow-list entry is a prefix wildcard, so it is judged by the worst flag
@@ -72,6 +74,7 @@ function renderReference() {
 
 const rendered = renderReference();
 const WORKFLOW = readFileSync(join(rendered, '.github/workflows/dependabot-review.yml'), 'utf8');
+const AUTOMERGE = readFileSync(join(rendered, '.github/workflows/dependabot-automerge.yml'), 'utf8');
 
 // ---- the scope lattice ----------------------------------------------------
 // `contents: write` satisfies a `contents: read` requirement, which the autofix
@@ -133,7 +136,9 @@ const NON_GH_SCOPES = {
   grep: {},
 };
 
-// Scopes the Claude App installation token cannot read, per the 403s observed
+// Scopes that blind a reviewer when its token lacks them. The review job grants
+// neither (the reviewer judges the bump, never CI), so a command that can reach
+// one 403s on every call. Also, per the 403s observed
 // live (GraphQL statusCheckRollup and REST /actions/runs both refused with
 // "Resource not accessible by integration"). An agent WITHOUT the passthrough
 // runs on that token, so an allow-listed command needing one of these is a
@@ -195,6 +200,7 @@ function parseJobs(workflow) {
 }
 
 const JOBS = parseJobs(WORKFLOW);
+const AM_JOBS = parseJobs(AUTOMERGE);
 
 // ---- requirement discovery, derived from the rendered artifacts -----------
 function allowlistedTools(jobBody) {
@@ -272,11 +278,11 @@ const AGENT_JOBS = Object.entries(JOBS).filter(([, j]) => allowlistedTools(j.bod
 test('the parser finds every job with a non-empty permissions block', () => {
   // A parser that silently finds nothing would make every assertion below
   // vacuously true, so this is the load-bearing precondition for the file.
-  const names = Object.keys(JOBS);
-  assert.deepEqual(names.sort(), ['auto-merge', 'autofix', 'review']);
-  for (const n of names) {
+  assert.deepEqual(Object.keys(JOBS).sort(), ['autofix', 'autofix-push', 'review']);
+  assert.deepEqual(Object.keys(AM_JOBS), ['auto-merge']);
+  for (const [n, j] of [...Object.entries(JOBS), ...Object.entries(AM_JOBS)]) {
     assert.ok(
-      Object.keys(JOBS[n].permissions).length > 0,
+      Object.keys(j.permissions).length > 0,
       `job "${n}" parsed with an empty permissions block — the parser is broken or the block is missing`,
     );
   }
@@ -356,13 +362,22 @@ test('every allow-listed tool has a scope mapping (an unmapped one fails loudly,
 
 // ---- 6. the identity contract, hardcoded on purpose -----------------------
 
-test('review does NOT pass github_token — its App-posted comment is what wakes the gate', () => {
-  // A comment created with GITHUB_TOKEN fires no workflow triggers (GitHub's
-  // recursion guard), so passing the token here would silently sever the
-  // auto-merge job's issue_comment wake-up: any review finishing after CI
-  // strands its PR until the next push. The two-trigger design depends on the
-  // review comment coming from the Claude App identity.
-  assert.equal(hasTokenPassthrough(JOBS.review.body), false);
+test('review DOES pass github_token — otherwise the action hands its agent the Claude App token', () => {
+  // That token can push and merge, and the reviewer reads attacker-influenced
+  // text. Its comment, posted with GITHUB_TOKEN, wakes nothing; the gate wakes
+  // when the review workflow finishes instead.
+  assert.equal(hasTokenPassthrough(JOBS.review.body), true);
+});
+
+test('review: a job that grants neither checks nor actions allow-lists nothing that can reach them', () => {
+  // The CI-blind review defect, kept out now that the reviewer runs on its
+  // job's token: such a command 403s on every call, and the model reports the
+  // blindness as risk. REACH, not need: the flags count (#2561).
+  assert.equal(JOBS.review.permissions.checks, undefined);
+  assert.equal(JOBS.review.permissions.actions, undefined);
+  for (const scope of Object.keys(scopesReachableBy(allowlistedTools(JOBS.review.body)))) {
+    assert.ok(!APP_TOKEN_LACKS.has(scope), `review allow-lists a command that can reach "${scope}" via its flags`);
+  }
 });
 
 test('autofix DOES pass github_token — reading the failing run log is its first step', () => {
@@ -376,17 +391,14 @@ test('autofix DOES pass github_token — reading the failing run log is its firs
 
 // ---- 7. the review job's grants, hardcoded on purpose ---------------------
 
-test('review grants exactly contents:read + pull-requests:write + id-token:write', () => {
+test('review grants exactly contents:read + pull-requests:write', () => {
   // Hardcoded equality, unlike the derived superset above: the review agent
-  // does not hold this token, so these grants exist for the job's own steps
-  // (checkout, the diagnose/assert steps' gh calls, labelling) and should not
-  // creep. checks:read + actions:read sat here for weeks on the wrong theory
-  // that they cured the agent's 403s; their absence is part of what this file
-  // locks.
+  // holds this token, so these grants are what a turned reviewer could do
+  // (read, comment, label) and must not creep. No id-token: nothing in this
+  // job may mint the Claude App's token.
   assert.deepEqual(JOBS.review.permissions, {
     contents: 'read',
     'pull-requests': 'write',
-    'id-token': 'write',
   });
 });
 
@@ -396,10 +408,11 @@ test('auto-merge keeps contents:write + actions:read (hardcoded — this job mer
   // Deliberately NOT derived: auto-merge runs no agent and has no allow-list, so
   // there is nothing to derive from. It is the one job that can write to the
   // default branch, so a change to its scopes should have to edit this line.
-  assert.equal(JOBS['auto-merge'].permissions.contents, 'write');
-  assert.equal(JOBS['auto-merge'].permissions['pull-requests'], 'write');
-  assert.equal(JOBS['auto-merge'].permissions.actions, 'read');
-  assert.equal(JOBS['auto-merge'].permissions['id-token'], undefined, 'the gate needs no OIDC token');
+  assert.equal(AM_JOBS['auto-merge'].permissions.contents, 'write');
+  assert.equal(AM_JOBS['auto-merge'].permissions['pull-requests'], 'write');
+  assert.equal(AM_JOBS['auto-merge'].permissions.actions, 'read');
+  assert.equal(AM_JOBS['auto-merge'].permissions['id-token'], undefined, 'the gate needs no OIDC token');
+  assert.equal(allowlistedTools(AM_JOBS['auto-merge'].body), null, 'and it runs no agent');
 });
 
 // ---- 9. the flag-reach table mirrors the scope table ----------------------
@@ -471,4 +484,32 @@ test('autofix keeps Bash(gh pr checks:*) and Bash(gh run view:*) — reading the
   // + actions:read precisely so these entries work.
   assert.ok(allowedGh(JOBS.autofix.body).has('pr checks'));
   assert.ok(allowedGh(JOBS.autofix.body).has('run view'));
+});
+
+// ---- 12. no agent holds a token that can push or merge -----------------------
+//
+// The one invariant the rest of this file serves. An agent reads
+// attacker-influenced text and can be turned, so whatever its job's token can
+// do, a dependency's changelog can make it do. A job that runs an agent may
+// therefore grant no contents: write (push, merge) and no id-token: write
+// (which buys the Claude App's token, which can do both), and its agent step
+// must take the job's token, or the action mints that App token itself. Pushing
+// and merging happen in jobs that run no agent.
+
+test('no job that runs an agent can push, merge, or mint a token that could', () => {
+  const agentJobs = [...Object.entries(JOBS), ...Object.entries(AM_JOBS)].filter(([, j]) => /uses: anthropics\/claude-code-action@/.test(j.body));
+  assert.deepEqual(agentJobs.map(([n]) => n).sort(), ['autofix', 'review']);
+  for (const [name, j] of agentJobs) {
+    assert.notEqual(j.permissions.contents, 'write', `${name} runs an agent and can push or merge`);
+    assert.equal(j.permissions['id-token'], undefined, `${name} runs an agent and can mint the Claude App token`);
+    assert.equal(hasTokenPassthrough(j.body), true, `${name}'s agent step must take its job's token, or the action mints the App's`);
+  }
+});
+
+test('the jobs that can push or merge run no agent', () => {
+  const writers = [...Object.entries(JOBS), ...Object.entries(AM_JOBS)].filter(([, j]) => j.permissions.contents === 'write' || j.permissions['id-token'] === 'write');
+  assert.deepEqual(writers.map(([n]) => n).sort(), ['auto-merge', 'autofix-push']);
+  for (const [name, j] of writers) {
+    assert.doesNotMatch(j.body, /uses: anthropics\/claude-code-action@/, `${name} can push or merge and must run no agent`);
+  }
 });

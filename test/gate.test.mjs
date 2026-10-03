@@ -97,11 +97,12 @@ const VALID_DECISION = {
   ],
 };
 
-// Default author is `claude` — what anthropics/claude-code-action posts as in
-// production. Other trusted forms are exercised in dedicated tests below.
+// Default author is `app/github-actions`: the review step posts with its job's
+// GITHUB_TOKEN, and that is how `gh pr view --json comments` names it. Other
+// forms are exercised in dedicated tests below.
 function commentJson(opts = {}) {
   return {
-    author: { login: opts.author ?? 'claude', is_bot: true },
+    author: { login: opts.author ?? 'app/github-actions', is_bot: true },
     body: opts.body ?? '',
     createdAt: opts.createdAt ?? '2026-05-27T12:00:00Z',
   };
@@ -263,10 +264,8 @@ test('uses the latest V1 block when multiple comments contain one (LLM may post 
 });
 
 for (const [author, note] of [
-  ['claude', 'gh-CLI form, current production reality'],
-  ['claude[bot]', 'event-payload form for the same Claude GitHub App'],
-  ['github-actions[bot]', 'event-payload form if review job ever posts via GITHUB_TOKEN'],
-  ['app/github-actions', 'gh-CLI form for the same'],
+  ['app/github-actions', 'gh-CLI form: the review posts with its job\'s GITHUB_TOKEN'],
+  ['github-actions[bot]', 'event-payload form for the same'],
 ]) {
   test(`accepts trusted-author form ${author} (${note})`, () => {
     const { decision } = runGate({
@@ -274,6 +273,20 @@ for (const [author, note] of [
       PR_COMMENTS_JSON: JSON.stringify([decisionComment(VALID_DECISION, { author })]),
     });
     assert.equal(decision, 'merge');
+  });
+}
+
+for (const author of ['claude', 'claude[bot]']) {
+  test(`ignores a verdict posted as ${author}: the review no longer posts as the Claude App`, () => {
+    // No agent here holds the Claude App's token any more, and an adopter's
+    // own @claude workflow posts as that App too, so its blocks are not the
+    // review's vote.
+    const { decision, code } = runGate({
+      ...OK_SINGLETON,
+      PR_COMMENTS_JSON: JSON.stringify([decisionComment(VALID_DECISION, { author })]),
+    });
+    assert.equal(decision, 'skip');
+    assert.equal(code, 'verdict_missing');
   });
 }
 

@@ -45,7 +45,7 @@ sh -c "$(curl -fsSL https://raw.githubusercontent.com/raphaelcm/dep-steward/main
       a structured AUTOMERGE-DECISION-V1 block.
         │
         ▼
-③ AUTO-MERGE-WHEN-SAFE  —  auto-merge job  (deterministic gate; the only thing that merges)
+③ AUTO-MERGE-WHEN-SAFE  —  auto-merge workflow  (deterministic gate; the only thing that merges; no agent)
       re-checks, independently of the model:
         • author is Dependabot        • PR is open
         • CI is green                 • every changed path is whitelisted
@@ -55,8 +55,9 @@ sh -c "$(curl -fsSL https://raw.githubusercontent.com/raphaelcm/dep-steward/main
         • singleton / MAJOR PR  → merge only if the model's block says
           recommendation=merge AND our_usage_affected=false
         • anything else / uncertain → leave it, label needs-human-review
-      it ARMS GitHub's native auto-merge rather than merging on the spot,
-      and DISARMS again if a later wake-up says no.
+      it wakes when CI or the review finishes, ARMS GitHub's native
+      auto-merge rather than merging on the spot, and DISARMS again if a
+      later wake-up says no.
 ```
 
 **Arming, not merging.** Once the gate authorizes, it turns on GitHub's own auto-merge instead of merging immediately. A synchronous merge is a race — the gate reads CI, asks GitHub to merge, and anything that changes mergeability in between becomes a refusal with no retry, because the job only wakes on a new commit or a new comment. Arming hands the timing to GitHub, which merges the moment every requirement is met. Because arming is a latch and the gate re-derives everything on every wake-up, a later refusal **disarms**: a PR whose CI goes red, or whose review posts a superseding `escalate`, cannot stay armed to merge itself. If a human armed it, dep-steward says so and leaves their decision alone. And once the gate has said yes, any failure to execute is escalated to you — labelled, assigned, commented, red — because a merge that fails silently is indistinguishable from one that never ran.
@@ -75,7 +76,8 @@ Files written into your repo (review and commit them like any change):
 
 | File | Purpose |
 |---|---|
-| `.github/workflows/dependabot-review.yml` | the two-job pipeline |
+| `.github/workflows/dependabot-review.yml` | the agents: the review, and autofix's fixer and its push |
+| `.github/workflows/dependabot-automerge.yml` | the gate's workflow: the only thing that merges, and it runs no agent |
 | `.github/dependabot-review-prompt.md` | the reviewer's instructions |
 | `.github/dependabot.yml` | groups minor/patch bumps; majors stay individual |
 | `.github/dependabot-automerge/gate.cjs` | the deterministic gate (vanilla Node, zero deps) |
@@ -219,7 +221,7 @@ node --test test/*.test.mjs
 - `test/actionlint.test.mjs` — the rendered workflow passes actionlint, which adopters' CI runs on it (skipped where actionlint is not installed; required in this repo's CI).
 - `test/agent-writes.test.mjs` — runs the rendered review job with a reviewer that rewrites every pipeline script it can reach: none of the rewrites runs, and the real lint and gate still do their jobs (the autofix bounds check has the same test in `autofix-push.test.mjs`).
 - `test/actions-sim.test.mjs` — the GitHub rules the step simulator (`test/lib/actions-sim.mjs`) copies: implicit `success()`, `continue-on-error`, unset outputs, case-insensitive comparison, loud refusal of anything it does not simulate.
-- `test/permissions.test.mjs` — each agent job grants every GitHub scope the commands in its own prompt need, and an agent left on the Claude App token (no `github_token` passthrough) allow-lists nothing that could reach — even via a flag on a wildcard entry — a scope that token lacks, nor any `gh` command its prompt never orders. Derived from the rendered workflow and prompt rather than hardcoded.
+- `test/permissions.test.mjs` — no job that runs an agent can push, merge, or mint a token that could, and the jobs that can run no agent; each agent job grants every GitHub scope the commands in its own prompt need, and the reviewer allow-lists nothing that could reach — even via a flag on a wildcard entry — a scope its job does not grant, nor any `gh` command its prompt never orders. Derived from the rendered workflows and prompts rather than hardcoded.
 - `test/plugin.test.mjs` — the plugin and marketplace manifests parse and agree, every skill carries a description, and the README's raw-file links resolve on disk.
 - `test/action-pin.test.mjs` — a reinstall keeps the repo's own `claude-code-action` pin when it is newer than the template's, takes the template's when it is older, keeps the repo's and warns when the versions cannot be compared, and renders a fresh install byte-for-byte as before.
 - `test/review-lint.test.mjs` — the reviewer's prose guard, in both of its modes: it refuses the comment that actually leaked and passes verbatim changelog text that merely mentions CI, and as a hook it blocks only the comment post and never blocks on its own failure.

@@ -48,6 +48,7 @@ TEMPLATE_ACTION_REF='1623c36729ac1cd5895198cded705a287de7db79'
 TEMPLATE_ACTION_VERSION='v1.0.187'
 REPO_URL='https://github.com/raphaelcm/dep-steward'
 GATE_PATH='.github/dependabot-automerge/gate.cjs'
+AUTOMERGE_WORKFLOW_PATH='.github/workflows/dependabot-automerge.yml'
 REVIEW_LINT_PATH='.github/dependabot-automerge/review-lint.cjs'
 AUTOFIX_BOUNDS_PATH='.github/dependabot-automerge/autofix-bounds.cjs'
 AUTOFIX_PROMPT_PATH='.github/dependabot-autofix-prompt.md'
@@ -417,24 +418,39 @@ render_prompt() {
       "$SRC/templates/dependabot-review-prompt.md"
 }
 
-render_workflow() {
+# The placeholders both workflow files share.
+subst_workflow() {
   crt=$(ci_runlist_token "$CI_NAME")
-  frag=''
-  if [ "$AUTOFIX" -eq 1 ]; then frag=$(cat "$SRC/templates/dependabot-autofix-job.yml"); fi
   # ESCALATABLE_CODES contains `|` (it renders a shell `case` pattern), so that
   # one substitution needs a delimiter the value cannot contain.
-  inject '#__AUTOFIX_JOB__' "$frag" < "$SRC/templates/dependabot-review.yml" \
-    | sed -e "s|__CI_NAME__|$CI_NAME|g" \
-          -e "s|__CI_RUNLIST__|$crt|g" \
-          -e "s|__MODEL__|$MODEL|g" \
-          -e "s|__GATE_PATH__|$GATE_PATH|g" \
-          -e "s|__REVIEW_LINT_PATH__|$REVIEW_LINT_PATH|g" \
-          -e "s|__REVIEW_ACTION_PIN__|$(sed_escape "$REVIEW_ACTION_PIN")|g" \
-          -e "s|__AUTOFIX_ACTION_PIN__|$(sed_escape "$AUTOFIX_ACTION_PIN")|g" \
-          -e "s|__ESCALATABLE_NOTE__|$ESCALATABLE_NOTE|g" \
-          -e "s,__ESCALATABLE_CODES__,$ESCALATABLE_CODES,g" \
-          -e "s|__ASSIGN_FLAG__|$ASSIGN_FLAG|g"
+  sed -e "s|__CI_NAME__|$CI_NAME|g" \
+      -e "s|__CI_RUNLIST__|$crt|g" \
+      -e "s|__MODEL__|$MODEL|g" \
+      -e "s|__GATE_PATH__|$GATE_PATH|g" \
+      -e "s|__REVIEW_LINT_PATH__|$REVIEW_LINT_PATH|g" \
+      -e "s|__REVIEW_ACTION_PIN__|$(sed_escape "$REVIEW_ACTION_PIN")|g" \
+      -e "s|__AUTOFIX_ACTION_PIN__|$(sed_escape "$AUTOFIX_ACTION_PIN")|g" \
+      -e "s|__ESCALATABLE_NOTE__|$ESCALATABLE_NOTE|g" \
+      -e "s,__ESCALATABLE_CODES__,$ESCALATABLE_CODES,g" \
+      -e "s|__ASSIGN_FLAG__|$ASSIGN_FLAG|g"
 }
+
+# The agents' workflow. Autofix wakes on CI finishing, so that trigger exists
+# only when autofix does.
+render_workflow() {
+  frag=''
+  trig=''
+  if [ "$AUTOFIX" -eq 1 ]; then
+    frag=$(cat "$SRC/templates/dependabot-autofix-job.yml")
+    trig=$(printf '%s\n' '  workflow_run:' '    workflows: ["__CI_NAME__"]' '    types: [completed]')
+  fi
+  inject '#__AUTOFIX_JOB__' "$frag" < "$SRC/templates/dependabot-review.yml" \
+    | inject '#__AUTOFIX_TRIGGER__' "$trig" \
+    | subst_workflow
+}
+
+# The gate's workflow: the only one that can merge, and it runs no agent.
+render_automerge_workflow() { subst_workflow < "$SRC/templates/dependabot-automerge.yml"; }
 
 render_gate() {
   inject '//__PREFIXES__' "$GROUP_PREFIXES" < "$SRC/templates/gate.cjs" \
@@ -470,6 +486,7 @@ if [ "$RENDER_ONLY" -eq 1 ]; then
   emit render_dependabot_yml "$OUT/.github/dependabot.yml"
   emit render_prompt          "$OUT/.github/dependabot-review-prompt.md"
   emit render_workflow        "$OUT/.github/workflows/dependabot-review.yml"
+  emit render_automerge_workflow "$OUT/$AUTOMERGE_WORKFLOW_PATH"
   emit render_gate            "$OUT/$GATE_PATH"
   emit render_review_lint     "$OUT/$REVIEW_LINT_PATH"
   if [ "$AUTOFIX" -eq 1 ]; then
@@ -547,10 +564,11 @@ STAGE=$(mktemp -d)
 emit render_dependabot_yml "$STAGE/.github/dependabot.yml"
 emit render_prompt          "$STAGE/.github/dependabot-review-prompt.md"
 emit render_workflow        "$STAGE/.github/workflows/dependabot-review.yml"
+emit render_automerge_workflow "$STAGE/$AUTOMERGE_WORKFLOW_PATH"
 emit render_gate            "$STAGE/$GATE_PATH"
 emit render_review_lint     "$STAGE/$REVIEW_LINT_PATH"
 
-FILES=".github/dependabot.yml .github/dependabot-review-prompt.md .github/workflows/dependabot-review.yml $GATE_PATH $REVIEW_LINT_PATH"
+FILES=".github/dependabot.yml .github/dependabot-review-prompt.md .github/workflows/dependabot-review.yml $AUTOMERGE_WORKFLOW_PATH $GATE_PATH $REVIEW_LINT_PATH"
 if [ "$AUTOFIX" -eq 1 ]; then
   emit render_autofix_prompt "$STAGE/$AUTOFIX_PROMPT_PATH"
   emit render_autofix_bounds "$STAGE/$AUTOFIX_BOUNDS_PATH"

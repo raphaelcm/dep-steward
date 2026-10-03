@@ -10,7 +10,7 @@ The half-uninstall to avoid is leaving the token behind: `CLAUDE_CODE_OAUTH_TOKE
 
 Report what exists before removing anything — the repo may have only some of it, or a hand-edited variant.
 
-- Files: `.github/workflows/dependabot-review.yml`, `.github/dependabot-review-prompt.md`, `.github/dependabot.yml`, `.github/dependabot-automerge/` (the gate and the reviewer's prose lint, plus `autofix-bounds.cjs` and `.github/dependabot-autofix-prompt.md` when autofix is on).
+- Files: `.github/workflows/dependabot-review.yml`, `.github/workflows/dependabot-automerge.yml`, `.github/dependabot-review-prompt.md`, `.github/dependabot.yml`, `.github/dependabot-automerge/` (the gate and the reviewer's prose lint, plus `autofix-bounds.cjs` and `.github/dependabot-autofix-prompt.md` when autofix is on).
 - Label: `gh label list --search needs-human-review`.
 - Secrets: `gh secret list` and `gh secret list --app dependabot`.
 - Open PRs still carrying the label: `gh pr list --label needs-human-review --state open`.
@@ -26,6 +26,7 @@ Show the user the exact list and get their go-ahead. Two things deserve a specif
 
 ```sh
 rm -f .github/workflows/dependabot-review.yml \
+      .github/workflows/dependabot-automerge.yml \
       .github/dependabot-review-prompt.md \
       .github/dependabot-autofix-prompt.md
 rm -rf .github/dependabot-automerge

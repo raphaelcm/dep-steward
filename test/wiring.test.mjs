@@ -175,6 +175,7 @@ test('writes the automation files into the target repo (repo scope only — no p
     '.github/dependabot.yml',
     '.github/dependabot-review-prompt.md',
     '.github/workflows/dependabot-review.yml',
+    '.github/workflows/dependabot-automerge.yml',
     '.github/dependabot-automerge/gate.cjs',
     '.github/dependabot-automerge/review-lint.cjs',
   ]) {
