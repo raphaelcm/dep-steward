@@ -437,11 +437,11 @@ if ((process.env.GATE_MODE || '') === 'classify') {
   process.exit(0);
 }
 
-// Verdicts mode, used by the review workflow's deliverable-assertion — NOT the
-// merge path. It prints the bodies of the decision comments the merge path
-// would trust, posted at or after SINCE, so the review job and the gate can
-// never disagree about whose verdict counts: a verdict the gate would ignore
-// is no deliverable. It authorizes nothing.
+// Verdicts mode, used by the review workflow's deliverable-assertion, not by
+// the merge path. It prints the bodies of the decision comments the merge
+// path would trust, posted at or after SINCE, so the review job and the gate
+// can never disagree about whose verdict counts: a verdict the gate would
+// ignore is no deliverable. It authorizes nothing.
 if ((process.env.GATE_MODE || '') === 'verdicts') {
   const { comments, error } = parseComments(process.env.PR_COMMENTS_JSON);
   if (error) {
