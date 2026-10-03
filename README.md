@@ -49,6 +49,7 @@ sh -c "$(curl -fsSL https://raw.githubusercontent.com/raphaelcm/dep-steward/main
       re-checks, independently of the model:
         • author is Dependabot        • PR is open
         • CI is green                 • every changed path is whitelisted
+        • Dependabot itself pushed the commit, and the merge is tied to it
       then:
         • minor/patch GROUP PR  → merge with zero LLM input
         • singleton / MAJOR PR  → merge only if the model's block says

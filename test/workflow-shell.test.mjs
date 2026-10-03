@@ -147,7 +147,10 @@ const GH_STUB = `#!/usr/bin/env bash
 printf '%s\\n' "$*" >> "$GH_LOG"
 case "$1 $2" in
   "pr view")
-    echo '{"state":"OPEN","author":{"login":"app/dependabot"},"comments":[],"labels":[]}' ;;
+    case "$*" in
+      *autoMergeRequest*) echo "\${ARMED_BY:-none}"; exit 0 ;;
+    esac
+    echo "{\\"state\\":\\"OPEN\\",\\"headRefOid\\":\\"$PR_HEAD_FIXTURE\\",\\"author\\":{\\"login\\":\\"app/dependabot\\"},\\"comments\\":[],\\"labels\\":[]}" ;;
   "pr diff")
     echo ".github/workflows/ci.yml" ;;
   "pr merge")
@@ -166,7 +169,9 @@ case "$1 $2" in
 esac
 `;
 
-function runGateStep({ acceptMethods, allowedMergeMethods }) {
+const GATE_HEAD = '9ee40cf2a1b3c4d5e6f708192a3b4c5d6e7f8091';
+
+function runGateStep({ acceptMethods, allowedMergeMethods, headPusher = 'dependabot[bot]', prHeadSha = GATE_HEAD, armedBy = 'none' }) {
   const out = renderTo();
   const workflow = readFileSync(join(out, '.github/workflows/dependabot-review.yml'), 'utf8');
   const block = runBlocks(workflow).find((b) => b.stepName === 'Deterministic auto-merge gate');
@@ -198,6 +203,10 @@ function runGateStep({ acceptMethods, allowedMergeMethods }) {
         HEAD_BRANCH: 'dependabot/github_actions/actions-minor-patch-a',
         CI_CONCLUSION: 'success',
         ALLOWED_MERGE_METHODS: allowedMergeMethods,
+        HEAD_SHA: GATE_HEAD,
+        HEAD_PUSHER: headPusher,
+        PR_HEAD_FIXTURE: prHeadSha,
+        ARMED_BY: armedBy,
       },
     });
   } catch (e) {
@@ -230,6 +239,122 @@ test('a refused merge commit falls through to rebase, merges, and pages nobody',
   // The whole point: no human is involved in a merge that succeeded.
   assert.equal(ghCalls.filter((c) => c.startsWith('pr comment')).length, 0, 'a successful fallback must not comment');
   assert.ok(!ghCalls.some((c) => c.includes('needs-human-review')), 'a successful fallback must not label');
+});
+
+test('the merge is tied to the commit the gate checked', () => {
+  // Arming without it merges whatever the head is when GitHub gets round to
+  // it, including a commit pushed after the gate looked.
+  const { status, stdout, ghCalls } = runGateStep({ acceptMethods: 'squash,rebase', allowedMergeMethods: 'squash,rebase' });
+  assert.equal(status, 0, stdout);
+  const arms = ghCalls.filter((c) => c.startsWith('pr merge') && c.includes('--auto'));
+  assert.ok(arms.length > 0, stdout);
+  for (const a of arms) assert.ok(a.includes(`--match-head-commit ${GATE_HEAD}`), `unpinned arm: ${a}`);
+});
+
+test('a commit someone else pushed is never armed, a person is told once, and an earlier arm is withdrawn', () => {
+  const { status, stdout, ghCalls, ghLogText } = runGateStep({
+    acceptMethods: 'squash,rebase',
+    allowedMergeMethods: 'squash,rebase',
+    headPusher: 'claude[bot]',
+    armedBy: 'github-actions[bot]',
+  });
+  assert.equal(status, 0, `the gate refusing correctly is not a malfunction:\n${stdout}`);
+  assert.ok(!ghCalls.some((c) => c.startsWith('pr merge') && c.includes('--auto')), 'never armed');
+  assert.ok(ghCalls.some((c) => c.startsWith('pr merge') && c.includes('--disable-auto')), 'the earlier arm is withdrawn');
+  assert.equal(ghCalls.filter((c) => c.startsWith('pr comment')).length, 1, ghLogText);
+  assert.match(ghLogText, /head_pushed_by_other/);
+  assert.ok(ghCalls.some((c) => c.includes('needs-human-review')), 'and labelled for a person');
+});
+
+test('a head that moved after CI was read is left for the next wake, silently, and disarmed', () => {
+  const { status, stdout, ghCalls } = runGateStep({
+    acceptMethods: 'squash,rebase',
+    allowedMergeMethods: 'squash,rebase',
+    prHeadSha: 'b'.repeat(40),
+    armedBy: 'github-actions[bot]',
+  });
+  assert.equal(status, 0, stdout);
+  assert.match(stdout, /head_moved/);
+  assert.ok(!ghCalls.some((c) => c.startsWith('pr merge') && c.includes('--auto')), 'never armed');
+  assert.ok(ghCalls.some((c) => c.startsWith('pr merge') && c.includes('--disable-auto')), 'an arm on the old head is withdrawn');
+  assert.equal(ghCalls.filter((c) => c.startsWith('pr comment')).length, 0, 'the next CI run decides; nobody is paged');
+});
+
+// ---- who pushed the commit under review, RESOLVED ---------------------------
+//
+// The gate's pusher is the actor of the first CI run GitHub created for the
+// head commit: the push creates that run, and a reopen or a re-run comes later.
+// Measured on Runsense-ai/runsense: #2805's head (Dependabot's own push) has CI
+// actor dependabot[bot]; #2693's head (a person's merge commit) has the person.
+
+const CI_STEP_GH_STUB = `#!/usr/bin/env bash
+printf '%s\\n' "$*" >> "$GH_LOG"
+flag() { local want="$1" prev='' a; shift; for a in "$@"; do if [ "$prev" = "$want" ]; then printf '%s' "$a"; return; fi; prev="$a"; done; }
+case "$1 $2" in
+  "pr view") printf '%s\\n' "$HEAD_SHA_FIXTURE"; exit 0 ;;
+  "run list")
+    # Newest first, as gh lists them; the step's own --jq runs over it.
+    printf '%s' "$RUNS_JSON" | jq -r "$(flag --jq "$@")"; exit 0 ;;
+  "api repos/octocat/repo/actions/runs/"*)
+    id="\${2##*/}"
+    printf '%s' "$RUNS_JSON" | jq -r --arg id "$id" '.[] | select((.databaseId|tostring) == $id) | .actor'; exit 0 ;;
+esac
+echo "gh stub: unexpected call: $*" >&2; exit 1
+`;
+
+function runResolveCiStep(runs) {
+  const out = renderTo();
+  const workflow = readFileSync(join(out, '.github/workflows/dependabot-review.yml'), 'utf8');
+  const block = runBlocks(workflow).find((b) => b.stepName.startsWith('Resolve CI conclusion'));
+  assert.ok(block, 'the CI-resolve step must exist');
+  const bin = mkdtempSync(join(tmpdir(), 'ds-ci-'));
+  writeFileSync(join(bin, 'gh'), CI_STEP_GH_STUB, { mode: 0o755 });
+  const ghLog = join(bin, 'gh.log');
+  writeFileSync(ghLog, '');
+  const githubOutput = join(bin, 'github_output');
+  writeFileSync(githubOutput, '');
+  const script = join(bin, 'step.sh');
+  writeFileSync(script, stripActionsExpressions(block.script));
+  const stdout = execFileSync('bash', ['-e', script], {
+    cwd: out,
+    encoding: 'utf8',
+    env: {
+      ...process.env,
+      PATH: `${bin}:${process.env.PATH}`,
+      GH_LOG: ghLog,
+      GH_TOKEN: 'x',
+      REPO: 'octocat/repo',
+      PR_NUMBER: '1',
+      HEAD_SHA_FIXTURE: GATE_HEAD,
+      RUNS_JSON: JSON.stringify(runs),
+      GITHUB_OUTPUT: githubOutput,
+    },
+  });
+  const outputs = Object.fromEntries(readFileSync(githubOutput, 'utf8').split('\n').filter(Boolean).map((l) => [l.slice(0, l.indexOf('=')), l.slice(l.indexOf('=') + 1)]));
+  return { stdout, outputs };
+}
+
+const run = (id, createdAt, actor, conclusion) => ({ databaseId: id, createdAt, actor, conclusion });
+
+test('resolve: the pusher is whoever caused the commit\'s first CI run, not a later reopen', () => {
+  const { outputs } = runResolveCiStep([
+    run(2, '2026-09-28T05:10:00Z', 'raphaelcm', 'success'),
+    run(1, '2026-09-28T04:33:31Z', 'dependabot[bot]', 'failure'),
+  ]);
+  assert.equal(outputs.head_pusher, 'dependabot[bot]');
+  assert.equal(outputs.head_sha, GATE_HEAD);
+  assert.equal(outputs.ci_conclusion, 'success', 'the CI result is still the newest run\'s');
+});
+
+test('resolve: a commit someone else pushed names them', () => {
+  const { outputs } = runResolveCiStep([run(7, '2026-09-28T06:00:00Z', 'claude[bot]', 'success')]);
+  assert.equal(outputs.head_pusher, 'claude[bot]');
+});
+
+test('resolve: with no CI run yet, the pusher is empty, not guessed', () => {
+  const { outputs } = runResolveCiStep([]);
+  assert.equal(outputs.head_pusher, '');
+  assert.equal(outputs.ci_conclusion, 'pending');
 });
 
 test('when every ranked method is refused, one escalation carries them all', () => {

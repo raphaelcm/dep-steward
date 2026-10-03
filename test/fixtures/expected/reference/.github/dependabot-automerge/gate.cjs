@@ -9,7 +9,8 @@
  *   1. **Group PRs** (branch prefix matches an entry in
  *      `ELIGIBLE_GROUP_PREFIXES`): `.github/dependabot.yml` guarantees the
  *      group contains only minor + patch bumps. No LLM input needed; the
- *      gate just verifies CI, author, PR state, and the path whitelist.
+ *      gate just verifies CI, author, who pushed the head commit, PR state,
+ *      and the path whitelist.
  *
  *   2. **Singleton / major PRs**: the LLM review job posts a fenced
  *      `<!-- AUTOMERGE-DECISION-V1 -->{...}<!-- /AUTOMERGE-DECISION-V1 -->`
@@ -24,6 +25,10 @@
  * Inputs (env):
  *   - HEAD_BRANCH, CI_CONCLUSION, PR_AUTHOR, PR_STATE, CHANGED_PATHS
  *     (CHANGED_PATHS is newline-separated)
+ *   - HEAD_SHA: the commit CI_CONCLUSION and HEAD_PUSHER were read for;
+ *     PR_HEAD_SHA: the PR's head when the rest was read. They must match.
+ *   - HEAD_PUSHER: who pushed HEAD_SHA (the actor of the first CI run GitHub
+ *     created for it), or empty when the workflow could not tell.
  *   - PR_COMMENTS_JSON (singleton path only): JSON array as produced by
  *     `gh pr view <n> --json comments --jq '.comments'`; empty / missing on
  *     group-PR runs.
@@ -294,6 +299,9 @@ function decide(env) {
   const ciConclusion = (env.CI_CONCLUSION || '').trim();
   const prAuthor = (env.PR_AUTHOR || '').trim();
   const prState = (env.PR_STATE || '').trim().toUpperCase();
+  const headSha = (env.HEAD_SHA || '').trim();
+  const prHeadSha = (env.PR_HEAD_SHA || '').trim();
+  const headPusher = (env.HEAD_PUSHER || '').trim();
   const changedPaths = (env.CHANGED_PATHS || '')
     .split('\n')
     .map((s) => s.trim())
@@ -310,6 +318,17 @@ function decide(env) {
   if (prState !== 'OPEN') {
     return { decision: 'skip', code: 'pr_not_open', reason: `PR state is ${prState || '(empty)'}, not OPEN` };
   }
+  // CI and the pusher were read for HEAD_SHA, the paths and the verdict a moment
+  // later. If the head moved in between they describe different commits, and
+  // judging one by the other's CI is how an unchecked commit merges. Not yet,
+  // not never: the new head's CI run wakes the gate again.
+  if (!headSha || headSha !== prHeadSha) {
+    return {
+      decision: 'skip',
+      code: 'head_moved',
+      reason: `the PR's head (${prHeadSha || 'unknown'}) is not the commit CI was read for (${headSha || 'unknown'})`,
+    };
+  }
   if (ciConclusion !== 'success') {
     const ciCode = CI_PENDING.has(ciConclusion)
       ? 'ci_pending'
@@ -320,6 +339,28 @@ function decide(env) {
       decision: 'skip',
       code: ciCode,
       reason: `CI conclusion is ${ciConclusion || '(empty)'}, not success`,
+    };
+  }
+  // The PR author stays Dependabot whoever pushes to the branch afterwards, so
+  // the author check above says nothing about the commit being judged. Anyone
+  // holding a token that can push (a person, the Claude App, GITHUB_TOKEN) can
+  // add a commit touching only whitelisted paths, such as a package.json
+  // script, and every check below would pass it. A singleton's verdict was
+  // about Dependabot's change, not theirs. So the commit must be Dependabot's
+  // own push. Never on its own: Dependabot does not touch a branch someone
+  // else pushed to until a person asks it to rebase.
+  if (!headPusher) {
+    return {
+      decision: 'skip',
+      code: 'head_pusher_unknown',
+      reason: `could not tell who pushed ${headSha}, so it cannot be confirmed as Dependabot's`,
+    };
+  }
+  if (!DEPENDABOT_AUTHORS.has(headPusher)) {
+    return {
+      decision: 'skip',
+      code: 'head_pushed_by_other',
+      reason: `the PR's latest commit (${headSha}) was pushed by ${headPusher}, not Dependabot, so it is not Dependabot's change alone`,
     };
   }
   if (changedPaths.length === 0) {

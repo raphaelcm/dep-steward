@@ -73,12 +73,19 @@ function classifyGate(headBranch) {
 // `gh pr list --json author --jq '.[0].author.login'` returns `app/<slug>` for
 // GitHub Apps, not the `<slug>[bot]` form event payloads use. OK_NPM matches
 // what the workflow actually passes in production — `app/dependabot`.
+// The commit CI was read for, the PR's head when the gate ran, and who pushed
+// that commit, as the workflow resolves them (the REST API spells the pusher
+// `dependabot[bot]`).
+const HEAD = '9ee40cf2a1b3c4d5e6f708192a3b4c5d6e7f8091';
+const PUSHED_BY_DEPENDABOT = { HEAD_SHA: HEAD, PR_HEAD_SHA: HEAD, HEAD_PUSHER: 'dependabot[bot]' };
+
 const OK_NPM = {
   HEAD_BRANCH: 'dependabot/npm_and_yarn/npm-minor-patch-5475a7b965',
   CI_CONCLUSION: 'success',
   PR_AUTHOR: 'app/dependabot',
   PR_STATE: 'OPEN',
   CHANGED_PATHS: 'package.json\npackage-lock.json',
+  ...PUSHED_BY_DEPENDABOT,
 };
 
 const VALID_DECISION = {
@@ -120,6 +127,7 @@ const OK_SINGLETON = {
   PR_STATE: 'OPEN',
   CHANGED_PATHS: 'package.json\npackage-lock.json',
   PR_COMMENTS_JSON: JSON.stringify([decisionComment(VALID_DECISION)]),
+  ...PUSHED_BY_DEPENDABOT,
 };
 
 test('merges a clean npm-minor-patch group PR (CI green, dependabot, open, whitelisted paths)', () => {
@@ -271,7 +279,7 @@ for (const [author, note] of [
 
 // ---- Multi-ecosystem: the whitelist + group prefixes cover every configured ecosystem ----
 
-const BASE = { CI_CONCLUSION: 'success', PR_AUTHOR: 'app/dependabot', PR_STATE: 'OPEN' };
+const BASE = { CI_CONCLUSION: 'success', PR_AUTHOR: 'app/dependabot', PR_STATE: 'OPEN', ...PUSHED_BY_DEPENDABOT };
 
 for (const [eco, branch, paths] of [
   ['cargo', 'dependabot/cargo/cargo-minor-patch-a', 'Cargo.toml\nCargo.lock'],
@@ -381,6 +389,60 @@ test('code: a well-formed block missing a required field is verdict_malformed, n
   assert.equal(code, 'verdict_malformed');
 });
 
+// ---- Who pushed the commit under review ------------------------------------
+//
+// The PR author is Dependabot for the PR's whole life, whoever pushes to its
+// branch afterwards. A token that can push (a person's, the Claude App's,
+// GITHUB_TOKEN) can add a commit touching only whitelisted paths, such as a
+// package.json script, and every other check here would still pass. So the gate
+// also asks who pushed the commit it is judging, and refuses anyone but
+// Dependabot. A singleton's verdict was about Dependabot's change, not theirs.
+
+test('pusher: a commit someone else pushed is refused, even when every path is whitelisted', () => {
+  for (const pusher of ['claude[bot]', 'raphaelcm', 'github-actions[bot]']) {
+    const r = runGate({ ...OK_NPM, HEAD_PUSHER: pusher });
+    assert.equal(r.decision, 'skip', `a commit pushed by ${pusher} must not auto-merge`);
+    assert.equal(r.code, 'head_pushed_by_other');
+    assert.match(r.reason, new RegExp(pusher.replace(/[[\]]/g, '\\$&')));
+  }
+});
+
+test('pusher: a singleton verdict does not carry over to a commit someone else pushed', () => {
+  const r = runGate({ ...OK_SINGLETON, HEAD_PUSHER: 'claude[bot]' });
+  assert.equal(r.decision, 'skip');
+  assert.equal(r.code, 'head_pushed_by_other');
+});
+
+test('pusher: both spellings of Dependabot are Dependabot', () => {
+  for (const pusher of ['dependabot[bot]', 'app/dependabot']) {
+    assert.equal(runGate({ ...OK_NPM, HEAD_PUSHER: pusher }).decision, 'merge', pusher);
+  }
+});
+
+test('pusher: when who pushed cannot be told, the gate refuses rather than assumes', () => {
+  const r = runGate({ ...OK_NPM, HEAD_PUSHER: '' });
+  assert.equal(r.decision, 'skip');
+  assert.equal(r.code, 'head_pusher_unknown');
+});
+
+test('pusher: CI that is not green is reported before who pushed', () => {
+  // No CI result yet means no CI run to read the pusher from, so "not yet" is
+  // the true answer, and it stays silent.
+  const r = runGate({ ...OK_NPM, CI_CONCLUSION: 'in_progress', HEAD_PUSHER: '' });
+  assert.equal(r.code, 'ci_pending');
+});
+
+test('head: a PR whose head moved after CI was read is not judged on the old commit\'s CI', () => {
+  // CI and the pusher were read for HEAD_SHA; the paths and verdict are read
+  // later. If the head moved in between, they describe different commits.
+  const moved = runGate({ ...OK_NPM, PR_HEAD_SHA: 'b'.repeat(40) });
+  assert.equal(moved.decision, 'skip');
+  assert.equal(moved.code, 'head_moved');
+  const unread = runGate({ ...OK_NPM, HEAD_SHA: '' });
+  assert.equal(unread.decision, 'skip', 'an unread head cannot be confirmed');
+  assert.equal(unread.code, 'head_moved');
+});
+
 test('code: every refusal carries one, and it is never empty', () => {
   // An empty code would fall through the workflow's `case` into silence, which
   // is the failure this whole mechanism exists to prevent — so a new refusal
@@ -394,6 +456,9 @@ test('code: every refusal carries one, and it is never empty', () => {
     { ...OK_NPM, CHANGED_PATHS: 'src/x.ts' },
     { ...OK_NPM, HEAD_BRANCH: 'dependabot/npm_and_yarn/twilio-6.0.2' },
     OK_SINGLETON,
+    { ...OK_NPM, HEAD_PUSHER: 'claude[bot]' },
+    { ...OK_NPM, HEAD_PUSHER: '' },
+    { ...OK_NPM, PR_HEAD_SHA: 'b'.repeat(40) },
   ]) {
     const { code } = runGate(env);
     assert.match(code, /^[a-z_]+$/, `empty or malformed code for ${JSON.stringify(env.HEAD_BRANCH)}`);

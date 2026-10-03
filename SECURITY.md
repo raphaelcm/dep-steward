@@ -11,6 +11,7 @@ Dependabot opens PRs that bump third-party dependencies. The contents of those d
 Merging is done only by the **deterministic gate** (`.github/dependabot-automerge/gate.cjs`), never by the model. The gate re-derives every safety-relevant fact itself and merges only when **all** hold:
 
 - the PR author is Dependabot,
+- **Dependabot itself pushed the commit being merged** — the gate reads who pushed the PR's latest commit (the actor of the first CI run GitHub created for it), refuses anyone else, and ties the merge to that exact commit, so a commit pushed afterwards cannot ride on the check,
 - the PR is open,
 - CI is green (re-queried at gate time), and
 - **every changed path is on the whitelist** — the dependency manifests and lockfiles for your configured ecosystems (e.g. `package.json`/lockfiles, `Cargo.toml`/`Cargo.lock`, `go.mod`/`go.sum`, `requirements*.txt`, `Dockerfile`) plus `.github/workflows/*.yml` and `.github/actions/**`. The whitelist is generated per-ecosystem and kept conservative (e.g. Docker matches `Dockerfile`s, not arbitrary YAML).
@@ -21,6 +22,7 @@ So a prompt-injected diff can at most flip the model's recommendation from `esca
 
 - **smuggle a source change** — the whitelist rejects any PR touching a non-dependency path, regardless of what the model says;
 - **merge past red tests** — the gate reads CI status itself;
+- **merge a commit someone else pushed** — the PR's author stays Dependabot whoever pushes to its branch, so the gate also checks who pushed the commit it is judging. A token that can push (a person's, an App's, `GITHUB_TOKEN`) could otherwise add a commit touching only whitelisted paths, such as a `package.json` script, and have it auto-merged;
 - **forge the decision** — the gate honours an `AUTOMERGE-DECISION-V1` block only from a trusted commenter identity (the review job / the Claude app), so a comment posted by any other account is ignored.
 
 ## Defense in depth
@@ -47,6 +49,7 @@ This matters because a silently-refused PR is indistinguishable from a dependenc
 
 - **A genuinely benign-looking malicious minor/patch bump.** Group PRs merge on CI-green without a model review. This is the standard trade-off of any Dependabot auto-merge; the mitigation is a good test suite as your required CI, plus Dependabot's own compromised-version signals.
 - **CI not required.** If CI is not a required check, a separate actor could merge around it; the gate's guarantees are about what *it* does, not about what a human with write access can do.
+- **A leaked write token can merge without the gate.** The gate governs the merges dep-steward makes. A token that can push can also merge a pull request through GitHub's API wherever your branch rules allow it, and no gate sees that. Keep GitHub's ruleset option "require extra approval for unattributed changes" on (rulesets have had it on by default since August 2026): it makes changes made by `github-actions[bot]` wait for a person's approval, while Dependabot's own pull requests still auto-merge.
 - **Token scope.** `CLAUDE_CODE_OAUTH_TOKEN` is billable; treat it as a secret. It lives in the Actions and Dependabot secret stores and is never written to logs.
 - **CI on an autofixed PR runs with your Actions secrets.** A CI run Dependabot starts gets the Dependabot secret store and a read-only token. A run autofix's push starts (as the Claude GitHub App) is an ordinary PR run, like one after a person pushes to the PR, so it gets your Actions secrets and whatever your CI hands to code under test. The code it runs is the dependency bump plus a few lines the fixer wrote. Anything in your CI that releases secrets based on PR state the agents can change reaches that run with no person in between: both the reviewer and the fixer can add labels, so a label that opts a PR into secret-bearing jobs is the case to check. `--no-autofix` turns this off along with autofix.
 
