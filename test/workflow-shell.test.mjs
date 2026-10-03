@@ -143,19 +143,52 @@ function renderTo() {
   return out;
 }
 
+// GitHub's two comment surfaces, rendered from one list of comments the way
+// GitHub renders them. Measured on Runsense-ai/runsense#2807 with gh 2.96.0 and
+// read in gh's source (api/queries_issue.go, CommentAuthor): the REST API names
+// a bot `<slug>[bot]` with type Bot, while `gh pr view --json comments` prints
+// only the bare login, so there a bot and a person with that login look alike.
+// A stub that answered in a shape GitHub never produces is how a gate trusting
+// a spelling no comment carries passed every test.
+function commentSurfaces(comments = []) {
+  const rest = comments.map((c) => ({
+    user: { login: c.type === 'Bot' ? `${c.login}[bot]` : c.login, type: c.type },
+    body: c.body,
+    created_at: c.createdAt,
+  }));
+  const view = comments.map((c) => ({ author: { login: c.login }, body: c.body, createdAt: c.createdAt }));
+  return { GH_REST_COMMENTS: JSON.stringify(rest), GH_VIEW_COMMENTS: JSON.stringify(view) };
+}
+// The review step posts with its job's GITHUB_TOKEN.
+const REVIEW = { login: 'github-actions', type: 'Bot' };
+
+// Both surfaces, answered with the step's own --jq run by real jq, as gh does
+// (strings raw, anything else compact JSON).
+const GH_COMMENTS_SH = `jq_arg() { local prev='' a; for a in "$@"; do if [ "$prev" = --jq ]; then printf '%s' "$a"; return; fi; prev="$a"; done; printf '.'; }
+if [ "$1" = api ]; then
+  case "$*" in
+    *repos/octocat/repo/issues/1/comments*) printf '%s' "\${GH_REST_COMMENTS:-[]}" | jq -rc "$(jq_arg "$@")"; exit 0 ;;
+  esac
+  exit 0
+fi
+`;
+
 // A `gh` that accepts only the methods named in ACCEPT_METHODS, refusing every
 // other `pr merge` with GitHub's real wording. Every call is appended to
 // $GH_LOG so the assertions can read what the step actually did.
 const GH_STUB = `#!/usr/bin/env bash
 printf '%s\\n' "$*" >> "$GH_LOG"
+${GH_COMMENTS_SH}
 case "$1 $2" in
   "pr view")
     case "$*" in
       *autoMergeRequest*) echo "\${ARMED_BY:-none}"; exit 0 ;;
     esac
-    echo "{\\"state\\":\\"OPEN\\",\\"headRefOid\\":\\"$PR_HEAD_FIXTURE\\",\\"author\\":{\\"login\\":\\"app/dependabot\\"},\\"comments\\":[],\\"labels\\":[]}" ;;
+    jq -nc --arg head "$PR_HEAD_FIXTURE" --argjson comments "\${GH_VIEW_COMMENTS:-[]}" \\
+      '{state: "OPEN", headRefOid: $head, author: {is_bot: true, login: "app/dependabot"}, comments: $comments, labels: []}' \\
+      | jq -rc "$(jq_arg "$@")" ;;
   "pr diff")
-    echo ".github/workflows/ci.yml" ;;
+    printf '%s\\n' "\${PR_DIFF_FIXTURE:-.github/workflows/ci.yml}" ;;
   "pr merge")
     for a in "$@"; do
       case "$a" in
@@ -174,7 +207,7 @@ esac
 
 const GATE_HEAD = '9ee40cf2a1b3c4d5e6f708192a3b4c5d6e7f8091';
 
-function runGateStep({ acceptMethods, allowedMergeMethods, headPusher = 'dependabot[bot]', prHeadSha = GATE_HEAD, armedBy = 'none' }) {
+function runGateStep({ acceptMethods, allowedMergeMethods, headPusher = 'dependabot[bot]', prHeadSha = GATE_HEAD, armedBy = 'none', headBranch = 'dependabot/github_actions/actions-minor-patch-a', changedPaths, comments = [] }) {
   const out = renderTo();
   const workflow = readFileSync(join(out, '.github/workflows/dependabot-automerge.yml'), 'utf8');
   const block = runBlocks(workflow).find((b) => b.stepName === 'Deterministic auto-merge gate');
@@ -203,7 +236,9 @@ function runGateStep({ acceptMethods, allowedMergeMethods, headPusher = 'dependa
         GH_TOKEN: 'x',
         REPO: 'octocat/repo',
         PR_NUMBER: '1',
-        HEAD_BRANCH: 'dependabot/github_actions/actions-minor-patch-a',
+        HEAD_BRANCH: headBranch,
+        ...(changedPaths ? { PR_DIFF_FIXTURE: changedPaths } : {}),
+        ...commentSurfaces(comments),
         CI_CONCLUSION: 'success',
         ALLOWED_MERGE_METHODS: allowedMergeMethods,
         HEAD_SHA: GATE_HEAD,
@@ -259,7 +294,7 @@ test('a commit someone else pushed is never armed, a person is told once, and an
     acceptMethods: 'squash,rebase',
     allowedMergeMethods: 'squash,rebase',
     headPusher: 'claude[bot]',
-    armedBy: 'github-actions[bot]',
+    armedBy: 'app/github-actions',
   });
   assert.equal(status, 0, `the gate refusing correctly is not a malfunction:\n${stdout}`);
   assert.ok(!ghCalls.some((c) => c.startsWith('pr merge') && c.includes('--auto')), 'never armed');
@@ -274,7 +309,7 @@ test('a head that moved after CI was read is left for the next wake, silently, a
     acceptMethods: 'squash,rebase',
     allowedMergeMethods: 'squash,rebase',
     prHeadSha: 'b'.repeat(40),
-    armedBy: 'github-actions[bot]',
+    armedBy: 'app/github-actions',
   });
   assert.equal(status, 0, stdout);
   assert.match(stdout, /head_moved/);
@@ -282,6 +317,46 @@ test('a head that moved after CI was read is left for the next wake, silently, a
   assert.ok(ghCalls.some((c) => c.startsWith('pr merge') && c.includes('--disable-auto')), 'an arm on the old head is withdrawn');
   assert.equal(ghCalls.filter((c) => c.startsWith('pr comment')).length, 0, 'the next CI run decides; nobody is paged');
 });
+
+// ---- whose verdict counts, END TO END --------------------------------------
+//
+// The gate trusts one identity, and the step decides which spelling of it the
+// gate sees. So this runs the real step against both of GitHub's comment
+// surfaces at once: whichever the step reads, the review's verdict must arm a
+// singleton and nobody else's may.
+
+const SINGLETON_BUMP = { headBranch: 'dependabot/npm_and_yarn/ioredis-6.0.0', changedPaths: 'package.json\npackage-lock.json' };
+const MERGE_V1 = '## Review\n<!-- AUTOMERGE-DECISION-V1 -->\n{"recommendation":"merge","our_usage_affected":false,"reason":"no use of removed APIs","breaking_changes_enumerated":[]}\n<!-- /AUTOMERGE-DECISION-V1 -->';
+
+test("the review's verdict arms a singleton", () => {
+  const { status, stdout, ghCalls } = runGateStep({
+    acceptMethods: 'squash,rebase',
+    allowedMergeMethods: 'squash,rebase',
+    ...SINGLETON_BUMP,
+    comments: [{ ...REVIEW, createdAt: '2026-10-03T12:00:00Z', body: MERGE_V1 }],
+  });
+  assert.equal(status, 0, stdout);
+  assert.match(stdout, /^decision=merge$/m, stdout);
+  assert.ok(ghCalls.some((c) => c.startsWith('pr merge') && c.includes('--auto')), 'armed');
+});
+
+for (const [who, note] of [
+  [{ login: 'github-actions', type: 'User' }, 'a person holding the bare login gh prints for the review'],
+  [{ login: 'claude', type: 'Bot' }, "the Claude App, which an adopter's own @claude workflow posts as"],
+  [{ login: 'octocat', type: 'User' }, 'anyone else'],
+]) {
+  test(`the same verdict posted by ${who.login} (${who.type}) arms nothing: ${note}`, () => {
+    const { status, stdout, ghCalls } = runGateStep({
+      acceptMethods: 'squash,rebase',
+      allowedMergeMethods: 'squash,rebase',
+      ...SINGLETON_BUMP,
+      comments: [{ ...who, createdAt: '2026-10-03T12:00:00Z', body: MERGE_V1 }],
+    });
+    assert.equal(status, 0, stdout);
+    assert.match(stdout, /^code=verdict_missing$/m, stdout);
+    assert.ok(!ghCalls.some((c) => c.startsWith('pr merge') && c.includes('--auto')), 'never armed');
+  });
+}
 
 // ---- who pushed the commit under review, RESOLVED ---------------------------
 //
@@ -399,23 +474,16 @@ test('when every ranked method is refused, one escalation carries them all', () 
 
 const ASSERT_GH_STUB = `#!/usr/bin/env bash
 printf '%s\\n' "$*" >> "$GH_LOG"
+${GH_COMMENTS_SH}
 case "$1 $2" in
   "pr view")
-    # The step asks twice: once for headRefName+state, once for comments with a
-    # --jq filter. Dispatch on which fields were requested.
+    # Dispatch on which fields were requested: headRefName+state, or comments.
     for a in "$@"; do
       case "$a" in
         *headRefName*) echo "{\\"headRefName\\":\\"$HEAD_BRANCH\\",\\"state\\":\\"$PR_STATE\\"}"; exit 0 ;;
       esac
     done
-    # Comments: run the step's own --jq expression over canned data with real jq.
-    expr=""
-    prev=""
-    for a in "$@"; do
-      [ "$prev" = "--jq" ] && expr="$a"
-      prev="$a"
-    done
-    printf '%s' "$PR_COMMENTS_JSON" | jq -r "$expr"
+    jq -nc --argjson comments "\${GH_VIEW_COMMENTS:-[]}" '{comments: $comments}' | jq -rc "$(jq_arg "$@")"
     exit 0 ;;
   "pr diff") echo "package.json" ;;
   *) exit 0 ;;
@@ -458,7 +526,7 @@ function runAssertStep({ prState, headBranch, comments, since }) {
         PR_NUMBER: '1',
         PR_STATE: prState,
         HEAD_BRANCH: headBranch,
-        PR_COMMENTS_JSON: JSON.stringify({ comments }),
+        ...commentSurfaces(comments),
         SINCE: since,
         EXEC_FILE: '',
       },
@@ -479,7 +547,7 @@ test('assertion: a verdict posted by THIS run satisfies it', () => {
   const { status, stdout, ghCalls } = runAssertStep({
     prState: 'OPEN',
     headBranch: SINGLETON,
-    comments: [{ createdAt: '2026-08-10T06:05:00Z', body: `## Review\n${V1}` }],
+    comments: [{ ...REVIEW, createdAt: '2026-08-10T06:05:00Z', body: `## Review\n${V1}` }],
     since: RUN_START,
   });
   assert.equal(status, 0, `a fresh verdict must pass:\n${stdout}`);
@@ -492,13 +560,29 @@ test('assertion: a STALE verdict from an earlier review does NOT satisfy it', ()
   const { status, stdout, ghCalls } = runAssertStep({
     prState: 'OPEN',
     headBranch: SINGLETON,
-    comments: [{ createdAt: '2026-08-10T04:53:52Z', body: `## Review\n${V1}` }],
+    comments: [{ ...REVIEW, createdAt: '2026-08-10T04:53:52Z', body: `## Review\n${V1}` }],
     since: RUN_START,
   });
   assert.notEqual(status, 0, 'a review that delivered nothing must go red');
-  assert.match(stdout, /No AUTOMERGE-DECISION-V1 comment posted during this run/);
+  assert.match(stdout, /No decision comment the gate trusts .* was posted during this run/);
   assert.ok(ghCalls.some((c) => c.includes('needs-human-review')), 'it must label so a human sees it');
 });
+
+for (const [who, note] of [
+  [{ login: 'claude', type: 'Bot' }, 'the review posted under the wrong identity'],
+  [{ login: 'github-actions', type: 'User' }, 'a person holding the bare login'],
+]) {
+  test(`assertion: a verdict from ${who.login} (${who.type}) is no deliverable, because the gate ignores it: ${note}`, () => {
+    const { status, stdout, ghCalls } = runAssertStep({
+      prState: 'OPEN',
+      headBranch: SINGLETON,
+      comments: [{ ...who, createdAt: '2026-08-10T06:05:00Z', body: `## Review\n${V1}` }],
+      since: RUN_START,
+    });
+    assert.notEqual(status, 0, `a verdict nobody will act on must go red:\n${stdout}`);
+    assert.ok(ghCalls.some((c) => c.includes('needs-human-review')), 'and a person must hear of it');
+  });
+}
 
 test('assertion: a CLOSED PR is owed no verdict, and pages nobody', () => {
   // gate.cjs refuses a closed PR with `pr_not_open` and the auto-merge job keeps
@@ -782,7 +866,7 @@ test('assertion: a verdict that reports on CI goes red — and pages nobody', ()
   const { status, stdout, ghCalls } = runAssertStep({
     prState: 'OPEN',
     headBranch: SINGLETON,
-    comments: [{ createdAt: '2026-08-10T06:05:00Z', body: LEAKED_V1 }],
+    comments: [{ ...REVIEW, createdAt: '2026-08-10T06:05:00Z', body: LEAKED_V1 }],
     since: RUN_START,
   });
   assert.notEqual(status, 0, 'a guard that stopped guarding must be visible');
@@ -799,7 +883,7 @@ test('assertion: a clean verdict passes the lint and says so', () => {
   const { status, stdout } = runAssertStep({
     prState: 'OPEN',
     headBranch: SINGLETON,
-    comments: [{ createdAt: '2026-08-10T06:05:00Z', body: CLEAN_V1 }],
+    comments: [{ ...REVIEW, createdAt: '2026-08-10T06:05:00Z', body: CLEAN_V1 }],
     since: RUN_START,
   });
   assert.equal(status, 0, `a clean verdict must pass:\n${stdout}`);
@@ -815,8 +899,8 @@ test('assertion: only the V1 comment is the deliverable — other comments in th
     prState: 'OPEN',
     headBranch: SINGLETON,
     comments: [
-      { createdAt: '2026-08-10T06:04:00Z', body: 'I could not read the CI status on this PR either — taking a look.' },
-      { createdAt: '2026-08-10T06:05:00Z', body: CLEAN_V1 },
+      { login: 'octocat', type: 'User', createdAt: '2026-08-10T06:04:00Z', body: 'I could not read the CI status on this PR either — taking a look.' },
+      { ...REVIEW, createdAt: '2026-08-10T06:05:00Z', body: CLEAN_V1 },
     ],
     since: RUN_START,
   });

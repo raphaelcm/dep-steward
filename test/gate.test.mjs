@@ -97,12 +97,14 @@ const VALID_DECISION = {
   ],
 };
 
-// Default author is `app/github-actions`: the review step posts with its job's
-// GITHUB_TOKEN, and that is how `gh pr view --json comments` names it. Other
-// forms are exercised in dedicated tests below.
+// Default author is `github-actions[bot]`: the review step posts with its job's
+// GITHUB_TOKEN, and the workflow reads comments from the REST API, which names
+// that identity so. (`gh pr view --json comments` prints the bare login
+// `github-actions`, which a person could hold, so the workflow does not use it.)
+// Other forms are exercised in dedicated tests below.
 function commentJson(opts = {}) {
   return {
-    author: { login: opts.author ?? 'app/github-actions', is_bot: true },
+    author: { login: opts.author ?? 'github-actions[bot]' },
     body: opts.body ?? '',
     createdAt: opts.createdAt ?? '2026-05-27T12:00:00Z',
   };
@@ -263,24 +265,21 @@ test('uses the latest V1 block when multiple comments contain one (LLM may post 
   assert.equal(runGate({ ...OK_SINGLETON, PR_COMMENTS_JSON: JSON.stringify([older, newer]) }).decision, 'merge');
 });
 
-for (const [author, note] of [
-  ['app/github-actions', 'gh-CLI form: the review posts with its job\'s GITHUB_TOKEN'],
-  ['github-actions[bot]', 'event-payload form for the same'],
-]) {
-  test(`accepts trusted-author form ${author} (${note})`, () => {
-    const { decision } = runGate({
-      ...OK_SINGLETON,
-      PR_COMMENTS_JSON: JSON.stringify([decisionComment(VALID_DECISION, { author })]),
-    });
-    assert.equal(decision, 'merge');
+test('accepts a verdict from the review: its GITHUB_TOKEN, as the REST API names it', () => {
+  const { decision } = runGate({
+    ...OK_SINGLETON,
+    PR_COMMENTS_JSON: JSON.stringify([decisionComment(VALID_DECISION, { author: 'github-actions[bot]' })]),
   });
-}
+  assert.equal(decision, 'merge');
+});
 
-for (const author of ['claude', 'claude[bot]']) {
-  test(`ignores a verdict posted as ${author}: the review no longer posts as the Claude App`, () => {
-    // No agent here holds the Claude App's token any more, and an adopter's
-    // own @claude workflow posts as that App too, so its blocks are not the
-    // review's vote.
+for (const [author, note] of [
+  ['github-actions', 'the bare login gh prints for a comment, which a person could register'],
+  ['app/github-actions', 'how gh spells a PR author or an auto-merge armer, never a comment author'],
+  ['claude', 'a person\'s account, and how gh prints the Claude App on a comment'],
+  ['claude[bot]', 'the Claude App, which an adopter\'s own @claude workflow posts as'],
+]) {
+  test(`ignores a verdict posted as ${author} (${note})`, () => {
     const { decision, code } = runGate({
       ...OK_SINGLETON,
       PR_COMMENTS_JSON: JSON.stringify([decisionComment(VALID_DECISION, { author })]),
@@ -289,6 +288,39 @@ for (const author of ['claude', 'claude[bot]']) {
     assert.equal(code, 'verdict_missing');
   });
 }
+
+// Verdicts mode (GATE_MODE=verdicts): the review job's deliverable check asks
+// the gate which decision comments it would trust, so the two cannot disagree
+// about whose verdict counts.
+function verdictsGate(comments, since = '') {
+  return execFileSync('node', [GATE], {
+    env: { ...process.env, GATE_MODE: 'verdicts', PR_COMMENTS_JSON: JSON.stringify(comments), SINCE: since },
+    encoding: 'utf8',
+  });
+}
+
+test('verdicts: prints the trusted decision comments posted since SINCE, and nothing else', () => {
+  const mine = decisionComment(VALID_DECISION, { createdAt: '2026-05-27T12:05:00Z', preamble: 'this run' });
+  const out = verdictsGate([
+    decisionComment(VALID_DECISION, { createdAt: '2026-05-27T11:00:00Z', preamble: 'an earlier run' }),
+    decisionComment(VALID_DECISION, { createdAt: '2026-05-27T12:01:00Z', author: 'github-actions', preamble: 'a person' }),
+    commentJson({ createdAt: '2026-05-27T12:02:00Z', body: 'the gate\'s stuck-PR notice, no block' }),
+    mine,
+  ], '2026-05-27T12:00:00Z');
+  assert.equal(out, mine.body);
+});
+
+test('verdicts: no trusted comment prints nothing', () => {
+  assert.equal(verdictsGate([decisionComment(VALID_DECISION, { author: 'claude[bot]' })]), '');
+  assert.equal(verdictsGate([]), '');
+});
+
+test('verdicts: comments it cannot read fail loudly instead of reading as none', () => {
+  assert.throws(
+    () => execFileSync('node', [GATE], { env: { ...process.env, GATE_MODE: 'verdicts', PR_COMMENTS_JSON: '{not json' }, stdio: 'pipe' }),
+    /not valid JSON/,
+  );
+});
 
 // ---- Multi-ecosystem: the whitelist + group prefixes cover every configured ecosystem ----
 

@@ -57,6 +57,8 @@ const SINGLETON = 'dependabot/npm_and_yarn/ioredis-6.0.0';
 const REVIEW_STARTED = '2026-09-23T10:00:00Z';
 const POSTED_AT = '2026-09-23T10:03:00Z';
 
+const WORKFLOW_TOKEN = 'ghs_workflowTokenOfThisRun0000001';
+
 // A verdict that reports on CI (the reviewer never sees CI), and the same
 // verdict without that clause.
 const CI_REPORTING_VERDICT = `## Dependabot review — ESCALATE
@@ -75,25 +77,34 @@ const CLEAN_VERDICT = `## Dependabot review — ESCALATE
 <!-- /AUTOMERGE-DECISION-V1 -->`;
 
 // Every gh call the review job makes, answered from canned documents through
-// the step's own `--jq` with real jq. Comments come from a file the simulated
-// agent appends to when it posts.
+// the step's own `--jq` with real jq (strings raw, anything else compact JSON,
+// as gh prints them). Comments live in a file, in the REST API's shape, which
+// the simulated agent appends to when it posts; `gh pr view --json comments`
+// prints the same comments with the bare login, as gh does.
 const GH_STUB = `#!/usr/bin/env bash
 printf '%s\\n' "$*" >> "$GH_LOG"
 flag() { local want="$1" prev='' a; shift; for a in "$@"; do if [ "$prev" = "$want" ]; then printf '%s' "$a"; return; fi; prev="$a"; done; }
-case "$1 $2" in
-  "pr view")
-    case "$(flag --json "$@")" in
-      author) doc='{"author":{"login":"app/dependabot"}}' ;;
-      headRefName,state) doc="{\\"headRefName\\":\\"$HEAD_BRANCH\\",\\"state\\":\\"OPEN\\"}" ;;
-      comments) doc=$(cat "$PR_COMMENTS_FILE") ;;
-      *) echo "gh stub: no canned answer for: $*" >&2; exit 1 ;;
-    esac ;;
-  "pr diff") echo package.json; exit 0 ;;
-  "pr edit") exit 0 ;;
-  *) echo "gh stub: unexpected call: $*" >&2; exit 1 ;;
-esac
+if [ "$1" = api ]; then
+  case "$*" in
+    *repos/octocat/repo/issues/1/comments*) doc=$(cat "$PR_COMMENTS_FILE") ;;
+    *) echo "gh stub: unexpected call: $*" >&2; exit 1 ;;
+  esac
+else
+  case "$1 $2" in
+    "pr view")
+      case "$(flag --json "$@")" in
+        author) doc='{"author":{"is_bot":true,"login":"app/dependabot"}}' ;;
+        headRefName,state) doc="{\\"headRefName\\":\\"$HEAD_BRANCH\\",\\"state\\":\\"OPEN\\"}" ;;
+        comments) doc=$(jq -c '{comments: [.[] | {author: {login: (.user.login | rtrimstr("[bot]"))}, body, createdAt: .created_at}]}' "$PR_COMMENTS_FILE") ;;
+        *) echo "gh stub: no canned answer for: $*" >&2; exit 1 ;;
+      esac ;;
+    "pr diff") echo package.json; exit 0 ;;
+    "pr edit") exit 0 ;;
+    *) echo "gh stub: unexpected call: $*" >&2; exit 1 ;;
+  esac
+fi
 expr=$(flag --jq "$@")
-if [ -n "$expr" ]; then printf '%s' "$doc" | jq -r "$expr"; else printf '%s\\n' "$doc"; fi
+if [ -n "$expr" ]; then printf '%s' "$doc" | jq -rc "$expr"; else printf '%s\\n' "$doc"; fi
 `;
 
 // GNU date's `-d` does not exist on BSD/macOS, and the instant is not under test.
@@ -120,7 +131,7 @@ async function runReview({ drafts, runnerTemp: sharedTemp }) {
   }
   const ran = join(root, 'ran');
   const commentsFile = join(root, 'comments.json');
-  writeFileSync(commentsFile, JSON.stringify({ comments: [] }));
+  writeFileSync(commentsFile, '[]');
   writeFileSync(join(bin, 'gh'), GH_STUB, { mode: 0o755 });
   writeFileSync(join(bin, 'date'), DATE_STUB, { mode: 0o755 });
   const ghLog = join(bin, 'gh.log');
@@ -163,8 +174,15 @@ async function runReview({ drafts, runnerTemp: sharedTemp }) {
         });
         hookRuns.push({ status: h.status, stderr: h.stderr });
         if (h.status === 2) continue; // refused: the agent rewrites the draft and tries again
+        // claude-code-action posts with the token its `github_token` input
+        // provides, and without one mints the Claude App's (setupGitHubToken),
+        // so the comment is github-actions' only when the step hands it this
+        // job's GITHUB_TOKEN.
+        const poster = w.github_token === WORKFLOW_TOKEN
+          ? { login: 'github-actions[bot]', type: 'Bot' }
+          : { login: 'claude[bot]', type: 'Bot' };
         const doc = JSON.parse(readFileSync(commentsFile, 'utf8'));
-        doc.comments.push({ createdAt: POSTED_AT, body: draft });
+        doc.push({ user: poster, body: draft, created_at: POSTED_AT });
         writeFileSync(commentsFile, JSON.stringify(doc));
       }
       return { exitCode: 0, outputs: { execution_file: '' } };
@@ -181,7 +199,7 @@ async function runReview({ drafts, runnerTemp: sharedTemp }) {
         sender: { login: 'dependabot[bot]', type: 'Bot' },
       },
     },
-    secrets: { GITHUB_TOKEN: 'ghs_workflowTokenOfThisRun0000001', CLAUDE_CODE_OAUTH_TOKEN: 'sk-ant-oat01-test' },
+    secrets: { GITHUB_TOKEN: WORKFLOW_TOKEN, CLAUDE_CODE_OAUTH_TOKEN: 'sk-ant-oat01-test' },
     uses,
     cwd: work,
     env: runnerEnv,

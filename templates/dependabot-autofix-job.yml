@@ -172,12 +172,11 @@
           # file but Claude Code's protected ones (.git, .claude, shell rc
           # files), in the checkout or outside it. The bounds check runs after
           # it. A bounds script it rewrote would decide what is pushed, and
-          # would run with what that step holds: GITHUB_TOKEN, and this job's
-          # OIDC token, which buys a Claude App token. So the bounds step reads
-          # only these copies, which are read-only, and the fixer has no shell
-          # to change that. They come from the workflow's own commit (the
-          # default branch's, as the gate's do), not the PR head, which on a
-          # branch cut before the install has neither file.
+          # would run with what that step holds: GITHUB_TOKEN. So the bounds
+          # step reads only these copies, which are read-only, and the fixer
+          # has no shell to change that. They come from the workflow's own
+          # commit (the default branch's, as the gate's do), not the PR head,
+          # which on a branch cut before the install has neither file.
           #
           # A runner that keeps its temp directory between jobs (self-hosted)
           # can still hold the last job's read-only copies.
@@ -401,9 +400,9 @@
     # for a push made with GITHUB_TOKEN, so a fix pushed that way sat with no CI
     # run and no merge-gate wake-up until a person pushed to the branch
     # (Runsense-ai/runsense#2693: nine days). A push made with a GitHub App's
-    # installation token does start them, and one App is already on every repo
-    # this pipeline runs in: the Claude Code GitHub App, which both agent jobs
-    # need. So the fix is pushed as that App, with a token from the same OIDC
+    # installation token does start them, and the installer asks for one App
+    # on every repo this pipeline runs in: the Claude Code GitHub App. So the
+    # fix is pushed as that App, with a token from the same OIDC
     # exchange claude-code-action performs (its src/github/token.ts; Anthropic's
     # own CI auto-fix example relies on it on workflow_run). Nothing to set up.
     needs: autofix

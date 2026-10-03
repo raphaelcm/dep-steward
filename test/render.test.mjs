@@ -201,8 +201,8 @@ test('the deliverable assertion re-runs the same lint over what was posted', () 
   // hook that silently stopped firing. A refusal here is red WITHOUT a label —
   // the verdict is valid; dep-steward's own guard is what broke.
   assert.match(wf, /REVIEW_LINT_MODE=body REVIEW_BODY="\$V1_BODIES" node "\$RUNNER_TEMP\/dep-steward\/review-lint\.cjs"/);
-  assert.match(wf, /select\(\.body \| contains\("<!-- AUTOMERGE-DECISION-V1 -->"\)\)/,
-    'only V1-bearing comments are the deliverable — the gate\'s own notices share that window');
+  assert.match(wf, /V1_BODIES=\$\(PR_COMMENTS_JSON="\$PR_COMMENTS_JSON" GATE_MODE=verdicts node "\$RUNNER_TEMP\/dep-steward\/gate\.cjs"\)/,
+    'the gate says which comments are the deliverable, so the two agree on whose verdict counts');
   const assertStep = wf.slice(wf.indexOf('Assert the review deliverable exists'), wf.indexOf('\n  autofix:'));
   assert.match(assertStep, /::error::The review comment on PR #\$PR_NUMBER reports on evidence outside/);
   assert.doesNotMatch(assertStep.slice(assertStep.indexOf('passes the prose lint') - 1200, assertStep.indexOf('passes the prose lint')), /add-label/,
@@ -413,7 +413,7 @@ test('the stuck notice fires once per PR, not once per wake-up', () => {
   const gateStep = wf.slice(wf.indexOf('Deterministic auto-merge gate'));
   // Without the label check a stuck PR collects one comment per CI run forever,
   // which is how a notification channel gets muted.
-  assert.match(gateStep, /--json state,headRefOid,author,comments,labels/, 'labels must ride along on the existing query');
+  assert.match(gateStep, /--json state,headRefOid,author,labels/, 'labels must ride along on the existing query');
   assert.match(gateStep, /grep -qxF 'needs-human-review' <<<"\$PR_LABELS"/);
 });
 
