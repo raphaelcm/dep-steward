@@ -48,7 +48,10 @@ function render(extraArgs = []) {
     [join(REPO, 'install.sh'), '--render-only', '--out', out, '--ci-name', 'CI', '--assignee', 'octocat', ...extraArgs],
     { cwd: fakeRepo, env: { ...process.env, DEP_STEWARD_SRC: REPO }, stdio: 'pipe' },
   );
-  return readFileSync(join(out, '.github/workflows/dependabot-review.yml'), 'utf8');
+  // Both workflows the installer writes; their run blocks are parsed alike.
+  return ['dependabot-review.yml', 'dependabot-automerge.yml']
+    .map((f) => readFileSync(join(out, '.github/workflows', f), 'utf8'))
+    .join('\n');
 }
 
 // Pull every `run: |` block out of the workflow, with the step name that owns it
@@ -173,7 +176,7 @@ const GATE_HEAD = '9ee40cf2a1b3c4d5e6f708192a3b4c5d6e7f8091';
 
 function runGateStep({ acceptMethods, allowedMergeMethods, headPusher = 'dependabot[bot]', prHeadSha = GATE_HEAD, armedBy = 'none' }) {
   const out = renderTo();
-  const workflow = readFileSync(join(out, '.github/workflows/dependabot-review.yml'), 'utf8');
+  const workflow = readFileSync(join(out, '.github/workflows/dependabot-automerge.yml'), 'utf8');
   const block = runBlocks(workflow).find((b) => b.stepName === 'Deterministic auto-merge gate');
   assert.ok(block, 'the auto-merge gate step must exist — the rest of this test is vacuous without it');
 
@@ -304,7 +307,7 @@ echo "gh stub: unexpected call: $*" >&2; exit 1
 
 function runResolveCiStep(runs) {
   const out = renderTo();
-  const workflow = readFileSync(join(out, '.github/workflows/dependabot-review.yml'), 'utf8');
+  const workflow = readFileSync(join(out, '.github/workflows/dependabot-automerge.yml'), 'utf8');
   const block = runBlocks(workflow).find((b) => b.stepName.startsWith('Resolve CI conclusion'));
   assert.ok(block, 'the CI-resolve step must exist');
   const bin = mkdtempSync(join(tmpdir(), 'ds-ci-'));

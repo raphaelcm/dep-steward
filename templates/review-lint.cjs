@@ -16,6 +16,13 @@
  * prompt listed CI as a merge condition) is fixed in the prompt; this file is
  * the guard that does not depend on the model.
  *
+ * Two roles. The reviewer (default) is held to the evidence contract below.
+ * The fixer (REVIEW_LINT_ROLE=fixer, autofix's hook) is held to one thing: its
+ * posts may not carry an AUTOMERGE-DECISION-V1 block. Both agents post as
+ * github-actions[bot], the identity whose blocks the gate trusts, and only the
+ * review may cast that vote; reading CI is the fixer's job, so the evidence
+ * rule does not apply to it.
+ *
  * Two modes, ONE rule (`lint`), so they can never disagree:
  *
  *   hook  (default) — a Claude Code PreToolUse hook on the Bash tool; the hook
@@ -72,7 +79,9 @@ const path = require('path');
 
 const V1_OPEN = '<!-- AUTOMERGE-DECISION-V1 -->';
 const V1_CLOSE = '<!-- /AUTOMERGE-DECISION-V1 -->';
-const PRESCRIBED_POST = 'gh pr comment <n> --body-file .dep-steward-review.md';
+const FIXER = process.env.REVIEW_LINT_ROLE === 'fixer';
+const DRAFT = FIXER ? '.dep-steward-autofix-comment.md' : '.dep-steward-review.md';
+const PRESCRIBED_POST = `gh pr comment <n> --body-file ${DRAFT}`;
 
 // ---- the rule -------------------------------------------------------------
 
@@ -340,12 +349,22 @@ function findPosts(command) {
 
 function refuse(reason) {
   process.stderr.write(
-    `dep-steward review-lint refused this comment: ${reason}\n` +
-      "The review's complete evidence is the PR diff, the upstream changelog, and this repository's source, and the verdict answers one question: does a documented change reach our usage? " +
-      'Remove that clause (or blockquote it if it is a quotation from upstream) — from the decision block\'s "reason" too — then rewrite .dep-steward-review.md and post it again with: ' +
-      `${PRESCRIBED_POST}\n`,
+    FIXER
+      ? `dep-steward refused this comment: ${reason}\n` +
+          'The merge decision is the review\'s, and only the review may post an AUTOMERGE-DECISION-V1 block. ' +
+          `Remove it, rewrite ${DRAFT} and post it again with: ${PRESCRIBED_POST}\n`
+      : `dep-steward review-lint refused this comment: ${reason}\n` +
+          "The review's complete evidence is the PR diff, the upstream changelog, and this repository's source, and the verdict answers one question: does a documented change reach our usage? " +
+          'Remove that clause (or blockquote it if it is a quotation from upstream) — from the decision block\'s "reason" too — then rewrite .dep-steward-review.md and post it again with: ' +
+          `${PRESCRIBED_POST}\n`,
   );
   process.exit(2);
+}
+
+// The fixer's one rule. Any mention of the marker counts, not only a
+// well-formed block: the gate reads the marker, so the guard must too.
+function castsVerdict(body) {
+  return /AUTOMERGE-DECISION-V1/.test(body) ? 'it carries an AUTOMERGE-DECISION-V1 block' : null;
 }
 
 function hookMode() {
@@ -358,7 +377,7 @@ function hookMode() {
   if (!input || input.tool_name !== 'Bash') return process.exit(0);
   for (const post of findPosts(input.tool_input && input.tool_input.command)) {
     if (post.unlintable) {
-      return refuse(`${post.unlintable}, so it cannot be read before it is posted. Write the body to .dep-steward-review.md and post it with: ${PRESCRIBED_POST}`);
+      return refuse(`${post.unlintable}, so it cannot be read before it is posted. Write the body to ${DRAFT} and post it with: ${PRESCRIBED_POST}`);
     }
     let body;
     if (post.file !== undefined) {
@@ -370,6 +389,11 @@ function hookMode() {
       }
     } else {
       body = post.text;
+    }
+    if (FIXER) {
+      const vote = castsVerdict(body);
+      if (vote) return refuse(vote);
+      continue;
     }
     const finding = lint(body);
     if (finding) return refuse(explain(finding));

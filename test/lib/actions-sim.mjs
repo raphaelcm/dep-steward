@@ -217,7 +217,7 @@ function property(obj, key) {
   return found === undefined ? null : obj[found] ?? null;
 }
 
-const CONTEXTS = new Set(['github', 'env', 'steps', 'secrets', 'inputs', 'vars', 'job', 'runner']);
+const CONTEXTS = new Set(['github', 'env', 'steps', 'secrets', 'inputs', 'vars', 'job', 'runner', 'needs']);
 
 export function evaluate(expression, ctx) {
   const whole = /^\s*\$\{\{([\s\S]*)\}\}\s*$/.exec(expression);
@@ -383,16 +383,20 @@ const STEP_KEYS = new Set(['name', 'id', 'if', 'uses', 'with', 'env', 'run', 'co
  * ({exitCode, outputs, output})`; `env` is the process environment every
  * `run:` block starts from (PATH with stubs, git isolation, ...).
  *
+ * `needs` is the `needs` context: `{ <job>: { outputs, result } }`, as a later
+ * job sees an earlier one.
+ *
  * Returns every step with what it saw and did, so a test can assert on
- * skipped steps, on the exact env a step was given, and on the job result.
+ * skipped steps, on the exact env a step was given, and on the job result,
+ * plus the job's `outputs:` evaluated after its steps ran.
  */
-export async function runJob(jobs, jobName, { github, secrets = {}, uses = {}, cwd, env = process.env }) {
+export async function runJob(jobs, jobName, { github, secrets = {}, uses = {}, cwd, env = process.env, needs = {} }) {
   const job = jobs[jobName];
   if (!job) throw new Error(`no job "${jobName}"`);
   const scratch = mkdtempSync(join(tmpdir(), 'ds-sim-'));
-  const ctx = { github, secrets, env: {}, steps: {}, inputs: {}, vars: {}, job: {}, runner: {}, jobFailed: false };
+  const ctx = { github, secrets, env: {}, steps: {}, inputs: {}, vars: {}, job: {}, runner: {}, needs, jobFailed: false };
 
-  if (!conditionHolds(job.if, ctx)) return { skipped: true, steps: [], failed: false, jobEnv: {} };
+  if (!conditionHolds(job.if, ctx)) return { skipped: true, steps: [], failed: false, jobEnv: {}, outputs: {} };
   for (const [k, v] of Object.entries(job.env ?? {})) ctx.env[k] = interpolate(v, ctx);
 
   const steps = [];
@@ -460,5 +464,7 @@ export async function runJob(jobs, jobName, { github, secrets = {}, uses = {}, c
     ctx.steps[id] = { outputs, outcome, conclusion };
     if (conclusion === 'failure') ctx.jobFailed = true;
   }
-  return { skipped: false, steps, failed: ctx.jobFailed, jobEnv: ctx.env };
+  const outputs = {};
+  for (const [k, v] of Object.entries(job.outputs ?? {})) outputs[k] = String(interpolate(v, ctx) ?? '');
+  return { skipped: false, steps, failed: ctx.jobFailed, jobEnv: ctx.env, outputs };
 }

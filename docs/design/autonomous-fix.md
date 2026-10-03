@@ -75,11 +75,23 @@ the one App every install already has:
 - The human still authorizes every merge. The gate still refuses any PR that
   touches source, and an autofixed PR always does.
 
+### Update (2026-10-03): no agent holds a token that can push or merge
+
+The fixer reads attacker-influenced text, so whatever its job's token can do, a
+turned fixer can do. Its job therefore grants no `contents: write` and no
+`id-token`, and hands over only a patch. A separate push job, which runs no
+agent, checks that patch again before pushing it: it applies to the commit the
+fixer saw, it passes the default branch's bounds check, and the one-push rule
+still holds. The reviewer likewise runs on its job's token, which can comment
+and not push, and the gate moved to its own workflow, woken when CI or the
+review finishes.
+
 Everything from §4 onward is **D** and is **not being built now** — preserved as
 the deferred design for if a central GitHub App is ever added and we choose to
 remove the human.
 
 ---
+
 
 ## 1. Outcome — why this exists
 

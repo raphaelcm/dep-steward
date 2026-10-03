@@ -92,3 +92,32 @@ test('the parser refuses a step key it does not simulate, rather than ignoring i
 `));
   return assert.rejects(runJob(jobs, 'j', { github, cwd }), /key "shell" is not simulated/);
 });
+
+test('a job\'s outputs are evaluated from its steps after they run, and a later job reads them through needs', async () => {
+  // The autofix push runs in its own job, after the agent's; it receives only
+  // what the agent job's `outputs:` hands it, through `needs`.
+  const jobs = parseJobs(`jobs:
+  first:
+    outputs:
+      decision: \${{ steps.decide.outputs.decision }}
+    steps:
+      - id: decide
+        run: echo "decision=push" >> "$GITHUB_OUTPUT"
+  second:
+    needs: first
+    if: needs.first.outputs.decision == 'push'
+    steps:
+      - id: act
+        env:
+          DECISION: \${{ needs.first.outputs.decision }}
+        run: echo "saw=$DECISION" >> "$GITHUB_OUTPUT"
+`);
+  const cwd = mkdtempSync(join(tmpdir(), 'ds-sim-needs-'));
+  const first = await runJob(jobs, 'first', { github: {}, cwd });
+  assert.deepEqual(first.outputs, { decision: 'push' });
+  const second = await runJob(jobs, 'second', { github: {}, cwd, needs: { first: { outputs: first.outputs, result: 'success' } } });
+  assert.equal(second.skipped, false);
+  assert.equal(second.steps[0].outputs.saw, 'push');
+  const skipped = await runJob(jobs, 'second', { github: {}, cwd, needs: { first: { outputs: {}, result: 'success' } } });
+  assert.equal(skipped.skipped, true, 'an empty decision skips the job');
+});

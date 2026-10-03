@@ -43,6 +43,7 @@ const FILES = [
   '.github/dependabot.yml',
   '.github/dependabot-review-prompt.md',
   WORKFLOW,
+  '.github/workflows/dependabot-automerge.yml',
   '.github/dependabot-automerge/gate.cjs',
   '.github/dependabot-automerge/review-lint.cjs',
   '.github/dependabot-automerge/autofix-bounds.cjs',

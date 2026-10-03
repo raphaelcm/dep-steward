@@ -66,25 +66,22 @@ const ELIGIBLE_GROUP_PREFIXES = [
 const DEPENDABOT_AUTHORS = new Set(['app/dependabot', 'dependabot[bot]']);
 
 // Trusted commenters whose AUTOMERGE-DECISION-V1 blocks the gate will honor.
-// Multiple normalizations of two underlying identities are accepted:
+// One identity: the review workflow's GITHUB_TOKEN, which the review step
+// hands its agent, so the verdict comment is github-actions'. Both spellings
+// are accepted: `app/github-actions` from gh-CLI JSON, `github-actions[bot]`
+// from event payloads.
 //
-//   - github-actions: when the review job posts comments via `gh pr comment`
-//     using the workflow's GITHUB_TOKEN. (Both `app/github-actions` from
-//     gh-CLI JSON and `github-actions[bot]` from event payloads.)
-//   - claude / claude[bot]: when the anthropics/claude-code-action posts
-//     the LLM's comment via its own GitHub App identity. (`claude` from
-//     gh-CLI JSON and `claude[bot]` from event payloads.) This is the
-//     identity that posts in practice — the action does not use
-//     GITHUB_TOKEN for comments.
+// Not the Claude GitHub App (`claude` / `claude[bot]`): no agent in this
+// pipeline holds its token any more, and an adopter's own @claude workflow
+// posts as that App too, so its blocks are not the review's vote. The other
+// github-actions poster that reads attacker-influenced text, the autofix
+// fixer, has a hook that refuses any post carrying a V1 block.
 //
-// An external commenter (any human, any untrusted bot) including a V1 block
-// has it ignored — this prevents "post a fake decision block to force a
-// merge" attacks.
+// An external commenter (any human, any other bot) including a V1 block has
+// it ignored, which prevents "post a fake decision block to force a merge".
 const TRUSTED_DECISION_AUTHORS = new Set([
   'app/github-actions',
   'github-actions[bot]',
-  'claude',
-  'claude[bot]',
 ]);
 
 const V1_OPEN = '<!-- AUTOMERGE-DECISION-V1 -->';

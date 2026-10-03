@@ -25,6 +25,9 @@ const FILES = [
   '.github/dependabot.yml',
   '.github/dependabot-review-prompt.md',
   '.github/workflows/dependabot-review.yml',
+  // The gate's own workflow: it runs no agent, and it is the only thing that
+  // merges.
+  '.github/workflows/dependabot-automerge.yml',
   '.github/dependabot-automerge/gate.cjs',
   // The reviewer's prose lint ships on every install, autofix or not — it is
   // the review job's guard, not the fixer's.
@@ -62,7 +65,7 @@ for (const f of FILES) {
 }
 
 test('the rendered workflow points at the relocated gate path', () => {
-  const wf = readFileSync(join(rendered, '.github/workflows/dependabot-review.yml'), 'utf8');
+  const wf = readFileSync(join(rendered, '.github/workflows/dependabot-automerge.yml'), 'utf8');
   assert.match(wf, /node \.github\/dependabot-automerge\/gate\.cjs/);
   assert.doesNotMatch(wf, /scripts\/dev\/dependabot-automerge-gate\.cjs/);
 });
@@ -119,7 +122,8 @@ test('--no-autofix removes the job, its files, and leaves no marker', () => {
   const out = renderWith(['--no-autofix']);
   const wf = readFileSync(join(out, '.github/workflows/dependabot-review.yml'), 'utf8');
   assert.doesNotMatch(wf, /^ {2}autofix:/m);
-  assert.doesNotMatch(wf, /__AUTOFIX_JOB__/);
+  assert.doesNotMatch(wf, /__AUTOFIX_JOB__|__AUTOFIX_TRIGGER__/);
+  assert.doesNotMatch(wf, /^ {2}workflow_run:/m, 'only autofix wakes on CI in this workflow, so without it nothing should');
   assert.ok(!existsSync(join(out, '.github/dependabot-automerge/autofix-bounds.cjs')));
   assert.ok(!existsSync(join(out, '.github/dependabot-autofix-prompt.md')));
   // ...but the review lint stays: turning the fixer off must not disarm the
@@ -155,11 +159,40 @@ test('the review step wires the prose lint as a PreToolUse hook, run from the co
   assert.ok(!entry.hooks[0].command.includes('${{'), 'the path must not be a GitHub expression');
 });
 
-test('the autofix step carries no settings block — the lint guards the reviewer only', () => {
+test('the fixer\'s hook refuses only a vote: the lint in its fixer role, from the copy taken before it starts', () => {
   const wf = readFileSync(join(rendered, '.github/workflows/dependabot-review.yml'), 'utf8');
   const autofixJob = wf.slice(wf.indexOf('\n  autofix:'));
-  assert.doesNotMatch(autofixJob, /settings: \|/,
-    'the fixer\'s contract IS reading CI; linting its prose for CI would be backwards');
+  // Reading CI is the fixer's contract, so the reviewer's evidence rule must not
+  // apply; but it posts as the identity the gate trusts for verdicts.
+  const block = /^\s*settings: \|\n((?:\s{12}.*\n)+)/m.exec(autofixJob);
+  assert.ok(block, 'the fixer step must carry a settings block');
+  const hook = JSON.parse(block[1].split('\n').map((l) => l.slice(12)).join('\n').trim());
+  const [entry] = hook.hooks.PreToolUse;
+  assert.equal(entry.matcher, 'Bash');
+  assert.equal(entry.hooks[0].command, 'REVIEW_LINT_ROLE=fixer node "$RUNNER_TEMP/dep-steward/review-lint.cjs"');
+  const snapshot = autofixJob.slice(0, autofixJob.indexOf('- name: Run the Claude fixer'));
+  assert.match(snapshot, /git show "\$GITHUB_SHA:\.github\/dependabot-automerge\/review-lint\.cjs" > "\$RUNNER_TEMP\/dep-steward\/review-lint\.cjs"/,
+    'the copy is taken from the default branch, before the fixer starts');
+});
+
+// ---- no agent holds a token that can push or merge --------------------------
+
+test('the review agent runs on its job\'s token, which can comment but cannot push or merge', () => {
+  const wf = readFileSync(join(rendered, '.github/workflows/dependabot-review.yml'), 'utf8');
+  const reviewJob = wf.slice(wf.indexOf('\n  review:'), wf.indexOf('\n  autofix:'));
+  assert.match(reviewJob, /^\s{10}github_token: \$\{\{ secrets\.GITHUB_TOKEN \}\}$/m,
+    'without it the action mints the Claude App token and hands it to the agent');
+  assert.doesNotMatch(reviewJob, /id-token:/, 'nothing in this job may mint a token that can push');
+});
+
+test('the gate wakes when CI or the review finishes, never on a comment', () => {
+  const gate = readFileSync(join(rendered, '.github/workflows/dependabot-automerge.yml'), 'utf8');
+  assert.match(gate, /on:\n  workflow_run:\n    workflows: \["CI", "Dependabot PR review"\]\n    types: \[completed\]\n/);
+  assert.doesNotMatch(gate, /issue_comment/);
+  const review = readFileSync(join(rendered, '.github/workflows/dependabot-review.yml'), 'utf8');
+  assert.match(review, /^name: Dependabot PR review$/m, 'the name the gate wakes on');
+  assert.doesNotMatch(review, /issue_comment/);
+  assert.doesNotMatch(review, /^ {2}auto-merge:/m, 'no job that runs an agent shares a workflow with the merge');
 });
 
 test('the deliverable assertion re-runs the same lint over what was posted', () => {
@@ -170,7 +203,7 @@ test('the deliverable assertion re-runs the same lint over what was posted', () 
   assert.match(wf, /REVIEW_LINT_MODE=body REVIEW_BODY="\$V1_BODIES" node "\$RUNNER_TEMP\/dep-steward\/review-lint\.cjs"/);
   assert.match(wf, /select\(\.body \| contains\("<!-- AUTOMERGE-DECISION-V1 -->"\)\)/,
     'only V1-bearing comments are the deliverable — the gate\'s own notices share that window');
-  const assertStep = wf.slice(wf.indexOf('Assert the review deliverable exists'), wf.indexOf('\n  auto-merge:'));
+  const assertStep = wf.slice(wf.indexOf('Assert the review deliverable exists'), wf.indexOf('\n  autofix:'));
   assert.match(assertStep, /::error::The review comment on PR #\$PR_NUMBER reports on evidence outside/);
   assert.doesNotMatch(assertStep.slice(assertStep.indexOf('passes the prose lint') - 1200, assertStep.indexOf('passes the prose lint')), /add-label/,
     'a lint failure must not page a human — the review delivered a valid verdict');
@@ -196,10 +229,11 @@ test('neither checkout persists its credential where an agent can write', () => 
   // actions/checkout keeps a persisted credential in a RUNNER_TEMP file the
   // repo's git config includes, and an agent's Write reaches RUNNER_TEMP.
   const wf = readFileSync(join(rendered, '.github/workflows/dependabot-review.yml'), 'utf8');
+  // Every checkout in the agents' workflow: the review's, autofix's, and the
+  // push job's (which brings its own credential to the push).
   const checkouts = wf.split(/\n(?=\s+- name: )/).filter((step) => /uses: actions\/checkout@/.test(step));
-  const agentJobCheckouts = checkouts.filter((step) => !/Checkout default branch/.test(step));
-  assert.equal(agentJobCheckouts.length, 2, 'the review and autofix checkouts');
-  for (const step of agentJobCheckouts) assert.match(step, /\n\s+persist-credentials: false(\n|$)/, step);
+  assert.equal(checkouts.length, 3, 'the review, autofix and autofix-push checkouts');
+  for (const step of checkouts) assert.match(step, /\n\s+persist-credentials: false(\n|$)/, step);
 });
 
 test('the rendered autofix job never merges', () => {
@@ -271,7 +305,7 @@ test('both agent jobs run the same SHA-pinned action version', () => {
 // ---- the gate arms auto-merge; it never merges imperatively ----------------
 
 test('the auto-merge job ARMS GitHub auto-merge rather than merging synchronously', () => {
-  const wf = readFileSync(join(rendered, '.github/workflows/dependabot-review.yml'), 'utf8');
+  const wf = readFileSync(join(rendered, '.github/workflows/dependabot-automerge.yml'), 'utf8');
   // A synchronous merge is a time-of-check/time-of-use race, and this job only
   // wakes on a head change or a comment, so a refusal is never retried. Arming
   // hands the timing to GitHub. Regression guard: no bare imperative merge.
@@ -283,7 +317,7 @@ test('the auto-merge job ARMS GitHub auto-merge rather than merging synchronousl
 });
 
 test('a refused merge method falls through to the next ranked one instead of paging a human', () => {
-  const wf = readFileSync(join(rendered, '.github/workflows/dependabot-review.yml'), 'utf8');
+  const wf = readFileSync(join(rendered, '.github/workflows/dependabot-automerge.yml'), 'utf8');
   // No pre-flight query can predict which method GitHub accepts — classic
   // branch protection needs admin to read, and the App-workflow-scope refusal
   // is not a repo setting at all. So the gate's RANKED list must be tried in
@@ -306,7 +340,7 @@ test('a refused merge method falls through to the next ranked one instead of pag
 });
 
 test('a later refusal DISARMS an earlier arm, and fails closed when it cannot tell', () => {
-  const wf = readFileSync(join(rendered, '.github/workflows/dependabot-review.yml'), 'utf8');
+  const wf = readFileSync(join(rendered, '.github/workflows/dependabot-automerge.yml'), 'utf8');
   // Arming is a latch and the gate re-derives on every wake, so a later `skip`
   // must revoke an earlier `merge` — otherwise a PR whose CI went red stays
   // armed to merge itself while the gate says no.
@@ -322,11 +356,11 @@ test('a later refusal DISARMS an earlier arm, and fails closed when it cannot te
 });
 
 test('every failure after the gate authorizes escalates to a human, never a silent red job', () => {
-  const wf = readFileSync(join(rendered, '.github/workflows/dependabot-review.yml'), 'utf8');
+  const wf = readFileSync(join(rendered, '.github/workflows/dependabot-automerge.yml'), 'utf8');
   // Past authorization, a failure is an EXECUTION failure, not a policy
   // decision. A merge that fails silently is indistinguishable from one that
   // never ran, which is how a green PR sits for days.
-  const gateStep = wf.slice(wf.indexOf('Deterministic auto-merge gate'), wf.indexOf('\n  autofix:'));
+  const gateStep = wf.slice(wf.indexOf('Deterministic auto-merge gate'));
   assert.match(gateStep, /escalate\(\) \{/);
   assert.match(gateStep, /--add-label needs-human-review --add-assignee octocat/);
   assert.match(gateStep, /escalate "\$\(printf 'every ranked merge method was refused/);
@@ -335,7 +369,7 @@ test('every failure after the gate authorizes escalates to a human, never a sile
 });
 
 test('the merge methods come from the repo, resolved across every layer the token can read', () => {
-  const wf = readFileSync(join(rendered, '.github/workflows/dependabot-review.yml'), 'utf8');
+  const wf = readFileSync(join(rendered, '.github/workflows/dependabot-automerge.yml'), 'utf8');
   // Three readable layers, all independent: repo settings, the `pull_request`
   // rule's allowed_merge_methods, and a `required_linear_history` rule — which
   // bans merge commits while saying nothing about allowed_merge_methods, so a
@@ -356,8 +390,8 @@ test('the merge methods come from the repo, resolved across every layer the toke
 // ---- a refusal that can never resolve reaches a human ----------------------
 
 test('a terminal refusal escalates; a transient one stays silent', () => {
-  const wf = readFileSync(join(rendered, '.github/workflows/dependabot-review.yml'), 'utf8');
-  const gateStep = wf.slice(wf.indexOf('Deterministic auto-merge gate'), wf.indexOf('\n  autofix:'));
+  const wf = readFileSync(join(rendered, '.github/workflows/dependabot-automerge.yml'), 'utf8');
+  const gateStep = wf.slice(wf.indexOf('Deterministic auto-merge gate'));
   // The gate wakes on every CI completion and every bot comment, so most
   // refusals mean "not yet" and must stay quiet. These three mean "never": the
   // gate would refuse the PR forever and tell nobody. (Dependabot does not
@@ -375,8 +409,8 @@ test('a terminal refusal escalates; a transient one stays silent', () => {
 });
 
 test('the stuck notice fires once per PR, not once per wake-up', () => {
-  const wf = readFileSync(join(rendered, '.github/workflows/dependabot-review.yml'), 'utf8');
-  const gateStep = wf.slice(wf.indexOf('Deterministic auto-merge gate'), wf.indexOf('\n  autofix:'));
+  const wf = readFileSync(join(rendered, '.github/workflows/dependabot-automerge.yml'), 'utf8');
+  const gateStep = wf.slice(wf.indexOf('Deterministic auto-merge gate'));
   // Without the label check a stuck PR collects one comment per CI run forever,
   // which is how a notification channel gets muted.
   assert.match(gateStep, /--json state,headRefOid,author,comments,labels/, 'labels must ride along on the existing query');
@@ -384,8 +418,8 @@ test('the stuck notice fires once per PR, not once per wake-up', () => {
 });
 
 test('a correct refusal notifies without reddening the job; a malfunction reddens', () => {
-  const wf = readFileSync(join(rendered, '.github/workflows/dependabot-review.yml'), 'utf8');
-  const gateStep = wf.slice(wf.indexOf('Deterministic auto-merge gate'), wf.indexOf('\n  autofix:'));
+  const wf = readFileSync(join(rendered, '.github/workflows/dependabot-automerge.yml'), 'utf8');
+  const gateStep = wf.slice(wf.indexOf('Deterministic auto-merge gate'));
   // The gate refusing is dep-steward working correctly, so it warns. Failing
   // AFTER authorizing is dep-steward malfunctioning, so it errors and exits 1.
   assert.match(gateStep, /::warning::PR #\$PR_NUMBER cannot merge without a human/);
@@ -397,8 +431,9 @@ test('autofix ON keeps ci_failed off the gate\'s list — one owner, no double-p
   // When CI goes red the autofix job and the gate wake from the SAME
   // workflow_run event and run in parallel. If both escalated you would be paged
   // about a build the fixer is already fixing.
+  const gate = readFileSync(join(rendered, '.github/workflows/dependabot-automerge.yml'), 'utf8');
   const wf = readFileSync(join(rendered, '.github/workflows/dependabot-review.yml'), 'utf8');
-  const caseArm = /case "\$CODE" in\s*\n\s*([a-z_|]+)\)/.exec(wf)?.[1] ?? '';
+  const caseArm = /case "\$CODE" in\s*\n\s*([a-z_|]+)\)/.exec(gate)?.[1] ?? '';
   assert.ok(!caseArm.split('|').includes('ci_failed'), 'with autofix on, autofix owns ci_failed');
   // ...and autofix must then actually escalate when it declines, deterministically.
   const autofixJob = wf.slice(wf.indexOf('\n  autofix:'));
@@ -409,8 +444,9 @@ test('autofix ON keeps ci_failed off the gate\'s list — one owner, no double-p
 
 test('--no-autofix moves ci_failed ONTO the gate\'s list — nothing else is watching CI', () => {
   const out = renderWith(['--no-autofix']);
+  const gate = readFileSync(join(out, '.github/workflows/dependabot-automerge.yml'), 'utf8');
   const wf = readFileSync(join(out, '.github/workflows/dependabot-review.yml'), 'utf8');
-  const caseArm = /case "\$CODE" in\s*\n\s*([a-z_|]+)\)/.exec(wf)?.[1] ?? '';
+  const caseArm = /case "\$CODE" in\s*\n\s*([a-z_|]+)\)/.exec(gate)?.[1] ?? '';
   assert.ok(caseArm.split('|').includes('ci_failed'),
     'with autofix off no job watches CI, so a red build would strand silently');
   assert.doesNotMatch(wf, /^ {2}autofix:/m);

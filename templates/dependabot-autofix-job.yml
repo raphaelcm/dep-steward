@@ -1,33 +1,27 @@
 
   autofix:
     # Option B — when CI FAILS on a Dependabot PR, a Claude agent attempts a small
-    # mechanical fix and PUSHES it to the PR branch for a human to review and
-    # merge. It NEVER merges. Safety rests on three independent things:
-    #   1. the agent's tools are allow-listed (Edit/Write/gh/grep/Read/WebFetch, no
-    #      general Bash), and nothing it writes is run: the steps after it run
-    #      only copies of this job's own files taken before it started. So
-    #      neither the PR's untrusted code nor the agent's output is EXECUTED
-    #      here, though this job holds a writable token;
-    #   2. the pushed change is bounds-limited by autofix-bounds.cjs (small,
-    #      source-only, not the bumped manifests, nothing under .github/);
-    #   3. a human authorizes every merge, so an injected "fix" can at most land a
+    # mechanical fix, and the autofix-push job below pushes it to the PR branch
+    # for a human to review and merge. Nothing here merges. Safety rests on
+    # four independent things:
+    #   1. this job, which runs the agent, holds a token that can read and
+    #      comment but cannot push or merge, and no OIDC grant, so nothing in it
+    #      can mint a token that could. It hands the push job a patch, nothing
+    #      more;
+    #   2. the agent's tools are allow-listed (Edit/Write/gh/grep/Read/WebFetch,
+    #      no general Bash), and nothing it writes is run: the steps after it
+    #      run only copies of this job's own files taken before it started;
+    #   3. the pushed change is bounds-limited by autofix-bounds.cjs (small,
+    #      source-only, not the bumped manifests, nothing under .github/), and
+    #      the push job re-checks that itself, with the default branch's copy;
+    #   4. a human authorizes every merge, so an injected "fix" can at most land a
     #      tiny reviewed source edit on a PR branch — never on your default branch.
-    # Runs on workflow_run (base context: secrets present, token writable), which
-    # also sidesteps claude-code-action's OIDC self-modification refusal.
+    # Runs on workflow_run (base context: secrets present), which also
+    # sidesteps claude-code-action's OIDC self-modification refusal.
     #
-    # WHO PUSHES decides whether CI runs on the fix. GitHub starts no workflow
-    # for a push made with GITHUB_TOKEN, so a fix pushed that way sat with no CI
-    # run and no merge-gate wake-up until a person pushed to the branch
-    # (Runsense-ai/runsense#2693: nine days). A push made with a GitHub App's
-    # installation token does start them, and one App is already on every repo
-    # this pipeline runs in: the Claude Code GitHub App, which both agent jobs
-    # need. So the fix is pushed as that App, with a token from the same OIDC
-    # exchange claude-code-action performs (its src/github/token.ts; Anthropic's
-    # own CI auto-fix example relies on it on workflow_run). Nothing to set up.
-    #
-    # That GitHub rule was also the only brake on fix, CI red, autofix, fix, and
-    # so on. An App push releases it, so the brake is explicit: one autofix push
-    # per PR (the `attempt` step).
+    # CI on a fix starts a new autofix run when it fails, so the brake is
+    # explicit: one autofix push per PR (the `attempt` step, checked again by
+    # the push job).
     if: >
       github.event_name == 'workflow_run' &&
       github.event.workflow_run.event == 'pull_request' &&
@@ -36,7 +30,11 @@
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
-      contents: write
+      # This job runs the fixer agent, so its token is what a turned fixer
+      # holds: it can read and comment, and cannot push or merge. No id-token:
+      # nothing in this job may mint the Claude App's token. The push happens
+      # in the autofix-push job, which runs no agent.
+      contents: read
       pull-requests: write
       # The prompt's first step is reading the failing CI run (`gh pr checks`,
       # then `gh run view --log-failed`) — this job fires ONLY on a CI
@@ -50,16 +48,16 @@
       # (permissions.test.mjs enforces the mapping).
       checks: read
       actions: read
-      # The push step exchanges this job's OIDC token for the Claude GitHub
-      # App's installation token: the credential that makes CI run on the fix.
-      # Without this grant there is no OIDC token and every fix falls back to a
-      # push that starts no CI. (claude-code-action's own OIDC flow is unused
-      # here, since the fixer passes github_token.)
-      id-token: write
+    outputs:
+      # All the push job takes from this one, and it takes none of it on trust:
+      # it checks out the branch afresh, confirms it is still at base_sha,
+      # applies the patch, and re-runs the default branch's bounds check.
+      decision: ${{ steps.bounds.outputs.decision }}
+      base_sha: ${{ steps.bump.outputs.base_sha }}
+      patch: ${{ steps.bounds.outputs.patch }}
     env:
-      # The fix commit's author. The push step writes it and the attempt step
-      # looks for it: one definition, so the guard cannot drift from the commit
-      # it guards against.
+      # The fix commit's author. The push job writes it and the attempt steps
+      # look for it. The push job repeats these two lines: keep them equal.
       AUTOFIX_AUTHOR_NAME: dep-steward[bot]
       AUTOFIX_AUTHOR_EMAIL: dep-steward@users.noreply.github.com
     concurrency:
@@ -165,8 +163,8 @@
           PR_NUMBER: ${{ steps.pr.outputs.pr_number }}
         run: |
           set -euo pipefail
-          # Reads the bump's paths, the pre-fix commit, and the prompt and
-          # bounds script from the commit this workflow runs from. Writes
+          # Reads the bump's paths, the pre-fix commit, and the prompt, bounds
+          # script and lint from the commit this workflow runs from. Writes
           # read-only copies outside the checkout, and base_sha. Touches
           # nothing else.
           #
@@ -188,6 +186,7 @@
           gh pr diff "$PR_NUMBER" --repo "$REPO" --name-only > "$RUNNER_TEMP/dep-steward/bump-paths.txt"
           git show "$GITHUB_SHA:.github/dependabot-autofix-prompt.md" > "$RUNNER_TEMP/dep-steward/dependabot-autofix-prompt.md"
           git show "$GITHUB_SHA:.github/dependabot-automerge/autofix-bounds.cjs" > "$RUNNER_TEMP/dep-steward/autofix-bounds.cjs"
+          git show "$GITHUB_SHA:__REVIEW_LINT_PATH__" > "$RUNNER_TEMP/dep-steward/review-lint.cjs"
           chmod -R a-w "$RUNNER_TEMP/dep-steward"
           echo "base_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
@@ -260,14 +259,20 @@
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           allowed_bots: "dependabot[bot]"
           # The fixer's `gh` runs on THIS token, so the job's checks:/actions:
-          # read grants reach it and `gh run view --log-failed` works. Its
-          # comments post as github-actions[bot], which is safe HERE: autofix
-          # comments carry no AUTOMERGE-DECISION-V1 block and nothing needs to
-          # wake on them. Do NOT copy this input to the review step — the
-          # review comment must come from the App identity or the gate's
-          # issue_comment wake-up never fires (see the workflow header).
+          # read grants reach it and `gh run view --log-failed` works, and it
+          # can comment but cannot push or merge. Its comments post as
+          # github-actions[bot], the identity whose AUTOMERGE-DECISION-V1
+          # blocks the gate trusts, so the hook in `settings` below refuses
+          # any post carrying one: a fixer turned by what it read must not be
+          # able to cast the review's vote.
           github_token: ${{ secrets.GITHUB_TOKEN }}
           prompt: ${{ steps.load_prompt.outputs.prompt }}
+          # The hook runs before every Bash call, from the read-only copy the
+          # snapshot step took, and refuses a `gh pr comment` whose body
+          # carries an AUTOMERGE-DECISION-V1 block (review-lint.cjs, fixer
+          # role). It checks nothing else: reading CI is this agent's job.
+          settings: |
+            {"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"REVIEW_LINT_ROLE=fixer node \"$RUNNER_TEMP/dep-steward/review-lint.cjs\"","timeout":30}]}]}}
           # Edit/Write make the fix; gh/grep/Read/Glob/WebFetch investigate. NO
           # general Bash, so the PR's untrusted code is never executed in this
           # contents:write context — only the agent's own edits and gh metadata.
@@ -372,10 +377,159 @@
             gh pr comment "$PR_NUMBER" --repo "$REPO" --body "dep-steward autofix drafted a change but it exceeded the safe bounds ($REASON), so it was discarded and left for a human."
             exit 0
           fi
-          # In bounds. Pushing is the next steps' job, after the mint: this step
-          # never holds a credential that starts workflows, and a push token
-          # exists only for a fix that will be pushed.
-          echo "Fix is within bounds ($REASON); the next steps push it."
+          # In bounds. Pushing is the autofix-push job's, on a runner no agent
+          # has touched: this job hands it the staged fix as a patch and it
+          # checks that patch again before it pushes anything.
+          echo "Fix is within bounds ($REASON); the autofix-push job checks it again and pushes it."
+          {
+            echo "decision=push"
+            echo "reason=$REASON"
+            echo "patch=$(git diff --cached --binary "$BASE_SHA" | base64 | tr -d '\n')"
+          } >> "$GITHUB_OUTPUT"
+
+  autofix-push:
+    # Pushes the fix the autofix job drafted. It runs no agent: it is the one
+    # job that can push, and it holds the means to (contents: write for the
+    # GITHUB_TOKEN fallback, id-token for the Claude App's token) only because
+    # nothing in it reads attacker-influenced text. From the autofix job it
+    # takes a patch and the commit the fixer saw, and trusts neither: it
+    # resolves the PR from the event itself, checks the one-push rule again,
+    # confirms the branch has not moved, applies the patch, and re-runs the
+    # bounds check from the default branch before it pushes.
+    #
+    # WHO PUSHES decides whether CI runs on the fix. GitHub starts no workflow
+    # for a push made with GITHUB_TOKEN, so a fix pushed that way sat with no CI
+    # run and no merge-gate wake-up until a person pushed to the branch
+    # (Runsense-ai/runsense#2693: nine days). A push made with a GitHub App's
+    # installation token does start them, and one App is already on every repo
+    # this pipeline runs in: the Claude Code GitHub App, which both agent jobs
+    # need. So the fix is pushed as that App, with a token from the same OIDC
+    # exchange claude-code-action performs (its src/github/token.ts; Anthropic's
+    # own CI auto-fix example relies on it on workflow_run). Nothing to set up.
+    needs: autofix
+    if: needs.autofix.outputs.decision == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      # The GITHUB_TOKEN fallback push, and the comment and label.
+      contents: write
+      pull-requests: write
+      # The OIDC token the push step exchanges for the Claude App's
+      # installation token: the credential that makes CI run on the fix.
+      id-token: write
+    env:
+      # The same author as the autofix job's: keep these two lines equal.
+      AUTOFIX_AUTHOR_NAME: dep-steward[bot]
+      AUTOFIX_AUTHOR_EMAIL: dep-steward@users.noreply.github.com
+    concurrency:
+      group: dependabot-autofix-push-${{ github.event.workflow_run.head_branch }}
+      cancel-in-progress: false
+    steps:
+      - name: Resolve the PR (and confirm it is Dependabot's)
+        id: pr
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+        run: |
+          set -euo pipefail
+          PR_NUMBER=$(gh pr list --repo "$REPO" --head "$HEAD_BRANCH" --state open --json number --jq '.[0].number // empty')
+          if [ -z "$PR_NUMBER" ]; then
+            echo "No open PR for $HEAD_BRANCH — nothing to do."; echo "skip=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          AUTHOR=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json author --jq '.author.login')
+          # Two spellings, one App: gh returns `app/dependabot`, event payloads
+          # return `dependabot[bot]` (gate.cjs documents the pair). And `case`
+          # patterns are GLOBS, so an UNQUOTED dependabot[bot] is a character
+          # class matching `dependabotb`/`dependaboto`/`dependabott` and NOT the
+          # literal login — it would admit a near-miss human account and refuse
+          # the App this step exists to recognise. Quoting makes both literal.
+          case "$AUTHOR" in
+            'app/dependabot'|'dependabot[bot]') : ;;
+            *) echo "PR author is $AUTHOR, not Dependabot — nothing to do."; echo "skip=true" >> "$GITHUB_OUTPUT"; exit 0 ;;
+          esac
+          echo "pr_number=$PR_NUMBER" >> "$GITHUB_OUTPUT"
+          echo "head_branch=$HEAD_BRANCH" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout the PR branch (afresh, on a runner no agent has touched)
+        if: steps.pr.outputs.skip != 'true'
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ steps.pr.outputs.head_branch }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check the fix again, from scratch (the autofix job's output is only a claim)
+        id: recheck
+        if: steps.pr.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ steps.pr.outputs.pr_number }}
+          BASE_SHA: ${{ needs.autofix.outputs.base_sha }}
+          PATCH: ${{ needs.autofix.outputs.patch }}
+        run: |
+          set -euo pipefail
+          # Reads the PR's commits, the branch, the patch, and the bounds
+          # script from the commit this workflow runs from. Writes decision and
+          # reason. Touches no remote; on a refusal it labels and comments once.
+          #
+          # The autofix job ran an agent over attacker-influenced text, so its
+          # outputs are claims. Everything this job pushes on is re-derived here.
+          refuse() { # $1 = why. Once per PR, like every escalation in autofix.
+            echo "::error::dep-steward did not push the autofix fix to PR #$PR_NUMBER: $1"
+            if gh pr view "$PR_NUMBER" --repo "$REPO" --json labels --jq '.labels[].name' 2>/dev/null | grep -qxF 'needs-human-review'; then
+              echo "PR #$PR_NUMBER is already labelled needs-human-review, so not commenting again."
+            else
+              gh pr comment "$PR_NUMBER" --repo "$REPO" --body "$(printf '%s\n' \
+                '## dep-steward did not push its fix' \
+                '' \
+                "The fix drafted for this PR did not pass the check made before pushing: $1" \
+                '' \
+                'Nothing was pushed, so this PR waits for a person.')" || true
+              gh pr edit "$PR_NUMBER" --repo "$REPO" --add-label needs-human-review__ASSIGN_FLAG__ || true
+            fi
+            exit 1
+          }
+          # One push per PR, again: two autofix runs can race to here.
+          if ! PRIOR=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json commits \
+            --jq '[.commits[] | select(any(.authors[]; .name == env.AUTOFIX_AUTHOR_NAME and .email == env.AUTOFIX_AUTHOR_EMAIL)) | .oid] | first // empty'); then
+            refuse "its commits could not be read, so a second push could not be ruled out"
+          fi
+          if [ -n "$PRIOR" ]; then
+            echo "dep-steward already pushed a fix to PR #$PR_NUMBER ($PRIOR); not pushing another."
+            exit 0
+          fi
+          # The fix was drafted against the commit the fixer saw. A branch that
+          # moved since gets the next CI failure's attempt instead.
+          HEAD_NOW=$(git rev-parse HEAD)
+          if [ "$HEAD_NOW" != "$BASE_SHA" ]; then
+            echo "::notice::PR #$PR_NUMBER's branch moved to $HEAD_NOW while the fixer worked on ${BASE_SHA:-an unknown commit}; not pushing a fix drafted for an older commit."
+            exit 0
+          fi
+          # A runner that keeps its temp directory between jobs (self-hosted)
+          # can still hold the autofix job's read-only copies.
+          chmod -R u+w "$RUNNER_TEMP/dep-steward" 2>/dev/null || true
+          mkdir -p "$RUNNER_TEMP/dep-steward"
+          git show "$GITHUB_SHA:.github/dependabot-automerge/autofix-bounds.cjs" > "$RUNNER_TEMP/dep-steward/autofix-bounds.cjs"
+          printf '%s' "$PATCH" | base64 -d > "$RUNNER_TEMP/dep-steward/fix.patch"
+          if ! APPLY_ERR=$(git apply --index "$RUNNER_TEMP/dep-steward/fix.patch" 2>&1); then
+            refuse "the patch does not apply to $BASE_SHA ($APPLY_ERR)"
+          fi
+          FIX_NAME_STATUS=$(git diff --cached --name-status "$BASE_SHA")
+          FIX_NUMSTAT=$(git diff --cached --numstat "$BASE_SHA")
+          BUMP_PATHS=$(gh pr diff "$PR_NUMBER" --repo "$REPO" --name-only)
+          if [ -z "$FIX_NAME_STATUS" ]; then
+            refuse "the patch changes nothing"
+          fi
+          export FIX_NAME_STATUS FIX_NUMSTAT BUMP_PATHS
+          OUT=$(node "$RUNNER_TEMP/dep-steward/autofix-bounds.cjs")
+          echo "$OUT"
+          DECISION=$(echo "$OUT" | sed -n 's/^decision=//p')
+          REASON=$(echo "$OUT" | sed -n 's/^reason=//p')
+          if [ "$DECISION" != "push" ]; then
+            refuse "it is outside the safe bounds ($REASON)"
+          fi
           {
             echo "decision=push"
             echo "reason=$REASON"
@@ -383,13 +537,16 @@
 
       - name: Push the fix (as the Claude GitHub App, so CI runs on it)
         id: push
-        if: ${{ !cancelled() && steps.bounds.outputs.decision == 'push' }}
+        if: ${{ !cancelled() && steps.recheck.outputs.decision == 'push' }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
           PR_NUMBER: ${{ steps.pr.outputs.pr_number }}
           HEAD_BRANCH: ${{ steps.pr.outputs.head_branch }}
-          REASON: ${{ steps.bounds.outputs.reason }}
+          # This job's own verdict, never the agent job's words: a reason
+          # carried over would put agent-chosen text in a github-actions
+          # comment, the identity whose decision blocks the gate trusts.
+          REASON: ${{ steps.recheck.outputs.reason }}
           WORKFLOW_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail

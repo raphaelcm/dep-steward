@@ -31,7 +31,7 @@ function render(extraArgs = []) {
     [join(REPO, 'install.sh'), '--render-only', '--out', out, '--ci-name', 'CI', '--assignee', 'octocat', ...extraArgs],
     { cwd: fakeRepo, env: { ...process.env, DEP_STEWARD_SRC: REPO }, stdio: 'pipe' },
   );
-  return join(out, '.github/workflows/dependabot-review.yml');
+  return ['dependabot-review.yml', 'dependabot-automerge.yml'].map((f) => join(out, '.github/workflows', f));
 }
 
 const available = spawnSync('actionlint', ['-version'], { stdio: 'pipe' }).status === 0;
@@ -40,7 +40,7 @@ const skip = !available && process.env.REQUIRE_ACTIONLINT !== '1' && 'actionlint
 for (const [variant, args] of [['default', []], ['--no-autofix', ['--no-autofix']]]) {
   test(`${variant}: the rendered workflow passes actionlint`, { skip }, () => {
     assert.ok(available, 'REQUIRE_ACTIONLINT=1 but actionlint is not on PATH');
-    const r = spawnSync('actionlint', ['-no-color', render(args)], { encoding: 'utf8' });
+    const r = spawnSync('actionlint', ['-no-color', ...render(args)], { encoding: 'utf8' });
     assert.equal(r.status, 0, `actionlint refused the render:\n${r.stdout}${r.stderr}`);
   });
 }
