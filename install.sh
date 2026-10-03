@@ -941,7 +941,15 @@ fi
 # The installer stages the generated files but doesn't commit by default — some
 # adopters want to review first. Offer to do it so "done" can actually mean live.
 ACTIVATED=0
-if [ -t 0 ] && [ -n "$FILES" ]; then
+# A reinstall that changed no file (how a repo upgrades when a release changes
+# nothing it renders) has nothing to commit: what is committed is this pipeline.
+UP_TO_DATE=1
+for f in $FILES; do
+  if ! git ls-files --error-unmatch -- "$f" >/dev/null 2>&1 || ! git diff --quiet HEAD -- "$f" 2>/dev/null; then
+    UP_TO_DATE=0
+  fi
+done
+if [ "$UP_TO_DATE" -eq 0 ] && [ -t 0 ] && [ -n "$FILES" ]; then
   say ""
   printf 'Commit and push these files now to activate the pipeline? [Y/n] '
   read -r ans
@@ -967,7 +975,9 @@ fi
 
 # ---- done ------------------------------------------------------------------
 say ""
-if [ "$ACTIVATED" -eq 1 ]; then
+if [ "$UP_TO_DATE" -eq 1 ]; then
+  say "Done. The pipeline files already match what is committed, so there is nothing to commit."
+elif [ "$ACTIVATED" -eq 1 ]; then
   say "Done — pushed and live. Dependabot scans on the new config and opens its first PRs shortly."
 else
   say "Done. Commit + push the files under .github/ to activate the pipeline:"
