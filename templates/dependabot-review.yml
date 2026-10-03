@@ -130,8 +130,8 @@ jobs:
           PR_NUMBER: ${{ inputs.pr_number || github.event.pull_request.number }}
           # The author is baked for a different reason: the reviewer holds no
           # PR-metadata tool (`gh pr view` is a prefix wildcard whose --json
-          # flags reach the Checks API the agent's token cannot read — see
-          # the allow-list comment below), so the not-from-Dependabot hard rule
+          # flags reach the Checks API the agent's token cannot read, as the
+          # allow-list comment below explains), so the not-from-Dependabot hard rule
           # is fed its fact here instead. THIS step's gh runs on the workflow's
           # own token, which can read it; same idiom as the autofix resolve
           # step. Spellings documented at gate.cjs DEPENDABOT_AUTHORS.

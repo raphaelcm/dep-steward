@@ -64,6 +64,18 @@ for (const f of FILES) {
   });
 }
 
+// Rendered files land in adopters' repositories, and some forbid em dashes
+// (Runsense-ai/runsense's AGENTS.md: "no em dashes anywhere"). Older template
+// text still carries some, so this count may only go down: new text adds
+// none, and a change that removes some lowers the ceiling here.
+const EM_DASH_CEILING = 146;
+
+test('the render adds no em dashes', () => {
+  const count = FILES.reduce((n, f) => n + (readFileSync(join(rendered, f), 'utf8').match(/\u2014/g) ?? []).length, 0);
+  assert.ok(count <= EM_DASH_CEILING, `the render carries ${count} em dashes, more than ${EM_DASH_CEILING}: new template text must not add any`);
+  assert.equal(count, EM_DASH_CEILING, `the render carries ${count} em dashes, fewer than before: lower EM_DASH_CEILING to ${count}`);
+});
+
 test('the rendered workflow points at the relocated gate path', () => {
   const wf = readFileSync(join(rendered, '.github/workflows/dependabot-automerge.yml'), 'utf8');
   assert.match(wf, /node \.github\/dependabot-automerge\/gate\.cjs/);
