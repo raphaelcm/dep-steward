@@ -68,7 +68,7 @@ for (const f of FILES) {
 // (Runsense-ai/runsense's AGENTS.md: "no em dashes anywhere"). Older template
 // text still carries some, so this count may only go down: new text adds
 // none, and a change that removes some lowers the ceiling here.
-const EM_DASH_CEILING = 146;
+const EM_DASH_CEILING = 143;
 
 test('the render adds no em dashes', () => {
   const count = FILES.reduce((n, f) => n + (readFileSync(join(rendered, f), 'utf8').match(/\u2014/g) ?? []).length, 0);

@@ -8,7 +8,8 @@ name: Dependabot auto-merge
 # which is one condition among deterministic ones.
 #
 # It wakes when either thing it waits for finishes: CI (the build result) or
-# the review workflow (the verdict, for singleton/major PRs). Whichever
+# the review workflow (the verdict, for singleton/major PRs), including a
+# review someone replays by hand. Whichever
 # finishes later finds both, and the gate re-derives every input each time, so
 # waking twice is harmless: only the wake where both are present can return
 # `decision=merge`. Both arrive as workflow_run, which runs in the default
@@ -43,12 +44,76 @@ on:
 permissions: {}
 
 jobs:
-  auto-merge:
-    # Wakes when CI or the review finishes on a Dependabot PR's branch, and
-    # judges the PR as it stands then (see the header).
+  resolve:
+    # Which PR this wake is about. Reads the finished run's event, branch and
+    # name, and the PR. Writes the PR's number and branch, or nothing. Holds
+    # read access to pull requests and nothing else.
+    #
+    # CI's runs and the review's pull_request runs are on the PR's branch. A
+    # review replay (`gh workflow run dependabot-review.yml -f pr_number=N`)
+    # runs on the default branch, and a workflow_run payload carries no
+    # inputs, so the review names the PR in its run name ("Dependabot PR
+    # review of #N") and this reads it back. Without that, a replay's verdict
+    # would wait for the PR's next CI run, which for a green PR may never come.
+    # Any other finished run (an autofix run, a dispatched CI run) is about no
+    # PR the gate judges.
     if: >
-      github.event.workflow_run.event == 'pull_request' &&
-      startsWith(github.event.workflow_run.head_branch, 'dependabot/')
+      (github.event.workflow_run.event == 'pull_request' &&
+       startsWith(github.event.workflow_run.head_branch, 'dependabot/')) ||
+      (github.event.workflow_run.event == 'workflow_dispatch' &&
+       github.event.workflow_run.name == 'Dependabot PR review')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      pull-requests: read
+    outputs:
+      pr_number: ${{ steps.pr.outputs.pr_number }}
+      head_branch: ${{ steps.pr.outputs.head_branch }}
+    steps:
+      - name: Resolve PR context
+        id: pr
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          # Attacker-influenced event data (a branch name, a run name) is
+          # passed through env vars, never interpolated into the shell command
+          # text, so a branch like `dependabot/x";curl evil"` stays an inert
+          # string.
+          WAKE_EVENT: ${{ github.event.workflow_run.event }}
+          WORKFLOW_RUN_HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          WORKFLOW_RUN_TITLE: ${{ github.event.workflow_run.display_title }}
+        run: |
+          set -euo pipefail
+          if [ "$WAKE_EVENT" = workflow_dispatch ]; then
+            # A replay: the review's run-name, built from a number-typed
+            # input. A run name in any other form names no PR.
+            PR_NUMBER=$(printf '%s\n' "$WORKFLOW_RUN_TITLE" | sed -n 's/^Dependabot PR review of #\([0-9][0-9]*\)$/\1/p')
+            HEAD_BRANCH=''
+            if [ -n "$PR_NUMBER" ]; then
+              HEAD_BRANCH=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json headRefName,state \
+                --jq 'select(.state == "OPEN") | .headRefName' 2>/dev/null || true)
+            fi
+          else
+            HEAD_BRANCH="$WORKFLOW_RUN_HEAD_BRANCH"
+            PR_NUMBER=$(gh pr list --repo "$REPO" --head "$HEAD_BRANCH" --state open \
+              --json number --jq '.[0].number // empty')
+          fi
+          if [ -z "$PR_NUMBER" ] || [ -z "$HEAD_BRANCH" ]; then
+            echo "No open PR resolved (PR_NUMBER='$PR_NUMBER', HEAD_BRANCH='$HEAD_BRANCH'), so there is nothing to do."
+            exit 0
+          fi
+          if ! echo "$HEAD_BRANCH" | grep -q '^dependabot/'; then
+            echo "Head branch '$HEAD_BRANCH' is not a dependabot/* branch, so there is nothing to do."
+            exit 0
+          fi
+          echo "pr_number=$PR_NUMBER" >> "$GITHUB_OUTPUT"
+          echo "head_branch=$HEAD_BRANCH" >> "$GITHUB_OUTPUT"
+          echo "Resolved PR #$PR_NUMBER on branch $HEAD_BRANCH"
+
+  auto-merge:
+    # Judges the PR resolve named, as it stands now (see the header).
+    needs: resolve
+    if: needs.resolve.outputs.pr_number != ''
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -57,7 +122,10 @@ jobs:
       checks: read
       actions: read
     concurrency:
-      group: dependabot-automerge-${{ github.event.workflow_run.head_branch }}
+      # One run per PR at a time, whatever woke it. Not the waking run's
+      # branch: a replay runs on the default branch, so every replay would
+      # share one group, and GitHub cancels a pending run when another joins.
+      group: dependabot-automerge-${{ needs.resolve.outputs.pr_number }}
       cancel-in-progress: false
     steps:
       - name: Checkout default branch (never the PR head)
@@ -67,44 +135,12 @@ jobs:
         # not the PR's.
         uses: actions/checkout@v7
 
-      - name: Resolve PR context
-        id: pr
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          REPO: ${{ github.repository }}
-          # Attacker-influenced event data (a branch name, an issue number) is
-          # passed through env vars, never interpolated into the shell command
-          # text — a branch like `dependabot/x";curl evil"` becomes an inert
-          # string in $WORKFLOW_RUN_HEAD_BRANCH instead of executing. This is
-          # the privileged workflow_run job (contents: write), so the
-          # indirection is load-bearing, not cosmetic.
-          WORKFLOW_RUN_HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
-        run: |
-          set -euo pipefail
-          HEAD_BRANCH="$WORKFLOW_RUN_HEAD_BRANCH"
-          PR_NUMBER=$(gh pr list --repo "$REPO" --head "$HEAD_BRANCH" --state open \
-            --json number --jq '.[0].number // empty')
-          if [ -z "$PR_NUMBER" ] || [ -z "$HEAD_BRANCH" ]; then
-            echo "No PR resolved (PR_NUMBER='$PR_NUMBER', HEAD_BRANCH='$HEAD_BRANCH') — nothing to do."
-            echo "skip=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          if ! echo "$HEAD_BRANCH" | grep -q '^dependabot/'; then
-            echo "Head branch '$HEAD_BRANCH' is not a dependabot/* branch — nothing to do."
-            echo "skip=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          echo "pr_number=$PR_NUMBER" >> "$GITHUB_OUTPUT"
-          echo "head_branch=$HEAD_BRANCH" >> "$GITHUB_OUTPUT"
-          echo "Resolved PR #$PR_NUMBER on branch $HEAD_BRANCH"
-
       - name: Resolve CI conclusion (re-query — trigger payload may be stale)
-        if: steps.pr.outputs.skip != 'true'
         id: ci
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
-          PR_NUMBER: ${{ steps.pr.outputs.pr_number }}
+          PR_NUMBER: ${{ needs.resolve.outputs.pr_number }}
         run: |
           set -euo pipefail
           # Query the latest CI workflow run for this PR's head SHA. The gate
@@ -130,7 +166,6 @@ jobs:
           echo "CI conclusion for $HEAD_SHA: $CI_CONCLUSION; pushed by ${HEAD_PUSHER:-(could not tell)}"
 
       - name: Resolve the merge methods this repo actually allows
-        if: steps.pr.outputs.skip != 'true'
         id: methods
         # A capability probe: reads settings, writes one output, touches nothing.
         # It produces a PRIOR for the gate's ranking, NOT a verdict — the arm
@@ -230,12 +265,11 @@ jobs:
           echo "This is a prior, not a verdict — restrictions in classic branch protection and in App token scopes are invisible here, so the arm step tries the ranked list in order."
 
       - name: Deterministic auto-merge gate
-        if: steps.pr.outputs.skip != 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
-          PR_NUMBER: ${{ steps.pr.outputs.pr_number }}
-          HEAD_BRANCH: ${{ steps.pr.outputs.head_branch }}
+          PR_NUMBER: ${{ needs.resolve.outputs.pr_number }}
+          HEAD_BRANCH: ${{ needs.resolve.outputs.head_branch }}
           CI_CONCLUSION: ${{ steps.ci.outputs.ci_conclusion }}
           # The commit CI was read for, and who pushed it. The merge below is
           # tied to that commit; the gate refuses if the PR's head has moved.
