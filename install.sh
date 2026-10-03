@@ -240,10 +240,10 @@ compute_assign
 # itself). With autofix off, nothing else is watching CI, so the gate owns it.
 # Only the taken branch is rendered — the workflow carries no conditional.
 if [ "$AUTOFIX" -eq 1 ]; then
-  ESCALATABLE_CODES='paths_not_whitelisted|verdict_malformed'
+  ESCALATABLE_CODES='paths_not_whitelisted|verdict_malformed|head_pushed_by_other'
   ESCALATABLE_NOTE='ci_failed is absent: the autofix job owns it. It wakes on this same event and escalates itself when it cannot fix the build.'
 else
-  ESCALATABLE_CODES='paths_not_whitelisted|verdict_malformed|ci_failed'
+  ESCALATABLE_CODES='paths_not_whitelisted|verdict_malformed|head_pushed_by_other|ci_failed'
   ESCALATABLE_NOTE='ci_failed IS here: autofix is off, so no other job is watching CI and a red build would otherwise strand silently.'
 fi
 

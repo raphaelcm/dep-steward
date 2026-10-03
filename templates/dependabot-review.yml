@@ -38,9 +38,10 @@ name: Dependabot PR review
 #
 #  - auto-merge (on: workflow_run of CI, or issue_comment when the LLM posts):
 #    a fully deterministic gate. For group PRs it merges with ZERO LLM input
-#    when CI is green, the author is Dependabot, the PR is open, and every
-#    changed path is whitelisted (`.github/dependabot.yml` guarantees the
-#    group is non-major by construction). For singleton/major PRs it reads
+#    when CI is green, the author is Dependabot, Dependabot itself pushed the
+#    commit being merged, the PR is open, and every changed path is
+#    whitelisted (`.github/dependabot.yml` guarantees the group is non-major
+#    by construction). For singleton/major PRs it reads
 #    the LLM's structured AUTOMERGE-DECISION-V1 block from a trusted
 #    commenter and merges only when recommendation=merge AND
 #    our_usage_affected=false AND every deterministic check ALSO passes. The
@@ -521,8 +522,22 @@ jobs:
           HEAD_SHA=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json headRefOid --jq '.headRefOid')
           CI_CONCLUSION=$(gh run list --repo "$REPO" --workflow __CI_RUNLIST__ --commit "$HEAD_SHA" \
             --limit 1 --json conclusion --jq '.[0].conclusion // "pending"')
-          echo "ci_conclusion=$CI_CONCLUSION" >> "$GITHUB_OUTPUT"
-          echo "CI conclusion for $HEAD_SHA: $CI_CONCLUSION"
+          # Who pushed that commit: the actor of the first CI run GitHub created
+          # for it. The push itself creates that run; a reopen or a re-run comes
+          # later and names whoever clicked. Empty when it cannot be read, which
+          # the gate refuses rather than guesses.
+          FIRST_RUN=$(gh run list --repo "$REPO" --workflow __CI_RUNLIST__ --commit "$HEAD_SHA" \
+            --limit 100 --json databaseId,createdAt --jq 'sort_by(.createdAt) | .[0].databaseId // empty' 2>/dev/null || true)
+          HEAD_PUSHER=''
+          if [ -n "$FIRST_RUN" ]; then
+            HEAD_PUSHER=$(gh api "repos/$REPO/actions/runs/$FIRST_RUN" --jq '.actor.login // empty' 2>/dev/null || true)
+          fi
+          {
+            echo "ci_conclusion=$CI_CONCLUSION"
+            echo "head_sha=$HEAD_SHA"
+            echo "head_pusher=$HEAD_PUSHER"
+          } >> "$GITHUB_OUTPUT"
+          echo "CI conclusion for $HEAD_SHA: $CI_CONCLUSION; pushed by ${HEAD_PUSHER:-(could not tell)}"
 
       - name: Resolve the merge methods this repo actually allows
         if: steps.pr.outputs.skip != 'true'
@@ -632,21 +647,26 @@ jobs:
           PR_NUMBER: ${{ steps.pr.outputs.pr_number }}
           HEAD_BRANCH: ${{ steps.pr.outputs.head_branch }}
           CI_CONCLUSION: ${{ steps.ci.outputs.ci_conclusion }}
+          # The commit CI was read for, and who pushed it. The merge below is
+          # tied to that commit; the gate refuses if the PR's head has moved.
+          HEAD_SHA: ${{ steps.ci.outputs.head_sha }}
+          HEAD_PUSHER: ${{ steps.ci.outputs.head_pusher }}
           ALLOWED_MERGE_METHODS: ${{ steps.methods.outputs.allowed_merge_methods }}
         run: |
           set -euo pipefail
           # `labels` rides along on the query we already make — it costs nothing
           # and is what keeps the escalation below idempotent.
           PR_JSON=$(gh pr view "$PR_NUMBER" --repo "$REPO" \
-            --json state,author,comments,labels --jq '{state, author, comments, labels}')
+            --json state,headRefOid,author,comments,labels --jq '{state, headRefOid, author, comments, labels}')
           PR_STATE=$(echo "$PR_JSON" | jq -r '.state')
+          PR_HEAD_SHA=$(echo "$PR_JSON" | jq -r '.headRefOid // empty')
           PR_AUTHOR=$(echo "$PR_JSON" | jq -r '.author.login')
           PR_COMMENTS_JSON=$(echo "$PR_JSON" | jq -c '.comments')
           PR_LABELS=$(echo "$PR_JSON" | jq -r '.labels[].name')
           CHANGED_PATHS=$(gh pr diff "$PR_NUMBER" --repo "$REPO" --name-only)
 
           export HEAD_BRANCH CI_CONCLUSION PR_AUTHOR PR_STATE CHANGED_PATHS PR_COMMENTS_JSON
-          export ALLOWED_MERGE_METHODS
+          export HEAD_SHA PR_HEAD_SHA HEAD_PUSHER ALLOWED_MERGE_METHODS
           GATE_OUT=$(node __GATE_PATH__)
           echo "$GATE_OUT"
           DECISION=$(echo "$GATE_OUT" | sed -n 's/^decision=//p')
@@ -731,6 +751,9 @@ jobs:
             #                      something it should not act on, and paging about
             #                      someone else's PR or an already-closed one is
             #                      exactly the noise that devalues the label
+            #   head_moved         the new head's CI run wakes the gate again
+            #   head_pusher_unknown
+            #                      a read that failed; the next wake reads again
             #
             # __ESCALATABLE_NOTE__
             case "$CODE" in
@@ -838,7 +861,9 @@ jobs:
             echo "Arming auto-merge on PR #$PR_NUMBER, method $METHOD ($REASON)"
             # `set -e` is disarmed inside an `if` condition, so a refusal here
             # reaches the next line instead of killing the step mid-list.
-            if ARM_OUT=$(gh pr merge "$PR_NUMBER" --repo "$REPO" --auto "--$METHOD" --delete-branch 2>&1); then
+            # Tied to the commit the gate judged: GitHub refuses the merge if
+            # the head has moved since.
+            if ARM_OUT=$(gh pr merge "$PR_NUMBER" --repo "$REPO" --auto "--$METHOD" --delete-branch --match-head-commit "$HEAD_SHA" 2>&1); then
               MERGED_WITH="$METHOD"
               break
             fi

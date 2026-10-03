@@ -359,16 +359,17 @@ test('a terminal refusal escalates; a transient one stays silent', () => {
   const wf = readFileSync(join(rendered, '.github/workflows/dependabot-review.yml'), 'utf8');
   const gateStep = wf.slice(wf.indexOf('Deterministic auto-merge gate'), wf.indexOf('\n  autofix:'));
   // The gate wakes on every CI completion and every bot comment, so most
-  // refusals mean "not yet" and must stay quiet. These two mean "never": the
-  // gate would refuse the PR forever and tell nobody.
+  // refusals mean "not yet" and must stay quiet. These three mean "never": the
+  // gate would refuse the PR forever and tell nobody. (Dependabot does not
+  // touch a branch someone else pushed to until a person asks it to rebase.)
   assert.match(gateStep, /CODE=\$\(echo "\$GATE_OUT" \| sed -n 's\/\^code=\/\/p'\)/,
     'the workflow must branch on the stable code, never on the prose reason');
-  assert.match(gateStep, /case "\$CODE" in\s*\n\s*paths_not_whitelisted\|verdict_malformed\)/);
+  assert.match(gateStep, /case "\$CODE" in\s*\n\s*paths_not_whitelisted\|verdict_malformed\|head_pushed_by_other\)/);
   // An allow-list, so a code added later defaults to silence. These must NOT
   // appear as escalation targets — each already has an owner, or is transient.
   const caseArm = /case "\$CODE" in\s*\n\s*([a-z_|]+)\)/.exec(gateStep)?.[1] ?? '';
   for (const silent of ['ci_pending', 'ci_indeterminate', 'verdict_missing', 'verdict_escalate',
-    'usage_affected', 'author_not_dependabot', 'pr_not_open', 'no_changed_paths']) {
+    'usage_affected', 'author_not_dependabot', 'pr_not_open', 'no_changed_paths', 'head_moved', 'head_pusher_unknown']) {
     assert.ok(!caseArm.split('|').includes(silent), `${silent} must not escalate — it is transient or already owned`);
   }
 });
@@ -378,7 +379,7 @@ test('the stuck notice fires once per PR, not once per wake-up', () => {
   const gateStep = wf.slice(wf.indexOf('Deterministic auto-merge gate'), wf.indexOf('\n  autofix:'));
   // Without the label check a stuck PR collects one comment per CI run forever,
   // which is how a notification channel gets muted.
-  assert.match(gateStep, /--json state,author,comments,labels/, 'labels must ride along on the existing query');
+  assert.match(gateStep, /--json state,headRefOid,author,comments,labels/, 'labels must ride along on the existing query');
   assert.match(gateStep, /grep -qxF 'needs-human-review' <<<"\$PR_LABELS"/);
 });
 
