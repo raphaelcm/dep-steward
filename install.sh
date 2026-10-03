@@ -66,6 +66,7 @@ MODEL="$DEFAULT_MODEL"
 ASSIGNEE=''
 ASSIGNEE_EXPLICIT=0
 AUTOFIX=1
+COPY_CI_SECRETS=''
 
 say()  { printf '%s\n' "$*"; }
 info() { printf '  %s\n' "$*"; }
@@ -94,6 +95,10 @@ Flags:
   --no-autofix         turn OFF autofix (it's ON by default): don't let a Claude
                        agent push mechanical fixes for CI-breaking bumps; baseline
                        review + auto-merge only.
+  --copy-ci-secrets    copy the secrets your CI reads into Dependabot's secret
+                       store without asking (GitHub runs a Dependabot PR's CI
+                       with that store only, so CI fails there without them)
+  --no-copy-ci-secrets don't copy them, and don't ask
   --render-only --out DIR   render into DIR and stop (no gh calls)
   -h, --help           show this help
 
@@ -108,6 +113,8 @@ while [ $# -gt 0 ]; do
     --dry-run) DRY_RUN=1 ;;
     --autofix) AUTOFIX=1 ;;
     --no-autofix) AUTOFIX=0 ;;
+    --copy-ci-secrets) COPY_CI_SECRETS=yes ;;
+    --no-copy-ci-secrets) COPY_CI_SECRETS=no ;;
     --render-only) RENDER_ONLY=1 ;;
     --out) OUT="${2:-}"; shift ;;
     --out=*) OUT="${1#--out=}" ;;
@@ -470,6 +477,156 @@ render_review_lint() { cat "$SRC/templates/review-lint.cjs"; }
 render_autofix_prompt() { sed -e "s|__ASSIGN_FLAG__|$ASSIGN_FLAG|g" "$SRC/templates/dependabot-autofix-prompt.md"; }
 render_autofix_bounds() { cat "$SRC/templates/autofix-bounds.cjs"; }
 
+# ---- the secrets CI needs on a Dependabot pull request ---------------------
+# GitHub runs a Dependabot PR's workflows with Dependabot's own secret store,
+# not the Actions one. A CI that reads an Actions secret therefore fails on
+# every Dependabot PR, and the gate, which merges only on green CI, never
+# merges one. copy_ci_secrets copies the secrets CI reads into that store, and
+# nobody handles a value: a short-lived run (templates/copy-ci-secrets.yml)
+# seals each one with the store's public key and prints only the sealed copy,
+# which only GitHub can open, and this script uploads it.
+
+render_copy_ci_secrets() { # <branch> <public key> <name>...
+  _branch=$1; _key=$2; shift 2
+  _env=''
+  for _n in "$@"; do _env="$_env          SEAL_$_n: \${{ secrets.$_n }}$NL"; done
+  sed -e "s|__SEAL_BRANCH__|$_branch|" -e "s|__PUBLIC_KEY__|$_key|" -e "s|__SEAL_NAMES__|$*|" \
+    "$SRC/templates/copy-ci-secrets.yml" | inject '#__SEAL_ENV__' "$_env"
+}
+
+# The workflow files whose top-level `name:` is the CI the gate keys on.
+ci_workflow_files() {
+  for _f in .github/workflows/*.yml .github/workflows/*.yaml; do
+    [ -f "$_f" ] || continue
+    _n=$(sed -n 's/^name:[[:space:]]*//p' "$_f" | head -1 \
+      | sed -e 's/[[:space:]]*$//' -e 's/^"\(.*\)"$/\1/' -e "s/^'\\(.*\\)'\$/\\1/")
+    if [ "$_n" = "$CI_NAME" ]; then printf '%s\n' "$_f"; fi
+  done
+}
+
+# The secret names the given workflows read, following the local reusable
+# workflows they call; one per line, sorted. Full-line comments are skipped.
+secrets_read_by() {
+  _queue="$*"; _seen=' '; _out=''
+  while [ -n "$_queue" ]; do
+    _f=${_queue%% *}
+    case "$_queue" in *' '*) _queue=${_queue#* } ;; *) _queue='' ;; esac
+    case "$_seen" in *" $_f "*) continue ;; esac
+    _seen="$_seen$_f "
+    [ -f "$_f" ] || continue
+    _body=$(sed '/^[[:space:]]*#/d' "$_f")
+    _out="$_out$(printf '%s\n' "$_body" | grep -oE 'secrets\.[A-Za-z_][A-Za-z0-9_]*' | sed 's/^secrets\.//')$NL"
+    for _u in $(printf '%s\n' "$_body" | sed -n 's|^[[:space:]-]*uses:[[:space:]]*\./\(\.github/workflows/[^[:space:]@]*\).*|\1|p'); do
+      _queue="${_queue:+$_queue }$_u"
+    done
+  done
+  printf '%s' "$_out" | sed '/^$/d' | sort -u
+}
+
+# The names CI reads that Dependabot's store lacks, space-separated. Fails when
+# that store's names cannot be read. GITHUB_TOKEN is each run's own token,
+# never a stored secret.
+ci_secrets_dependabot_lacks() {
+  _files=$(ci_workflow_files)
+  [ -n "$_files" ] || return 0
+  # shellcheck disable=SC2086
+  _read=$(secrets_read_by $_files | grep -vx 'GITHUB_TOKEN' || true)
+  [ -n "$_read" ] || return 0
+  _have=$(gh secret list --repo "$NWO" --app dependabot --json name --jq '.[].name' 2>/dev/null) || return 1
+  _lack=''
+  for _n in $_read; do
+    printf '%s\n' "$_have" | grep -qxF "$_n" || _lack="${_lack:+$_lack }$_n"
+  done
+  printf '%s' "$_lack"
+}
+
+copy_ci_secrets() {
+  _need=$(ci_secrets_dependabot_lacks) || {
+    warn "could not read Dependabot's secret names, so the secrets '$CI_NAME' reads were not checked."
+    return 0
+  }
+  [ -n "$_need" ] || return 0
+  say ""
+  say "Your CI ('$CI_NAME') reads secrets that Dependabot's pull requests can't see:"
+  info "$_need"
+  say "GitHub gives Dependabot PRs a secret store of their own, so without these, CI fails on"
+  say "every Dependabot PR and nothing merges on its own. dep-steward can copy them there. No"
+  say "value leaves GitHub, but a new dependency version's code can read them while CI runs."
+  case "$COPY_CI_SECRETS" in
+    yes) ;;
+    no) info "not copied (--no-copy-ci-secrets)."; return 0 ;;
+    *)
+      if [ -t 0 ]; then
+        printf "Copy them into Dependabot's secrets? [Y/n] "
+        read -r ans
+        case "$ans" in ''|[Yy]*) ;; *) info "not copied."; return 0 ;; esac
+      else
+        warn "not copied: nobody was here to say yes. Re-run the installer with --copy-ci-secrets to copy them."
+        return 0
+      fi ;;
+  esac
+
+  _pk=$(gh api "repos/$NWO/dependabot/secrets/public-key" --jq '.key_id + " " + .key' 2>/dev/null || true)
+  _key_id=${_pk%% *}; _key=${_pk#* }
+  case "$_key_id" in ''|*[!A-Za-z0-9]*) warn "could not read the Dependabot store's public key; nothing copied."; return 0 ;; esac
+  case "$_key" in ''|*[!A-Za-z0-9+/=]*) warn "the Dependabot store's public key looks wrong; nothing copied."; return 0 ;; esac
+
+  # One commit, no parent, holding only the sealing workflow: none of this
+  # repository's own workflows exist on that branch, so nothing else runs.
+  _branch="dep-steward-copy-ci-secrets-$(date +%s)$$"
+  # shellcheck disable=SC2086
+  if ! { _sha=$(render_copy_ci_secrets "$_branch" "$_key" $_need | git hash-object -w --stdin) \
+    && _sha=$(printf '100644 blob %s\t%s.yml\n' "$_sha" "$_branch" | git mktree) \
+    && _sha=$(printf '040000 tree %s\tworkflows\n' "$_sha" | git mktree) \
+    && _sha=$(printf '040000 tree %s\t.github\n' "$_sha" | git mktree) \
+    && _sha=$(GIT_AUTHOR_NAME=dep-steward GIT_AUTHOR_EMAIL=dep-steward@users.noreply.github.com \
+      GIT_COMMITTER_NAME=dep-steward GIT_COMMITTER_EMAIL=dep-steward@users.noreply.github.com \
+      git commit-tree "$_sha" -m "dep-steward: copy CI secrets for Dependabot (deleted once run)") \
+    && git push -q origin "$_sha:refs/heads/$_branch" 2>/dev/null; }; then
+    warn "could not push the short-lived branch that seals them; nothing copied."
+    return 0
+  fi
+  say "Sealing them in a short-lived run on branch $_branch..."
+  _run=''; _tries=0
+  while [ "$_tries" -lt 60 ]; do
+    _run=$(gh run list --repo "$NWO" --branch "$_branch" --json databaseId,status,conclusion --limit 1 \
+      --jq '.[0] | select(.status == "completed") | "\(.databaseId) \(.conclusion)"' 2>/dev/null || true)
+    [ -n "$_run" ] && break
+    _tries=$((_tries + 1))
+    sleep 5
+  done
+  git push -q origin --delete "$_branch" 2>/dev/null || warn "could not delete the branch $_branch."
+  if [ -z "$_run" ]; then
+    warn "the sealing run did not finish within five minutes; nothing copied. Its log: https://github.com/$NWO/actions"
+    return 0
+  fi
+  _id=${_run%% *}
+  if [ "${_run#* }" != success ]; then
+    warn "the sealing run failed; nothing copied. Its log: https://github.com/$NWO/actions/runs/$_id"
+    return 0
+  fi
+  _log=$(gh run view "$_id" --repo "$NWO" --log 2>/dev/null | tr -d '\r' || true)
+  _copied=''; _unset=''
+  for _n in $_need; do
+    _sealed=$(printf '%s\n' "$_log" | sed -n "s|.*DEP-STEWARD-SEALED $_n \\([A-Za-z0-9+/]*=*\\)\$|\\1|p" | head -1)
+    if [ -n "$_sealed" ]; then
+      if gh api --method PUT "repos/$NWO/dependabot/secrets/$_n" -f encrypted_value="$_sealed" -f key_id="$_key_id" >/dev/null 2>&1; then
+        _copied="${_copied:+$_copied }$_n"
+      else
+        warn "could not store $_n in Dependabot's secrets."
+      fi
+    elif printf '%s\n' "$_log" | grep -q "DEP-STEWARD-UNSET $_n\$"; then
+      _unset="${_unset:+$_unset }$_n"
+    else
+      warn "the sealing run did not report $_n, so it was not copied."
+    fi
+  done
+  gh api --method DELETE "repos/$NWO/actions/runs/$_id" >/dev/null 2>&1 || true
+  if [ -n "$_copied" ]; then info "copied into Dependabot's secrets: $_copied"; fi
+  if [ -n "$_unset" ]; then warn "not copied, because no secret by that name is set for this repository: $_unset"; fi
+  return 0
+}
+
 # write one rendered file to a destination path (creating parent dirs)
 emit() { # emit <renderer-fn> <dest-path>
   d=$(dirname "$2")
@@ -591,10 +748,16 @@ if [ "$DRY_RUN" -eq 1 ]; then
   done
   say ""
   say "[dry-run] GitHub changes that would be made:"
-  info "REQUIRED (manual, web): install the Claude Code GitHub App on $NWO — https://github.com/apps/claude"
+  if [ "$AUTOFIX" -eq 1 ]; then
+    info "manual, web: install the Claude Code GitHub App on $NWO, which autofix pushes as — https://github.com/apps/claude"
+  fi
   info "gh label create $LABEL (if missing)"
   info "gh secret set $SECRET            (Actions store)"
   info "gh secret set $SECRET --app dependabot   (Dependabot store)"
+  _would=$(ci_secrets_dependabot_lacks 2>/dev/null || true)
+  if [ -n "$_would" ]; then
+    info "copy into Dependabot's secrets what '$CI_NAME' reads and that store lacks: $_would"
+  fi
   info "gh api -X PATCH repos/$NWO -F allow_auto_merge=true"
   info "inspect branch protection on '$DEFAULT_BRANCH' and advise"
   say ""
@@ -622,24 +785,26 @@ else
   fi
 fi
 
-# ---- Claude GitHub App (required; not automatable) -------------------------
-# claude-code-action needs the Claude Code GitHub App installed on the repo, in
-# addition to the token: the token authorizes the Claude side, the App the GitHub
-# side. Installation is a web consent flow with no user-token API to perform or
-# verify it, so we surface it as a required step and open it when we can. Without
-# it, every review/autofix run fails with "Claude Code is not installed on this
-# repository".
-say ""
-say "REQUIRED — install the Claude Code GitHub App on $NWO. The token alone is not"
-say "enough; without the App, every review/autofix run fails with \"Claude Code is"
-say "not installed on this repository\". Grant it access to this repo:"
-info "https://github.com/apps/claude  ->  Configure  ->  add $NWO"
-if [ -t 0 ]; then
-  printf 'Open that page now? [Y/n] '
-  read -r ans
-  case "$ans" in ''|[Yy]*) open_url "https://github.com/apps/claude/installations/new" ;; esac
-  printf 'Press Enter once the App has access to %s... ' "$NWO"
-  read -r _
+# ---- Claude GitHub App (autofix's push; not automatable) -------------------
+# Autofix pushes its fixes as the Claude Code GitHub App, which is what makes CI
+# run on them: a push with GITHUB_TOKEN starts no workflow. The review and the
+# fixer run on their jobs' own GITHUB_TOKEN and do not need the App, so neither
+# does an install without autofix. Installing it is a web consent flow with no
+# user-token API to perform or verify it, so we surface it and open it when we
+# can.
+if [ "$AUTOFIX" -eq 1 ]; then
+  say ""
+  say "Install the Claude Code GitHub App on $NWO. Autofix pushes its fixes as this App,"
+  say "which is what makes CI run on them; without it, a fix goes out with the workflow's"
+  say "token and CI does not start on it by itself. Grant it access to this repo:"
+  info "https://github.com/apps/claude  ->  Configure  ->  add $NWO"
+  if [ -t 0 ]; then
+    printf 'Open that page now? [Y/n] '
+    read -r ans
+    case "$ans" in ''|[Yy]*) open_url "https://github.com/apps/claude/installations/new" ;; esac
+    printf 'Press Enter once the App has access to %s... ' "$NWO"
+    read -r _
+  fi
 fi
 
 # ---- secret in BOTH stores (the marquee gotcha) ----------------------------
@@ -728,11 +893,18 @@ if [ -n "$TOKEN" ]; then
   else
     warn "could not set $SECRET (Dependabot store)"
   fi
+elif gh secret list --repo "$NWO" --json name --jq '.[].name' 2>/dev/null | grep -qxF "$SECRET" \
+  && gh secret list --repo "$NWO" --app dependabot --json name --jq '.[].name' 2>/dev/null | grep -qxF "$SECRET"; then
+  # A reinstall (how a repo upgrades) without the token at hand: both stores
+  # already holding it is the installed state, not a step left to do.
+  info "$SECRET is already set in both secret stores; keeping it."
 else
   warn "no CLAUDE_CODE_OAUTH_TOKEN provided — set it in BOTH stores yourself:"
   info "gh secret set $SECRET --repo $NWO"
   info "gh secret set $SECRET --repo $NWO --app dependabot"
 fi
+
+copy_ci_secrets
 
 # ---- enable auto-merge -----------------------------------------------------
 if gh api -X PATCH "repos/$NWO" -F allow_auto_merge=true >/dev/null 2>&1; then

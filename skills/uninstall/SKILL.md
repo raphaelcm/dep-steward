@@ -38,6 +38,8 @@ gh secret delete CLAUDE_CODE_OAUTH_TOKEN
 gh secret delete CLAUDE_CODE_OAUTH_TOKEN --app dependabot
 ```
 
+The installer may also have copied the secrets the repo's CI reads into the Dependabot store, so CI could pass on Dependabot's PRs. They are copies of the Actions secrets, which stay. Show the user the other names `gh secret list --app dependabot` lists, and delete with `gh secret delete <NAME> --app dependabot` only the ones they confirm, since they may have set some themselves.
+
 The file deletions are working-tree changes the user commits like any other change; the pipeline stops when that commit reaches the default branch.
 
 ## 4. Report what was deliberately left alone

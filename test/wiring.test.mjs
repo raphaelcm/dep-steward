@@ -38,6 +38,8 @@ case "$cmd" in
     # command can look right while storing the wrong thing. Mirrors gh: a
     # non-empty --body is stored verbatim; without --body, stdin is read and
     # its trailing newlines are dropped (cli/cli pkg/cmd/secret/set getBody).
+    # The names each store already holds (GH_LISTED_SECRETS, both stores).
+    if [ "$sub" = list ]; then printf '%s\\n' \${GH_LISTED_SECRETS:-}; exit 0; fi
     if [ "$sub" = set ]; then
       name="$3"; store=actions; has_body=''; body=''
       shift 3
@@ -212,6 +214,15 @@ test('a token that fails verification is never stored (no opaque bad-token insta
     `a token rejected by the probe must not be written to either store. gh log:\n${badLog}`);
   // Contrast: the default run (probe returns OK) DOES set it in both stores —
   // proven by the 'sets the secret ...' tests above, which share this harness.
+});
+
+test('a reinstall without the token, where both stores already hold it, keeps it and asks for nothing', () => {
+  // Re-running the installer is how a repo upgrades. A token already in both
+  // stores is the installed state, not something the user still has to set.
+  const { stdout, stderr, log: reLog } = runInstaller({ CLAUDE_CODE_OAUTH_TOKEN: '', GH_LISTED_SECRETS: 'CLAUDE_CODE_OAUTH_TOKEN' });
+  assert.match(stdout, /CLAUDE_CODE_OAUTH_TOKEN is already set in both secret stores/);
+  assert.doesNotMatch(`${stdout}${stderr}`, /set it in BOTH stores yourself/);
+  assert.doesNotMatch(reLog, /secret set CLAUDE_CODE_OAUTH_TOKEN/);
 });
 
 // ---- the claude-code-action pin survives a real reinstall --------------------

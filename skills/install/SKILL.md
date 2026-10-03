@@ -25,14 +25,16 @@ Run these and tell the user what you found. Each failure has a specific fix, so 
 sh -c "$(curl -fsSL https://raw.githubusercontent.com/raphaelcm/dep-steward/main/install.sh)" -- --dry-run
 ```
 
-Add `--ci-name "<name>"` when you determined it in preflight, plus anything from `$ARGUMENTS`. Summarize the output for the user: the files it writes into `.github/`, the label it creates, the secrets it sets, and the repo settings it touches. It never touches their source, their existing CI workflow, branch-protection rules, or git history.
+Add `--ci-name "<name>"` when you determined it in preflight, plus anything from `$ARGUMENTS`. Summarize the output for the user: the files it writes into `.github/`, the label it creates, the secrets it sets (including any CI secrets it would copy into the Dependabot store, which CI needs to pass on Dependabot's PRs), and the repo settings it touches. It never touches their source, their existing CI workflow, branch-protection rules, or git history.
 
 ## 3. Install
 
 Run the same command without `--dry-run` when both of these hold:
 
 - `CLAUDE_CODE_OAUTH_TOKEN` is already set in the environment, **or** already present in both secret stores; and
-- the user has confirmed the Claude Code GitHub App has access to the repo.
+- the user has confirmed the Claude Code GitHub App has access to the repo (autofix pushes its fixes as it; with `--no-autofix` it is not needed).
+
+When the dry run lists CI secrets to copy into the Dependabot store, add `--copy-ci-secrets`: without it a run with no terminal copies nothing, and CI then fails on every Dependabot PR. Tell the user which secrets, and why, in your summary.
 
 Otherwise **stop and hand off**, because the two missing pieces are browser-interactive and cannot be completed by a tool:
 
