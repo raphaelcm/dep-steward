@@ -98,37 +98,47 @@ async function resolveFor(workflowRun) {
 
 const BUMP = PRS[0].headRefName;
 
+// Finished runs as GitHub describes them. A run's `name` is its run name: the
+// workflow's `run-name` when it sets one, so a replay of the review is named
+// "Dependabot PR review of #N", not after its workflow (measured on
+// Runsense-ai/runsense run 37151861865). `path` is the workflow's own.
+const REVIEW_PATH = '.github/workflows/dependabot-review.yml';
+const CI_PATH = '.github/workflows/ci.yml';
+const ciRun = (over) => ({ event: 'pull_request', name: 'CI', path: CI_PATH, head_branch: BUMP, display_title: 'Bump ioredis from 5.4.1 to 6.0.0', ...over });
+const reviewRun = (over) => ({ event: 'pull_request', name: 'Dependabot PR review', path: REVIEW_PATH, head_branch: BUMP, display_title: 'Bump ioredis from 5.4.1 to 6.0.0', ...over });
+const replayOf = (title) => reviewRun({ event: 'workflow_dispatch', head_branch: 'main', name: title, display_title: title });
+
 test('a replay names its PR in its run name; every other run keeps the default name', () => {
   assert.equal(reviewRunName({ pr_number: 7 }), 'Dependabot PR review of #7');
   assert.equal(String(reviewRunName({})).trim(), '');
 });
 
 test('CI finishing on a Dependabot PR wakes the gate for that PR', async () => {
-  const r = await resolveFor({ event: 'pull_request', name: 'CI', head_branch: BUMP, display_title: 'Bump ioredis from 5.4.1 to 6.0.0' });
+  const r = await resolveFor(ciRun());
   assert.equal(r.skipped, false);
   assert.equal(r.failed, false, r.log);
   assert.deepEqual(r.outputs, { pr_number: '7', head_branch: BUMP });
 });
 
 test('the review finishing on a Dependabot PR wakes the gate for that PR', async () => {
-  const r = await resolveFor({ event: 'pull_request', name: 'Dependabot PR review', head_branch: BUMP, display_title: 'Bump ioredis from 5.4.1 to 6.0.0' });
+  const r = await resolveFor(reviewRun());
   assert.equal(r.failed, false, r.log);
   assert.deepEqual(r.outputs, { pr_number: '7', head_branch: BUMP });
 });
 
 test('a replayed review wakes the gate for the PR it replayed, though it ran on the default branch', async () => {
-  const r = await resolveFor({ event: 'workflow_dispatch', name: 'Dependabot PR review', head_branch: 'main', display_title: reviewRunName({ pr_number: 7 }) });
+  const r = await resolveFor(replayOf(reviewRunName({ pr_number: 7 })));
   assert.equal(r.skipped, false, 'a replay must wake the gate');
   assert.equal(r.failed, false, r.log);
   assert.deepEqual(r.outputs, { pr_number: '7', head_branch: BUMP });
 });
 
 for (const [what, run] of [
-  ['a replay of a closed PR', { event: 'workflow_dispatch', name: 'Dependabot PR review', head_branch: 'main', display_title: 'Dependabot PR review of #8' }],
-  ['a replay of a PR that is not a Dependabot bump', { event: 'workflow_dispatch', name: 'Dependabot PR review', head_branch: 'main', display_title: 'Dependabot PR review of #9' }],
-  ['a replay of a PR that does not exist', { event: 'workflow_dispatch', name: 'Dependabot PR review', head_branch: 'main', display_title: 'Dependabot PR review of #404' }],
-  ['a replay whose run name names no PR', { event: 'workflow_dispatch', name: 'Dependabot PR review', head_branch: 'main', display_title: 'Dependabot PR review' }],
-  ['a run name that only starts like a replay', { event: 'workflow_dispatch', name: 'Dependabot PR review', head_branch: 'main', display_title: 'Dependabot PR review of #7; and #9' }],
+  ['a replay of a closed PR', replayOf('Dependabot PR review of #8')],
+  ['a replay of a PR that is not a Dependabot bump', replayOf('Dependabot PR review of #9')],
+  ['a replay of a PR that does not exist', replayOf('Dependabot PR review of #404')],
+  ['a replay whose run name names no PR', replayOf('Dependabot PR review')],
+  ['a run name that only starts like a replay', replayOf('Dependabot PR review of #7; and #9')],
 ]) {
   test(`${what} resolves no PR, quietly`, async () => {
     const r = await resolveFor(run);
@@ -138,9 +148,9 @@ for (const [what, run] of [
 }
 
 for (const [what, run] of [
-  ['a dispatched CI run', { event: 'workflow_dispatch', name: 'CI', head_branch: 'main', display_title: 'CI' }],
-  ["an autofix run (the review workflow's workflow_run event)", { event: 'workflow_run', name: 'Dependabot PR review', head_branch: 'main', display_title: 'Dependabot PR review' }],
-  ['CI on a branch that is not a Dependabot bump', { event: 'pull_request', name: 'CI', head_branch: 'feature/not-a-bump', display_title: 'Some feature' }],
+  ['a dispatched CI run, even one named like a replay', ciRun({ event: 'workflow_dispatch', head_branch: 'main', name: 'Dependabot PR review of #7', display_title: 'Dependabot PR review of #7' })],
+  ["an autofix run (the review workflow's workflow_run event)", reviewRun({ event: 'workflow_run', head_branch: 'main', display_title: 'Dependabot PR review' })],
+  ['CI on a branch that is not a Dependabot bump', ciRun({ head_branch: 'feature/not-a-bump', display_title: 'Some feature' })],
 ]) {
   test(`${what} does not wake the gate`, async () => {
     const r = await resolveFor(run);
