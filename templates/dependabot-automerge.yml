@@ -55,13 +55,15 @@ jobs:
     # inputs, so the review names the PR in its run name ("Dependabot PR
     # review of #N") and this reads it back. Without that, a replay's verdict
     # would wait for the PR's next CI run, which for a green PR may never come.
-    # Any other finished run (an autofix run, a dispatched CI run) is about no
-    # PR the gate judges.
+    # The replay is told by its workflow's path: a run's `name` is its run
+    # name, which for a replay is that same "Dependabot PR review of #N". Any
+    # other finished run (an autofix run, a dispatched CI run) is about no PR
+    # the gate judges.
     if: >
       (github.event.workflow_run.event == 'pull_request' &&
        startsWith(github.event.workflow_run.head_branch, 'dependabot/')) ||
       (github.event.workflow_run.event == 'workflow_dispatch' &&
-       github.event.workflow_run.name == 'Dependabot PR review')
+       github.event.workflow_run.path == '.github/workflows/dependabot-review.yml')
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
