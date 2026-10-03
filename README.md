@@ -89,10 +89,11 @@ GitHub settings it configures (via `gh`):
 
 - Creates the `needs-human-review` label.
 - Sets `CLAUDE_CODE_OAUTH_TOKEN` in **both** the Actions secret store **and** the Dependabot secret store (see FAQ — this is the #1 thing people get wrong).
+- Copies the secrets your CI reads into the Dependabot secret store, after asking once, so CI can pass on Dependabot's PRs at all (see FAQ). Nobody handles a value: a short-lived run seals each one for that store and the installer uploads only the sealed copy.
 - Enables "Allow auto-merge" on the repo.
 - Checks branch protection and **advises** if CI isn't a required check (it never changes your protection rules).
 
-It does not touch your source, your existing CI workflow, or your git history.
+It does not touch your source, your existing CI workflow, or your git history. (Copying the CI secrets creates one short-lived branch through GitHub's API, holding only the sealing workflow and sharing no history with yours, and deletes it with its run. Nothing is pushed from your checkout, so your git hooks never run.)
 
 ## Autofix (on by default)
 
@@ -160,6 +161,9 @@ That puts `/dep-steward-summary` in your `/` menu everywhere. (Prefer a repo-sha
 **Why does the token need to be in two places?**
 A Dependabot-triggered workflow run reads secrets from the *Dependabot* secret store, not the Actions store — the Actions store is invisible to it. If the token is only in Actions, the review job silently gets an empty token on real Dependabot PRs. The installer sets both so you never hit this. (It cost us weeks before we understood it.)
 
+**My CI needs a secret (an API key, say). Will it pass on Dependabot's PRs?**
+Yes, once it's in the Dependabot secret store, and the installer puts it there. GitHub runs a Dependabot PR's workflows with that store only, so a CI that reads an Actions secret fails on every Dependabot PR, and the gate, which merges only on green CI, never merges one. The installer finds the secrets your CI workflow reads (and the local reusable workflows it calls), and copies any the Dependabot store lacks. It asks first, because a new dependency version's code can then read them while CI runs; pass `--copy-ci-secrets` to say yes without a prompt. It never overwrites a secret already in the Dependabot store.
+
 **Must my CI workflow be named `CI`?**
 No. The installer detects your CI workflow's name and templates it into the pipeline. Pass `--ci-name "<name>"` to override. The gate keys off this exact name, so it does need *a* CI workflow to exist.
 
@@ -202,7 +206,7 @@ The review job's final step prints the agent's *actual* error, read from `claude
 It's conservative by default: a major bump merges only if the model affirmatively recommends it *and* finds no affected usage. To make majors always wait for a human, tell the reviewer to always escalate majors (edit `.github/dependabot-review-prompt.md`), or require human review on those PRs via branch protection.
 
 **How do I uninstall?**
-Delete the files above, remove the `needs-human-review` label, and delete the `CLAUDE_CODE_OAUTH_TOKEN` secret from both stores . No other footprint. `/dep-steward:uninstall` walks it for you, including the second secret store people forget.
+Delete the files above, remove the `needs-human-review` label, and delete the `CLAUDE_CODE_OAUTH_TOKEN` secret from both stores, plus any CI secrets the installer copied into the Dependabot store. No other footprint. `/dep-steward:uninstall` walks it for you, including the second secret store people forget.
 
 ## Development
 
@@ -226,6 +230,8 @@ node --test test/*.test.mjs
 - `test/action-pin.test.mjs` — a reinstall keeps the repo's own `claude-code-action` pin when it is newer than the template's, takes the template's when it is older, keeps the repo's and warns when the versions cannot be compared, and renders a fresh install byte-for-byte as before.
 - `test/review-lint.test.mjs` — the reviewer's prose guard, in both of its modes: it refuses the comment that actually leaked and passes verbatim changelog text that merely mentions CI, and as a hook it blocks only the comment post and never blocks on its own failure.
 - `test/prompt-hygiene.test.mjs` — the rendered review prompt never raises CI as something to consider, with a self-check that its patterns still catch what leaked (so it cannot go quietly vacuous).
+- `test/gate-wake.test.mjs` — which finished runs wake the gate and for which PR, a replayed review included, through the real `resolve` job.
+- `test/ci-secrets.test.mjs` — the installer copies exactly the secrets CI reads that the Dependabot store lacks, as values sealed by a run of the workflow it actually pushed (run by the step simulator with a stand-in cipher), on a parentless branch it deletes afterwards, and copies nothing without consent.
 
 Working on the plugin locally:
 
