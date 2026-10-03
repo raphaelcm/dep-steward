@@ -247,12 +247,17 @@ jobs:
           # `labels` rides along on the query we already make — it costs nothing
           # and is what keeps the escalation below idempotent.
           PR_JSON=$(gh pr view "$PR_NUMBER" --repo "$REPO" \
-            --json state,headRefOid,author,comments,labels --jq '{state, headRefOid, author, comments, labels}')
+            --json state,headRefOid,author,labels --jq '{state, headRefOid, author, labels}')
           PR_STATE=$(echo "$PR_JSON" | jq -r '.state')
           PR_HEAD_SHA=$(echo "$PR_JSON" | jq -r '.headRefOid // empty')
           PR_AUTHOR=$(echo "$PR_JSON" | jq -r '.author.login')
-          PR_COMMENTS_JSON=$(echo "$PR_JSON" | jq -c '.comments')
           PR_LABELS=$(echo "$PR_JSON" | jq -r '.labels[].name')
+          # Comments come from the REST API, not `gh pr view --json comments`:
+          # gh prints a comment's author as a bare login, so the review's
+          # `github-actions` would look the same as a person with that login.
+          # REST names it `github-actions[bot]`, which no person can hold.
+          PR_COMMENTS_JSON=$(gh api --paginate "repos/$REPO/issues/$PR_NUMBER/comments?per_page=100" \
+            --jq '.[] | {author: {login: .user.login}, body, createdAt: .created_at}' | jq -sc .)
           CHANGED_PATHS=$(gh pr diff "$PR_NUMBER" --repo "$REPO" --name-only)
 
           export HEAD_BRANCH CI_CONCLUSION PR_AUTHOR PR_STATE CHANGED_PATHS PR_COMMENTS_JSON

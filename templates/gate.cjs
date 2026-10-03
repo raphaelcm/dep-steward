@@ -67,22 +67,21 @@ const DEPENDABOT_AUTHORS = new Set(['app/dependabot', 'dependabot[bot]']);
 
 // Trusted commenters whose AUTOMERGE-DECISION-V1 blocks the gate will honor.
 // One identity: the review workflow's GITHUB_TOKEN, which the review step
-// hands its agent, so the verdict comment is github-actions'. Both spellings
-// are accepted: `app/github-actions` from gh-CLI JSON, `github-actions[bot]`
-// from event payloads.
+// hands its agent, so the verdict comment is github-actions'. One spelling:
+// the workflow reads comments from the REST API, which names that identity
+// `github-actions[bot]`, a login no person can hold. (`gh pr view --json
+// comments` prints the bare `github-actions`, the same as it would print a
+// person with that login, so the workflow does not read comments that way.)
 //
-// Not the Claude GitHub App (`claude` / `claude[bot]`): no agent in this
-// pipeline holds its token any more, and an adopter's own @claude workflow
-// posts as that App too, so its blocks are not the review's vote. The other
-// github-actions poster that reads attacker-influenced text, the autofix
-// fixer, has a hook that refuses any post carrying a V1 block.
+// Not the Claude GitHub App (`claude[bot]`): no agent in this pipeline holds
+// its token any more, and an adopter's own @claude workflow posts as that App
+// too, so its blocks are not the review's vote. The other github-actions
+// poster that reads attacker-influenced text, the autofix fixer, has a hook
+// that refuses any post carrying a V1 block.
 //
 // An external commenter (any human, any other bot) including a V1 block has
 // it ignored, which prevents "post a fake decision block to force a merge".
-const TRUSTED_DECISION_AUTHORS = new Set([
-  'app/github-actions',
-  'github-actions[bot]',
-]);
+const TRUSTED_DECISION_AUTHORS = new Set(['github-actions[bot]']);
 
 const V1_OPEN = '<!-- AUTOMERGE-DECISION-V1 -->';
 const V1_CLOSE = '<!-- /AUTOMERGE-DECISION-V1 -->';
@@ -195,15 +194,13 @@ function validateDecisionShape(d) {
   return true;
 }
 
-// Returns { decision: <parsed-decision-object> } on success,
-// { decision: null } when no trusted V1 block exists (legitimate "not yet"),
-// or { error: <message> } when a V1 block exists but its content is malformed
-// — surfaces the error rather than silently falling back to an older block,
-// because the LLM may have posted a newer (intended-to-supersede) block.
-function findLatestDecision(commentsJson) {
+// PR_COMMENTS_JSON is `[{author: {login}, body, createdAt}, ...]`, projected
+// from the REST API's issue comments. Returns { comments } or { error }; an
+// empty value is no comments.
+function parseComments(commentsJson) {
   const text = (commentsJson || '').trim();
   if (text === '') {
-    return { decision: null };
+    return { comments: [] };
   }
   let comments;
   try {
@@ -214,10 +211,29 @@ function findLatestDecision(commentsJson) {
   if (!Array.isArray(comments)) {
     return { error: 'PR_COMMENTS_JSON does not parse as a JSON array' };
   }
-  const candidates = comments
+  return { comments };
+}
+
+// The comments the gate counts as the review's vote: a trusted author, and a
+// V1 open marker. In the order given.
+function trustedDecisionComments(comments) {
+  return comments
     .filter((c) => c && c.author && typeof c.author.login === 'string')
     .filter((c) => TRUSTED_DECISION_AUTHORS.has(c.author.login))
-    .filter((c) => typeof c.body === 'string' && c.body.includes(V1_OPEN))
+    .filter((c) => typeof c.body === 'string' && c.body.includes(V1_OPEN));
+}
+
+// Returns { decision: <parsed-decision-object> } on success,
+// { decision: null } when no trusted V1 block exists (legitimate "not yet"),
+// or { error: <message> } when a V1 block exists but its content is malformed
+// — surfaces the error rather than silently falling back to an older block,
+// because the LLM may have posted a newer (intended-to-supersede) block.
+function findLatestDecision(commentsJson) {
+  const { comments, error } = parseComments(commentsJson);
+  if (error) {
+    return { error };
+  }
+  const candidates = trustedDecisionComments(comments)
     .sort((a, b) => String(b.createdAt || '').localeCompare(String(a.createdAt || '')));
 
   if (candidates.length === 0) {
@@ -418,6 +434,25 @@ if ((process.env.GATE_MODE || '') === 'classify') {
   const headBranch = (process.env.HEAD_BRANCH || '').trim();
   const isGroup = ELIGIBLE_GROUP_PREFIXES.some((pfx) => headBranch.startsWith(pfx));
   process.stdout.write(`group=${isGroup}\n`);
+  process.exit(0);
+}
+
+// Verdicts mode, used by the review workflow's deliverable-assertion — NOT the
+// merge path. It prints the bodies of the decision comments the merge path
+// would trust, posted at or after SINCE, so the review job and the gate can
+// never disagree about whose verdict counts: a verdict the gate would ignore
+// is no deliverable. It authorizes nothing.
+if ((process.env.GATE_MODE || '') === 'verdicts') {
+  const { comments, error } = parseComments(process.env.PR_COMMENTS_JSON);
+  if (error) {
+    process.stderr.write(`${error}\n`);
+    process.exit(1);
+  }
+  const since = process.env.SINCE || '';
+  const bodies = trustedDecisionComments(comments)
+    .filter((c) => String(c.createdAt || '') >= since)
+    .map((c) => c.body);
+  process.stdout.write(bodies.join('\n'));
   process.exit(0);
 }
 

