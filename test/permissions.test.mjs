@@ -279,7 +279,7 @@ test('the parser finds every job with a non-empty permissions block', () => {
   // A parser that silently finds nothing would make every assertion below
   // vacuously true, so this is the load-bearing precondition for the file.
   assert.deepEqual(Object.keys(JOBS).sort(), ['autofix', 'autofix-push', 'review']);
-  assert.deepEqual(Object.keys(AM_JOBS), ['auto-merge']);
+  assert.deepEqual(Object.keys(AM_JOBS), ['resolve', 'auto-merge']);
   for (const [n, j] of [...Object.entries(JOBS), ...Object.entries(AM_JOBS)]) {
     assert.ok(
       Object.keys(j.permissions).length > 0,

@@ -1,4 +1,8 @@
 name: Dependabot PR review
+# A replay names its PR, so the auto-merge workflow can wake for it when this
+# run finishes: a dispatched run is on the default branch, and a workflow_run
+# payload carries no inputs. Every other run keeps GitHub's default name.
+run-name: "${{ inputs.pr_number && format('Dependabot PR review of #{0}', inputs.pr_number) || '' }}"
 
 # The agents. Each reads attacker-influenced text (a dependency's changelog
 # and diff, a failing build's log), so each job that runs one holds a token

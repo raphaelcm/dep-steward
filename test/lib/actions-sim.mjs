@@ -238,6 +238,14 @@ export function evaluate(expression, ctx) {
     contains: (s, x) => (Array.isArray(s)
       ? s.some((e) => looseEquals(e, x))
       : String(s ?? '').toLowerCase().includes(String(x ?? '').toLowerCase())),
+    // GitHub's format(): `{N}` is the Nth argument as text, `{{` and `}}` are
+    // literal braces.
+    format: (fmt, ...args) => String(fmt).replace(/\{\{|\}\}|\{(\d+)\}/g, (m, n) => {
+      if (m === '{{') return '{';
+      if (m === '}}') return '}';
+      if (Number(n) >= args.length) throw new Error(`expression: format() has no argument ${n}`);
+      return toText(args[Number(n)]);
+    }),
   };
 
   function primary() {
