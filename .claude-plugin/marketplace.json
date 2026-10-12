@@ -11,7 +11,7 @@
   "plugins": [
     {
       "name": "dep-steward",
-      "source": "./",
+      "source": "./plugin",
       "description": "Install, inspect, and remove the dep-steward Dependabot pipeline: Dependabot auto-updates your dependencies, a Claude agent auto-reviews each PR, and a deterministic gate auto-merges only when it is safe.",
       "category": "development",
       "keywords": [

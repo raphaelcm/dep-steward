@@ -66,8 +66,8 @@ function renderReference() {
   const out = mkdtempSync(join(tmpdir(), 'ds-perm-out-'));
   execFileSync(
     'sh',
-    [join(REPO, 'install.sh'), '--render-only', '--out', out, '--ci-name', 'CI', '--assignee', 'octocat'],
-    { cwd: fakeRepo, env: { ...process.env, DEP_STEWARD_SRC: REPO }, stdio: 'pipe' },
+    [join(REPO, 'plugin', 'install.sh'), '--render-only', '--out', out, '--ci-name', 'CI', '--assignee', 'octocat'],
+    { cwd: fakeRepo, env: { ...process.env, DEP_STEWARD_SRC: join(REPO, 'plugin') }, stdio: 'pipe' },
   );
   return out;
 }

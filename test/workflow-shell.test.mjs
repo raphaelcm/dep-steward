@@ -45,8 +45,8 @@ function render(extraArgs = []) {
   const out = mkdtempSync(join(tmpdir(), 'ds-sh-out-'));
   execFileSync(
     'sh',
-    [join(REPO, 'install.sh'), '--render-only', '--out', out, '--ci-name', 'CI', '--assignee', 'octocat', ...extraArgs],
-    { cwd: fakeRepo, env: { ...process.env, DEP_STEWARD_SRC: REPO }, stdio: 'pipe' },
+    [join(REPO, 'plugin', 'install.sh'), '--render-only', '--out', out, '--ci-name', 'CI', '--assignee', 'octocat', ...extraArgs],
+    { cwd: fakeRepo, env: { ...process.env, DEP_STEWARD_SRC: join(REPO, 'plugin') }, stdio: 'pipe' },
   );
   // Both workflows the installer writes; their run blocks are parsed alike.
   return ['dependabot-review.yml', 'dependabot-automerge.yml']
@@ -137,8 +137,8 @@ function renderTo() {
   const out = mkdtempSync(join(tmpdir(), 'ds-run-out-'));
   execFileSync(
     'sh',
-    [join(REPO, 'install.sh'), '--render-only', '--out', out, '--ci-name', 'CI', '--assignee', 'octocat'],
-    { cwd: fakeRepo, env: { ...process.env, DEP_STEWARD_SRC: REPO }, stdio: 'pipe' },
+    [join(REPO, 'plugin', 'install.sh'), '--render-only', '--out', out, '--ci-name', 'CI', '--assignee', 'octocat'],
+    { cwd: fakeRepo, env: { ...process.env, DEP_STEWARD_SRC: join(REPO, 'plugin') }, stdio: 'pipe' },
   );
   return out;
 }

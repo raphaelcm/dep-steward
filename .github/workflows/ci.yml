@@ -17,7 +17,7 @@ jobs:
         with:
           node-version: '24'
       - name: Shellcheck the installer
-        run: shellcheck -s sh install.sh
+        run: shellcheck -s sh install.sh plugin/install.sh
       # Adopters lint the workflow this repo renders, so the tests lint it too
       # (test/actionlint.test.mjs). Checksummed by the Go module proxy.
       - uses: actions/setup-go@v5

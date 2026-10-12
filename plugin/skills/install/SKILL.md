@@ -5,7 +5,7 @@ argument-hint: "[extra installer flags — e.g. --no-autofix, --ci-name \"Build\
 
 Set up **dep-steward** in the repository the user is working in: Dependabot auto-updates the dependencies, a Claude agent auto-reviews each PR it opens, and a deterministic gate auto-merges only when it is safe.
 
-The installer is `install.sh` from `raphaelcm/dep-steward`. It is idempotent, so re-running it is safe. Everything below runs it non-interactively (its interactive prompts are all TTY-guarded, so it never hangs when a tool runs it — it either uses a flag you passed or stops with a clear message).
+The installer is `install.sh`, bundled with this plugin at `${CLAUDE_PLUGIN_ROOT}/install.sh`. It is idempotent, so re-running it is safe. Everything below runs it non-interactively (its interactive prompts are all TTY-guarded, so it never hangs when a tool runs it — it either uses a flag you passed or stops with a clear message).
 
 Pass `$ARGUMENTS` through to the installer if the user gave any.
 
@@ -22,7 +22,7 @@ Run these and tell the user what you found. Each failure has a specific fix, so 
 ## 2. Show what will change, before changing it
 
 ```sh
-sh -c "$(curl -fsSL https://raw.githubusercontent.com/raphaelcm/dep-steward/main/install.sh)" -- --dry-run
+sh "${CLAUDE_PLUGIN_ROOT}/install.sh" --dry-run
 ```
 
 Add `--ci-name "<name>"` when you determined it in preflight, plus anything from `$ARGUMENTS`. Summarize the output for the user: the files it writes into `.github/`, the label it creates, the secrets it sets (including any CI secrets it would copy into the Dependabot store, which CI needs to pass on Dependabot's PRs), and the repo settings it touches. It never touches their source, their existing CI workflow, branch-protection rules, or git history.
@@ -44,7 +44,7 @@ Otherwise **stop and hand off**, because the two missing pieces are browser-inte
 Give the user the exact line to run in their own terminal, and say plainly which step needs them:
 
 ```sh
-sh -c "$(curl -fsSL https://raw.githubusercontent.com/raphaelcm/dep-steward/main/install.sh)"
+sh "${CLAUDE_PLUGIN_ROOT}/install.sh"
 ```
 
 Run interactively, the installer mints the token for them, verifies it authenticates before storing it, and opens the App page.

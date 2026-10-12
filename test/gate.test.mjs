@@ -39,9 +39,9 @@ function renderGate() {
     writeFileSync(join(fakeRepo, m), '\n');
   }
   const out = mkdtempSync(join(tmpdir(), 'ds-out-'));
-  execFileSync('sh', [join(REPO, 'install.sh'), '--render-only', '--out', out, '--ci-name', 'CI'], {
+  execFileSync('sh', [join(REPO, 'plugin', 'install.sh'), '--render-only', '--out', out, '--ci-name', 'CI'], {
     cwd: fakeRepo,
-    env: { ...process.env, DEP_STEWARD_SRC: REPO },
+    env: { ...process.env, DEP_STEWARD_SRC: join(REPO, 'plugin') },
     stdio: 'pipe',
   });
   return join(out, '.github', 'dependabot-automerge', 'gate.cjs');

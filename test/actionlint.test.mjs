@@ -28,8 +28,8 @@ function render(extraArgs = []) {
   const out = mkdtempSync(join(tmpdir(), 'ds-al-out-'));
   execFileSync(
     'sh',
-    [join(REPO, 'install.sh'), '--render-only', '--out', out, '--ci-name', 'CI', '--assignee', 'octocat', ...extraArgs],
-    { cwd: fakeRepo, env: { ...process.env, DEP_STEWARD_SRC: REPO }, stdio: 'pipe' },
+    [join(REPO, 'plugin', 'install.sh'), '--render-only', '--out', out, '--ci-name', 'CI', '--assignee', 'octocat', ...extraArgs],
+    { cwd: fakeRepo, env: { ...process.env, DEP_STEWARD_SRC: join(REPO, 'plugin') }, stdio: 'pipe' },
   );
   return ['dependabot-review.yml', 'dependabot-automerge.yml'].map((f) => join(out, '.github/workflows', f));
 }
