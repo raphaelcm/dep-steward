@@ -84,8 +84,8 @@ function render({ existing = null, args = [] } = {}) {
   const out = mkdtempSync(join(tmpdir(), 'ds-pin-out-'));
   const r = spawnSync(
     'sh',
-    [join(REPO, 'install.sh'), '--render-only', '--out', out, '--ci-name', 'CI', '--assignee', 'octocat', ...args],
-    { cwd: fakeRepo, env: { ...process.env, DEP_STEWARD_SRC: REPO }, encoding: 'utf8' },
+    [join(REPO, 'plugin', 'install.sh'), '--render-only', '--out', out, '--ci-name', 'CI', '--assignee', 'octocat', ...args],
+    { cwd: fakeRepo, env: { ...process.env, DEP_STEWARD_SRC: join(REPO, 'plugin') }, encoding: 'utf8' },
   );
   assert.equal(r.status, 0, `render failed:\n${r.stderr}`);
   const workflow = readFileSync(join(out, WORKFLOW), 'utf8');

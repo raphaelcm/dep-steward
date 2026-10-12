@@ -13,13 +13,13 @@ This is not blind merging. `dep-steward` configures Dependabot to **auto-update*
 Run this in the repo you want to protect:
 
 ```sh
-sh -c "$(curl -fsSL https://raw.githubusercontent.com/raphaelcm/dep-steward/main/install.sh)"
+sh -c "$(curl -fsSL https://raw.githubusercontent.com/raphaelcm/dep-steward/main/plugin/install.sh)"
 ```
 
 It inspects your repo, shows what it will change, and does it. Re-running is safe (every step is idempotent), and it is how you upgrade. A re-run keeps the `anthropics/claude-code-action` version your repo's Dependabot has already moved to whenever that is newer than the one dep-steward ships, so an upgrade never downgrades the action; every run says which pin it kept. Preview without touching anything:
 
 ```sh
-sh -c "$(curl -fsSL https://raw.githubusercontent.com/raphaelcm/dep-steward/main/install.sh)" -- --dry-run
+sh -c "$(curl -fsSL https://raw.githubusercontent.com/raphaelcm/dep-steward/main/plugin/install.sh)" -- --dry-run
 ```
 
 ### Prerequisites
@@ -104,7 +104,7 @@ The fixer is also told the failing run's own timestamp and weekday rather than l
 It's the one part of dep-steward that drafts changes to *your* source — always in a PR you review and merge, never on your default branch. If you'd rather no agent did that, turn it off at install:
 
 ```
-sh -c "$(curl -fsSL https://raw.githubusercontent.com/raphaelcm/dep-steward/main/install.sh)" -- --no-autofix
+sh -c "$(curl -fsSL https://raw.githubusercontent.com/raphaelcm/dep-steward/main/plugin/install.sh)" -- --no-autofix
 ```
 
 **It never merges — you authorize every merge.** Three things keep that safe:
@@ -127,7 +127,7 @@ If that token can't be had or the push is refused, the fix still goes out with `
 
 ## Claude Code plugin
 
-This repo is also a [Claude Code plugin](https://code.claude.com/docs/en/plugins) **and its own marketplace**, so it installs in two commands, from here, with no third-party listing in the way:
+dep-steward is also a [Claude Code plugin](https://code.claude.com/docs/en/plugins), and this repo is **its own marketplace**, so it installs in two commands, straight from here:
 
 ```
 /plugin marketplace add raphaelcm/dep-steward
@@ -136,7 +136,7 @@ This repo is also a [Claude Code plugin](https://code.claude.com/docs/en/plugins
 
 Its three commands — `/dep-steward:install`, `/dep-steward:summary`, `/dep-steward:uninstall` — then follow you into every repo you work in. (From a shell, the same two as `claude plugin marketplace add raphaelcm/dep-steward` and `claude plugin install dep-steward@dep-steward`.)
 
-A listing in [Anthropic's community marketplace](https://github.com/anthropics/claude-plugins-community) is submitted and pending review. That would add a second install path — `@claude-community` — rather than replace this one, so nothing here depends on it.
+The plugin itself is the [`plugin/`](plugin) folder: its manifest, its three skills, the installer, and the templates the installer writes. The skills run that bundled installer, so the version you installed is the version that runs.
 
 | Command | What it does |
 |---|---|
@@ -150,7 +150,7 @@ These are **personal, install-once** tools: they act on whatever repo you're cur
 
 ```sh
 mkdir -p ~/.claude/commands
-curl -fsSL https://raw.githubusercontent.com/raphaelcm/dep-steward/main/skills/summary/SKILL.md \
+curl -fsSL https://raw.githubusercontent.com/raphaelcm/dep-steward/main/plugin/skills/summary/SKILL.md \
   > ~/.claude/commands/dep-steward-summary.md
 ```
 
@@ -226,7 +226,7 @@ node --test test/*.test.mjs
 - `test/agent-writes.test.mjs` — runs the rendered review job with a reviewer that rewrites every pipeline script it can reach: none of the rewrites runs, and the real lint and gate still do their jobs (the autofix bounds check has the same test in `autofix-push.test.mjs`).
 - `test/actions-sim.test.mjs` — the GitHub rules the step simulator (`test/lib/actions-sim.mjs`) copies: implicit `success()`, `continue-on-error`, unset outputs, case-insensitive comparison, loud refusal of anything it does not simulate.
 - `test/permissions.test.mjs` — no job that runs an agent can push, merge, or mint a token that could, and the jobs that can run no agent; each agent job grants every GitHub scope the commands in its own prompt need, and the reviewer allow-lists nothing that could reach — even via a flag on a wildcard entry — a scope its job does not grant, nor any `gh` command its prompt never orders. Derived from the rendered workflows and prompts rather than hardcoded.
-- `test/plugin.test.mjs` — the plugin and marketplace manifests parse and agree, every skill carries a description, and the README's raw-file links resolve on disk.
+- `test/plugin.test.mjs` — the plugin and marketplace manifests parse and agree, every skill carries a description, the README's raw-file links resolve on disk, `plugin/` holds only what the plugin runs, and no skill downloads code.
 - `test/action-pin.test.mjs` — a reinstall keeps the repo's own `claude-code-action` pin when it is newer than the template's, takes the template's when it is older, keeps the repo's and warns when the versions cannot be compared, and renders a fresh install byte-for-byte as before.
 - `test/review-lint.test.mjs` — the reviewer's prose guard, in both of its modes: it refuses the comment that actually leaked and passes verbatim changelog text that merely mentions CI, and as a hook it blocks only the comment post and never blocks on its own failure.
 - `test/prompt-hygiene.test.mjs` — the rendered review prompt never raises CI as something to consider, with a self-check that its patterns still catch what leaked (so it cannot go quietly vacuous).

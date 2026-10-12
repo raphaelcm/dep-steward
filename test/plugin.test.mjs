@@ -7,14 +7,14 @@ import { fileURLToPath } from 'node:url';
 /**
  * Claude Code plugin packaging.
  *
- * This repo is both a plugin and its own single-plugin marketplace, so users
- * install it with:
+ * The plugin lives in plugin/. The repo root is its own single-plugin
+ * marketplace pointing there, so users can install it with:
  *   /plugin marketplace add raphaelcm/dep-steward
  *   /plugin install dep-steward@dep-steward
  *
- * That path owes nothing to a third-party listing. A community-marketplace
- * submission is pending; it would add `@claude-community` as a second source,
- * so these invariants hold either way.
+ * Anthropic's plugin directory reads the same plugin/ folder. It scans and
+ * ships everything in that folder, which is why the website, tests, and docs
+ * live outside it.
  *
  * Every assertion here fails an install for every user, silently, at a moment
  * nothing else is watching: a manifest that does not parse, a marketplace entry
@@ -24,10 +24,11 @@ import { fileURLToPath } from 'node:url';
  */
 
 const REPO = dirname(dirname(fileURLToPath(import.meta.url)));
+const PLUGIN = join(REPO, 'plugin');
 const readJSON = (...p) => JSON.parse(readFileSync(join(REPO, ...p), 'utf8'));
 
 test('plugin.json is valid and identifies the plugin', () => {
-  const m = readJSON('.claude-plugin', 'plugin.json');
+  const m = readJSON('plugin', '.claude-plugin', 'plugin.json');
 
   assert.equal(m.name, 'dep-steward', 'name is the skill namespace: /dep-steward:<skill>');
   assert.match(m.name, /^[a-z0-9-]+$/, 'name must be kebab-case with no spaces');
@@ -41,20 +42,20 @@ test('plugin.json is valid and identifies the plugin', () => {
 
 test('marketplace.json lists this repo as its own plugin', () => {
   const mk = readJSON('.claude-plugin', 'marketplace.json');
-  const plugin = readJSON('.claude-plugin', 'plugin.json');
+  const plugin = readJSON('plugin', '.claude-plugin', 'plugin.json');
 
   assert.equal(mk.name, 'dep-steward', 'marketplace name — users type @dep-steward when installing');
   assert.ok(mk.owner?.name, 'owner is a required marketplace field');
-  assert.ok(Array.isArray(mk.plugins) && mk.plugins.length === 1, 'exactly one plugin: this repo');
+  assert.ok(Array.isArray(mk.plugins) && mk.plugins.length === 1, 'exactly one plugin: dep-steward');
 
   const [entry] = mk.plugins;
   assert.equal(entry.name, plugin.name, 'entry name must match plugin.json, or the install resolves nothing');
-  assert.equal(entry.source, './', 'the plugin IS the marketplace repo root');
+  assert.equal(entry.source, './plugin', 'the plugin is the plugin/ folder, the same path the directory submission reads');
   assert.ok(entry.description?.length > 20, 'description shows in the plugin browser');
 });
 
 test('every skill has frontmatter with a description', () => {
-  const skillsDir = join(REPO, 'skills');
+  const skillsDir = join(PLUGIN, 'skills');
   const skills = readdirSync(skillsDir, { withFileTypes: true })
     .filter((d) => d.isDirectory())
     .map((d) => d.name);
@@ -89,4 +90,24 @@ test('the README points at the summary skill where it actually lives', () => {
   for (const p of rawPaths) {
     assert.ok(existsSync(join(REPO, p)), `README links raw .../main/${p}, which does not exist in the repo`);
   }
+});
+
+test('the plugin folder holds only what the plugin runs', () => {
+  // Anthropic's directory scans and ships every file under plugin/. The
+  // homepage once sat inside the plugin and held the listing in review, because
+  // its inlined fonts and images could not be inspected.
+  const entries = readdirSync(PLUGIN).sort();
+  assert.deepEqual(entries, ['.claude-plugin', 'install.sh', 'skills', 'templates'],
+    'only the manifest, skills, installer, and templates belong in plugin/');
+});
+
+test('skills run the plugin’s own installer, never a downloaded one', () => {
+  // A skill that pipes a remote script into a shell runs whatever is on main
+  // today, not the version that was reviewed and installed.
+  for (const skill of readdirSync(join(PLUGIN, 'skills'))) {
+    const body = readFileSync(join(PLUGIN, 'skills', skill, 'SKILL.md'), 'utf8');
+    assert.doesNotMatch(body, /curl|wget|raw\.githubusercontent/, `skills/${skill}/SKILL.md downloads code`);
+  }
+  const install = readFileSync(join(PLUGIN, 'skills', 'install', 'SKILL.md'), 'utf8');
+  assert.match(install, /\$\{CLAUDE_PLUGIN_ROOT\}\/install\.sh/, 'the install skill runs the bundled installer');
 });

@@ -105,14 +105,14 @@ function runInstaller(extraEnv = {}, { args = [], setup = () => {}, expectFailur
   execFileSync('git', ['init', '-q'], { cwd: repoDir });
   setup(repoDir);
 
-  const r = spawnSync('sh', [join(REPO, 'install.sh'), '--ci-name', 'CI', ...args], {
+  const r = spawnSync('sh', [join(REPO, 'plugin', 'install.sh'), '--ci-name', 'CI', ...args], {
     cwd: repoDir,
     env: {
       ...process.env,
       PATH: `${bin}:${process.env.PATH}`,
       GH_LOG: ghLog,
       GH_SECRETS: secretsDir,
-      DEP_STEWARD_SRC: REPO,
+      DEP_STEWARD_SRC: join(REPO, 'plugin'),
       CLAUDE_CODE_OAUTH_TOKEN: 'oauth-tok-xyz',
       ...extraEnv,
     },
@@ -228,8 +228,8 @@ test('a reinstall without the token, where both stores already hold it, keeps it
 test('a reinstall that changes no file says so, and asks for no commit', () => {
   // The installed state, committed: the same files a full install renders.
   const committed = (repoDir) => {
-    execFileSync('sh', [join(REPO, 'install.sh'), '--render-only', '--out', repoDir, '--ci-name', 'CI', '--assignee', 'octomaintainer'],
-      { cwd: repoDir, env: { ...process.env, DEP_STEWARD_SRC: REPO }, stdio: 'pipe' });
+    execFileSync('sh', [join(REPO, 'plugin', 'install.sh'), '--render-only', '--out', repoDir, '--ci-name', 'CI', '--assignee', 'octomaintainer'],
+      { cwd: repoDir, env: { ...process.env, DEP_STEWARD_SRC: join(REPO, 'plugin') }, stdio: 'pipe' });
     const env = { ...process.env, GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@t', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@t' };
     execFileSync('git', ['add', '-A'], { cwd: repoDir });
     execFileSync('git', ['commit', '-qm', 'installed'], { cwd: repoDir, env });

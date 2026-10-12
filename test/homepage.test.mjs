@@ -49,7 +49,7 @@ test('the install one-liner is byte-identical to the README’s', () => {
 });
 
 test('the commands the page advertises are the skills that exist', () => {
-  const skills = readdirSync(join(REPO, 'skills'), { withFileTypes: true })
+  const skills = readdirSync(join(REPO, 'plugin', 'skills'), { withFileTypes: true })
     .filter((d) => d.isDirectory())
     .map((d) => d.name);
   assert.ok(skills.length > 0, 'skills/ must contain the plugin’s skills');

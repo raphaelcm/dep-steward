@@ -48,8 +48,8 @@ function renderReference() {
   const out = mkdtempSync(join(tmpdir(), 'ds-ref-out-'));
   execFileSync(
     'sh',
-    [join(REPO, 'install.sh'), '--render-only', '--out', out, '--ci-name', 'CI', '--assignee', 'octocat'],
-    { cwd: fakeRepo, env: { ...process.env, DEP_STEWARD_SRC: REPO }, stdio: 'pipe' },
+    [join(REPO, 'plugin', 'install.sh'), '--render-only', '--out', out, '--ci-name', 'CI', '--assignee', 'octocat'],
+    { cwd: fakeRepo, env: { ...process.env, DEP_STEWARD_SRC: join(REPO, 'plugin') }, stdio: 'pipe' },
   );
   return out;
 }
@@ -102,8 +102,8 @@ function renderWith(extraArgs) {
   const out = mkdtempSync(join(tmpdir(), 'ds-af-out-'));
   execFileSync(
     'sh',
-    [join(REPO, 'install.sh'), '--render-only', '--out', out, '--ci-name', 'CI', '--assignee', 'octocat', ...extraArgs],
-    { cwd: fakeRepo, env: { ...process.env, DEP_STEWARD_SRC: REPO }, stdio: 'pipe' },
+    [join(REPO, 'plugin', 'install.sh'), '--render-only', '--out', out, '--ci-name', 'CI', '--assignee', 'octocat', ...extraArgs],
+    { cwd: fakeRepo, env: { ...process.env, DEP_STEWARD_SRC: join(REPO, 'plugin') }, stdio: 'pipe' },
   );
   return out;
 }
@@ -283,8 +283,8 @@ test('the action pin is a placeholder in both templates, resolved by the install
   // template never receives the adopter's Dependabot bumps, so plain text
   // copied on every render quietly downgrades any repo that has moved on.
   // install.sh owns the first-install default and keeps a newer repo pin.
-  const review = readFileSync(join(REPO, 'templates/dependabot-review.yml'), 'utf8');
-  const autofix = readFileSync(join(REPO, 'templates/dependabot-autofix-job.yml'), 'utf8');
+  const review = readFileSync(join(REPO, 'plugin/templates/dependabot-review.yml'), 'utf8');
+  const autofix = readFileSync(join(REPO, 'plugin/templates/dependabot-autofix-job.yml'), 'utf8');
   assert.match(review, /uses: anthropics\/claude-code-action@__REVIEW_ACTION_PIN__$/m);
   assert.match(autofix, /uses: anthropics\/claude-code-action@__AUTOFIX_ACTION_PIN__$/m);
   for (const [name, text] of [['dependabot-review.yml', review], ['dependabot-autofix-job.yml', autofix]]) {

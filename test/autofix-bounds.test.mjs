@@ -17,7 +17,7 @@ import { fileURLToPath } from 'node:url';
  * MAX_LINES (default 10). Output (stdout): decision=push|escalate, reason=…
  */
 
-const BOUNDS = join(dirname(fileURLToPath(import.meta.url)), '..', 'templates', 'autofix-bounds.cjs');
+const BOUNDS = join(dirname(fileURLToPath(import.meta.url)), '..', 'plugin', 'templates', 'autofix-bounds.cjs');
 
 function runBounds(env) {
   const raw = execFileSync('node', [BOUNDS], { env: { ...process.env, ...env }, encoding: 'utf8' });
