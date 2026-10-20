@@ -244,10 +244,13 @@ jobs:
         # silently degrades while still reporting success (that is how the 2.1.207
         # tool-permission breakage was found).
         #
-        # One denial is ASSERTED on, not just printed: `gh pr diff`. The diff is
-        # the thing under review; an agent that never read it still posts an
-        # escalate-shaped V1 block, so the deliverable assertion below stays green
-        # and nobody learns the review was void. Detection is positive-evidence
+        # One denial is ASSERTED on, not just printed: `gh pr diff`, when no
+        # `gh pr diff` call returned the diff. The diff is the thing under
+        # review; an agent that never read it still posts an escalate-shaped V1
+        # block, so the deliverable assertion below stays green and nobody learns
+        # the review was void. An agent that read it and was then denied a
+        # compound command over it (`gh pr diff 1 > f; wc -l f`, which the
+        # allowlist does not cover) has read it. Detection is positive-evidence
         # only (the SDK's permission_denials record, plus the denial text of
         # errored tool_results), so a schema drift degrades back to print-only
         # rather than inventing a red.
@@ -275,8 +278,9 @@ jobs:
           echo "===== raw denial/permission lines (fallback) ====="
           grep -aoiE '(permission[^"]{0,90}|denied[^"]{0,90}|not allowed[^"]{0,90}|requested permission[^"]{0,130})' "$EXEC_FILE" 2>/dev/null | sort -u | head -20 || true
           echo "=========================================="
-          # The assertion: a denied `gh pr diff` means the review never saw the
-          # change it reviewed. Two independent positive signals, either fires.
+          # The assertion: a denied `gh pr diff`, with no `gh pr diff` call that
+          # returned, means the review never saw the change it reviewed. Two
+          # independent positive signals of a denial, either fires.
           DENIED_DIFF=$(jq -rs '
             [.. | objects | select(.type? == "result") | (.permission_denials // [])[]
              | select((.tool_name // "") == "Bash")
@@ -288,7 +292,15 @@ jobs:
              | (.content | if type=="array" then (map(.text? // (.|tostring)) | join(" ")) else (.|tostring) end)
              | select(test("gh pr diff") and test("permission|denied|not allowed"; "i"))] | length' "$EXEC_FILE" 2>/dev/null || echo 0)
           [ "$DENIED_DIFF_TEXT" -gt 0 ] 2>/dev/null || DENIED_DIFF_TEXT=0
-          if [ "$DENIED_DIFF" -gt 0 ] || [ "$DENIED_DIFF_TEXT" -gt 0 ]; then
+          READ_DIFF=$(jq -rs '
+            [.. | objects | select(.type? == "tool_use" and .name? == "Bash")
+             | select((.input.command? // "") | startswith("gh pr diff")) | .id] as $ids
+            | [.. | objects | select(.type? == "tool_result" and .is_error? != true)
+               | select(.tool_use_id? as $t | any($ids[]; . == $t))] | length' "$EXEC_FILE" 2>/dev/null || echo 0)
+          [ "$READ_DIFF" -gt 0 ] 2>/dev/null || READ_DIFF=0
+          if { [ "$DENIED_DIFF" -gt 0 ] || [ "$DENIED_DIFF_TEXT" -gt 0 ]; } && [ "$READ_DIFF" -gt 0 ]; then
+            echo "A 'gh pr diff' call was denied, and $READ_DIFF other(s) returned the diff, so the review read it."
+          elif [ "$DENIED_DIFF" -gt 0 ] || [ "$DENIED_DIFF_TEXT" -gt 0 ]; then
             echo "::error::The review agent was DENIED 'gh pr diff' on PR #$PR_NUMBER — it reviewed without reading the diff, so its verdict is void."
             gh pr edit "$PR_NUMBER" --repo "$REPO" --add-label needs-human-review --add-assignee octocat || true
             exit 1
