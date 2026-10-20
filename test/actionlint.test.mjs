@@ -37,7 +37,7 @@ function render(extraArgs = []) {
 const available = spawnSync('actionlint', ['-version'], { stdio: 'pipe' }).status === 0;
 const skip = !available && process.env.REQUIRE_ACTIONLINT !== '1' && 'actionlint is not installed';
 
-for (const [variant, args] of [['default', []], ['--no-autofix', ['--no-autofix']]]) {
+for (const [variant, args] of [['default', []], ['--no-autofix', ['--no-autofix']], ['--regenerate', ['--regenerate', 'npm run db:generate', '--regenerate-path', 'src/generated/prisma', '--regenerate-env', 'DATABASE_URL=postgresql://runsense:runsense@localhost:5432/runsense']]]) {
   test(`${variant}: the rendered workflow passes actionlint`, { skip }, () => {
     assert.ok(available, 'REQUIRE_ACTIONLINT=1 but actionlint is not on PATH');
     const r = spawnSync('actionlint', ['-no-color', ...render(args)], { encoding: 'utf8' });

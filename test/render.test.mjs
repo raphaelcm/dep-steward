@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { execFileSync } from 'node:child_process';
-import { mkdtempSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
+import { execFileSync, spawnSync } from 'node:child_process';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -474,4 +474,119 @@ test('both prompt-loads bake in the literal PR number, never cat the raw prompt'
   }
   assert.doesNotMatch(wf, /cat \.github\/dependabot-(review|autofix)-prompt\.md/,
     'no prompt-load may cat the raw prompt — that leaves $PR_NUMBER unexpanded → denied');
+});
+
+// ---- the regeneration's settings ---------------------------------------------
+//
+// The command that regenerates committed output, the paths it writes and the
+// environment it needs live in the regenerate job's env, where a reinstall
+// reads them back. Runsense-ai/runsense#3034's values throughout.
+
+const REGEN_ARGS = [
+  '--regenerate', 'npm run db:generate',
+  '--regenerate-path', 'src/generated/prisma',
+  '--regenerate-env', 'DATABASE_URL=postgresql://runsense:runsense@localhost:5432/runsense',
+];
+
+function installIn(repoDir, args, { out = mkdtempSync(join(tmpdir(), 'ds-rg-out-')) } = {}) {
+  const r = spawnSync(
+    'sh',
+    [join(REPO, 'plugin', 'install.sh'), '--render-only', '--out', out, '--ci-name', 'CI', '--assignee', 'octocat', ...args],
+    { cwd: repoDir, env: { ...process.env, DEP_STEWARD_SRC: join(REPO, 'plugin') }, encoding: 'utf8', input: '' },
+  );
+  const wfPath = join(out, '.github/workflows/dependabot-review.yml');
+  return { ...r, out, workflow: existsSync(wfPath) ? readFileSync(wfPath, 'utf8') : '' };
+}
+
+function referenceRepo() {
+  const dir = mkdtempSync(join(tmpdir(), 'ds-rg-repo-'));
+  for (const m of REFERENCE_MANIFESTS) writeFileSync(join(dir, m), '\n');
+  return dir;
+}
+
+test('--regenerate renders the regenerate jobs byte-identical to their reference fixture', () => {
+  const r = installIn(referenceRepo(), REGEN_ARGS);
+  assert.equal(r.status, 0, r.stderr);
+  const golden = readFileSync(join(REPO, 'test/fixtures/expected/reference-regenerate/.github/workflows/dependabot-review.yml'), 'utf8');
+  assert.equal(r.workflow, golden);
+  assert.match(r.stdout, /regenerate: `npm run db:generate` -> src\/generated\/prisma \(env: DATABASE_URL\) \(from the flags\)/);
+  // Every other file is the reference render's.
+  for (const f of FILES.filter((f) => f !== '.github/workflows/dependabot-review.yml')) {
+    assert.equal(readFileSync(join(r.out, f), 'utf8'), readFileSync(join(GOLDEN, f), 'utf8'), f);
+  }
+});
+
+test('a reinstall with no flags keeps the regeneration it finds in the workflow, quotes and all', () => {
+  const repo = referenceRepo();
+  const first = installIn(repo, ['--regenerate', "DB=it's npm run db:generate", '--regenerate-path', './src/generated/prisma/', '--regenerate-path', 'openapi/client', '--regenerate-env', "A=x'y z", '--regenerate-env', 'B=postgresql://u:p@h:5432/d?x=1#f'], { out: repo });
+  assert.equal(first.status, 0, first.stderr);
+  const kept = installIn(repo, [], { out: repo });
+  assert.equal(kept.workflow, first.workflow, 'a reinstall renders the same workflow');
+  assert.match(kept.stdout, /regenerate: `DB=it's npm run db:generate` -> src\/generated\/prisma openapi\/client \(env: A B\) \(kept from the existing workflow\)/);
+  assert.match(kept.workflow, /^ {6}A: 'x''y z'$/m);
+});
+
+test('--no-regenerate takes it out of a workflow that had it', () => {
+  const repo = referenceRepo();
+  installIn(repo, REGEN_ARGS, { out: repo });
+  const off = installIn(repo, ['--no-regenerate'], { out: repo });
+  assert.equal(off.status, 0, off.stderr);
+  assert.doesNotMatch(off.workflow, /REGENERATE|^ {2}regenerate:/m);
+  assert.equal(off.workflow, readFileSync(join(GOLDEN, '.github/workflows/dependabot-review.yml'), 'utf8'));
+});
+
+for (const [why, args, message] of [
+  ['a path outside the repository', ['--regenerate', 'make gen', '--regenerate-path', '../elsewhere'], /inside the repository/],
+  ['a path under .github/', ['--regenerate', 'make gen', '--regenerate-path', '.github/generated'], /never pushes under \.github/],
+  ['no path at all', ['--regenerate', 'make gen'], /at least one --regenerate-path/],
+  ['a path with a space', ['--regenerate', 'make gen', '--regenerate-path', 'gen out'], /only letters/],
+  ['an expression in the command', ['--regenerate', 'echo ${{ secrets.X }}', '--regenerate-path', 'gen'], /expression/],
+  ['an env name the runner owns', ['--regenerate', 'make gen', '--regenerate-path', 'gen', '--regenerate-env', 'GITHUB_TOKEN=x'], /belongs to the runner/],
+  ['an env without a value', ['--regenerate', 'make gen', '--regenerate-path', 'gen', '--regenerate-env', 'DATABASE_URL'], /NAME=VALUE/],
+  ['a path with no command', ['--regenerate-path', 'gen'], /needs the command/],
+  ['--no-autofix', ['--no-autofix', '--regenerate', 'make gen', '--regenerate-path', 'gen'], /cannot be used with --no-autofix/],
+]) {
+  test(`--regenerate refuses ${why}`, () => {
+    const r = installIn(referenceRepo(), args);
+    assert.notEqual(r.status, 0, `rendered anyway:\n${r.stdout}`);
+    assert.match(r.stderr, message);
+  });
+}
+
+// Prisma: a schema whose generator writes into a directory git tracks.
+function prismaRepo({ config = true } = {}) {
+  const dir = mkdtempSync(join(tmpdir(), 'ds-prisma-repo-'));
+  writeFileSync(join(dir, 'package.json'), '{\n  "scripts": {\n    "build": "tsc",\n    "db:generate": "prisma generate"\n  }\n}\n');
+  writeFileSync(join(dir, 'package-lock.json'), '{}\n');
+  mkdirSync(join(dir, 'prisma'));
+  writeFileSync(join(dir, 'prisma/schema.prisma'), 'generator client {\n  provider = "prisma-client"\n  output   = "../src/generated/prisma"\n}\n\ndatasource db {\n  provider = "postgresql"\n}\n');
+  if (config) writeFileSync(join(dir, 'prisma.config.ts'), "import { defineConfig, env } from 'prisma/config';\nexport default defineConfig({\n  schema: 'prisma/schema.prisma',\n  datasource: { url: env('DATABASE_URL') },\n});\n");
+  mkdirSync(join(dir, 'src/generated/prisma'), { recursive: true });
+  writeFileSync(join(dir, 'src/generated/prisma/client.ts'), 'export {};\n');
+  const git = (...a) => execFileSync('git', a, { cwd: dir, stdio: 'pipe', env: { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null' } });
+  git('init', '-q');
+  git('add', '-A');
+  return dir;
+}
+
+test('Prisma is detected: its generator\'s tracked output and the script that runs it', () => {
+  const r = installIn(prismaRepo({ config: false }), []);
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stdout, /regenerate: `npm run db:generate` -> src\/generated\/prisma \(detected: Prisma\)/);
+  assert.match(r.workflow, /^ {6}REGENERATE_COMMAND: 'npm run db:generate'$/m);
+  assert.match(r.workflow, /node-version-file: package\.json/);
+  assert.match(r.workflow, /run: npm ci/);
+});
+
+test('a Prisma config that reads env() leaves the regeneration off without a terminal, and names the flags that turn it on', () => {
+  const r = installIn(prismaRepo(), []);
+  assert.equal(r.status, 0, r.stderr);
+  assert.doesNotMatch(r.workflow, /REGENERATE_COMMAND/);
+  assert.match(r.stderr, /its config reads DATABASE_URL, so the regeneration stays off\. Turn it on with: --regenerate 'npm run db:generate' --regenerate-path src\/generated\/prisma --regenerate-env DATABASE_URL=/);
+});
+
+test('flags win over what detection would find', () => {
+  const r = installIn(prismaRepo(), REGEN_ARGS);
+  assert.match(r.stdout, /\(from the flags\)/);
+  assert.match(r.workflow, /^ {6}DATABASE_URL: 'postgresql:\/\/runsense:runsense@localhost:5432\/runsense'$/m);
 });

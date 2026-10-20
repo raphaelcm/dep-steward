@@ -1,0 +1,152 @@
+
+  regenerate:
+    # Re-runs this repo's code generator for a Dependabot bump, with the
+    # command the installer was given, and leaves what it found as an
+    # artifact of this run. No agent: regenerating is mechanical.
+    #
+    # The install and the generator are the bump's own code, so this runs
+    # where the PR's CI runs: on pull_request, with a token that can only read,
+    # no secret, and the PR's own cache scope. A workflow_run job, like
+    # autofix, runs in the default branch's cache scope, and code run there
+    # could plant a cache entry the default branch's workflows later restore.
+    # The autofix jobs only read this run's artifact, as data.
+    #
+    # Same pushers as the review job: autofix's own push (as the Claude
+    # GitHub App) does not regenerate again.
+    if: >
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.user.login == 'dependabot[bot]' &&
+      (github.event.sender.type == 'User' || github.actor == 'dependabot[bot]')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    concurrency:
+      group: dependabot-regenerate-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
+    env:
+      # The installer's settings for this repo. A reinstall reads them back
+      # from here, so re-running the installer keeps them.
+      #__REGENERATE_SETTINGS__
+      #__REGENERATE_ENV__
+    outputs:
+      changed: ${{ steps.regenerate.outputs.changed }}
+    steps:
+      - name: Checkout the PR head
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+
+      #__REGENERATE_SETUP__
+
+      - name: Regenerate
+        id: regenerate
+        env:
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          # Reads the PR head and the generator's output. Writes the verdict
+          # files outside the checkout, and `changed`. Pushes nothing.
+          bash -euo pipefail -c "$REGENERATE_COMMAND"
+          git add -A
+          OUT="$RUNNER_TEMP/dep-steward-regenerate"
+          rm -rf "$OUT"
+          mkdir -p "$OUT"
+          printf '%s\n' "$HEAD_SHA" > "$OUT/head_sha"
+          if git diff --cached --quiet HEAD; then
+            echo unchanged > "$OUT/verdict"
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "The committed output already matches this bump: regenerating changed nothing."
+          else
+            git diff --cached --binary HEAD > "$OUT/regeneration.patch"
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            git diff --cached --stat HEAD
+          fi
+
+      - name: Leave the verdict (unchanged)
+        if: steps.regenerate.outputs.changed == 'false'
+        uses: actions/upload-artifact@v7
+        with:
+          name: dep-steward-regenerate
+          path: ${{ runner.temp }}/dep-steward-regenerate
+          retention-days: 30
+          overwrite: true
+
+      - name: Hand the regeneration to the check
+        if: steps.regenerate.outputs.changed == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: dep-steward-regenerate-candidate
+          path: ${{ runner.temp }}/dep-steward-regenerate
+          retention-days: 30
+          overwrite: true
+
+  regenerate-verify:
+    # Runs the generator again, on a fresh runner, over the PR head with the
+    # regeneration applied. It must change nothing: the tree is then the
+    # generator's own fixed point, which is what a CI sync check asks of it.
+    # Only then is the regeneration left as verified. Same trust as the job
+    # above: the bump's code runs here too, so it runs on pull_request.
+    needs: regenerate
+    if: needs.regenerate.outputs.changed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    concurrency:
+      group: dependabot-regenerate-verify-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
+    env:
+      #__REGENERATE_SETTINGS__
+      #__REGENERATE_ENV__
+    steps:
+      - name: Checkout the PR head
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+
+      - name: Take the regeneration
+        uses: actions/download-artifact@v8
+        with:
+          name: dep-steward-regenerate-candidate
+          path: ${{ runner.temp }}/dep-steward-regenerate
+
+      - name: Apply it to the PR head
+        env:
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          OUT="$RUNNER_TEMP/dep-steward-regenerate"
+          if [ "$(cat "$OUT/head_sha")" != "$HEAD_SHA" ]; then
+            echo "::error::The regeneration was made for another commit than $HEAD_SHA."
+            exit 1
+          fi
+          git apply --index "$OUT/regeneration.patch"
+
+      #__REGENERATE_SETUP__
+
+      - name: Regenerate again (it must change nothing)
+        run: |
+          set -euo pipefail
+          # Reads the regenerated tree. Writes the verdict beside the patch.
+          bash -euo pipefail -c "$REGENERATE_COMMAND"
+          OUT="$RUNNER_TEMP/dep-steward-regenerate"
+          if git diff --quiet && [ -z "$(git ls-files --others --exclude-standard)" ]; then
+            echo verified > "$OUT/verdict"
+            echo "Regenerating over the regeneration changed nothing, so it is verified."
+          else
+            echo unreproducible > "$OUT/verdict"
+            rm -f "$OUT/regeneration.patch"
+            echo "::warning::Regenerating over the regeneration changed it again, so it is not the generator's stable output:"
+            git status --short
+          fi
+
+      - name: Leave the verdict
+        uses: actions/upload-artifact@v7
+        with:
+          name: dep-steward-regenerate
+          path: ${{ runner.temp }}/dep-steward-regenerate
+          retention-days: 30
+          overwrite: true

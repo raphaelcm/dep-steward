@@ -43,6 +43,11 @@ run-name: "${{ inputs.pr_number && format('Dependabot PR review of #{0}', inputs
 #  - autofix (on: workflow_run of CI, when autofix is installed): when CI fails
 #    on a Dependabot PR, a Claude agent drafts a small mechanical fix. A
 #    separate job with no agent re-checks it and pushes it.
+#
+#  - regenerate (on: pull_request, when the installer was given a regenerate
+#    command): re-runs the repo's code generator for the bump, with no agent,
+#    and leaves a verdict artifact. When CI then fails, autofix pushes a
+#    verified regeneration instead of running its fixer.
 
 on:
   pull_request:
@@ -422,6 +427,11 @@ jobs:
     #      the push job re-checks that itself, with the default branch's copy;
     #   4. a human authorizes every merge, so an injected "fix" can at most land a
     #      tiny reviewed source edit on a PR branch — never on your default branch.
+    # When the installer was given a regenerate command, the fix can instead be
+    # the regeneration: the repo's own generator, re-run for the bump by the
+    # regenerate jobs on pull_request (where the bump's code may run). This
+    # job then only reads that run's verdict, and when it is verified, no
+    # agent runs at all; the push job reads the regeneration itself.
     # Runs on workflow_run (base context: secrets present), which also
     # sidesteps claude-code-action's OIDC self-modification refusal.
     #
@@ -616,6 +626,13 @@ jobs:
           # the same rule the auto-merge job's resolve step follows.
           CI_RUN_STARTED_AT: ${{ github.event.workflow_run.run_started_at }}
           CI_RUN_CREATED_AT: ${{ github.event.workflow_run.created_at }}
+          # What CI did on this exact commit, the one evidence that a failing
+          # test also passes on the same code. Read from GitHub's record of
+          # the CI workflow's runs, never left for the agent to infer.
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          CI_WORKFLOW_ID: ${{ github.event.workflow_run.workflow_id }}
+          CI_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
         run: |
           set -euo pipefail
           # %A is locale-dependent; hosted runners are C.UTF-8 but self-hosted
@@ -637,17 +654,51 @@ jobs:
             esac
           done
           CI_RUN_WEEKDAY=$(date -u -d "$CI_RUN_STARTED" +%A 2>/dev/null || echo "$NOW_WEEKDAY")
+          # Finished runs only (a cancelled one says nothing about the code),
+          # each run's earlier attempts included. Any lookup that fails leaves
+          # the sentence saying so, and never fails this step.
+          CI_COMMIT_HISTORY='How often CI has passed on this exact commit could not be read.'
+          ci_tally() {
+            case "$1" in
+              success) FINISHED=$((FINISHED + 1)); PASSED=$((PASSED + 1)) ;;
+              failure) FINISHED=$((FINISHED + 1)) ;;
+            esac
+          }
+          if RUNS=$(gh api "repos/$REPO/actions/workflows/$CI_WORKFLOW_ID/runs?head_sha=$CI_HEAD_SHA&per_page=100" \
+                --jq '.workflow_runs[] | "\(.id) \(.run_attempt) \(.conclusion // "none")"' 2>/dev/null); then
+            FINISHED=0
+            PASSED=0
+            READ=1
+            while read -r RUN_ID ATTEMPTS CONCLUSION; do
+              [ -n "$RUN_ID" ] || continue
+              ci_tally "$CONCLUSION"
+              N=1
+              while [ "$N" -lt "$ATTEMPTS" ]; do
+                if EARLIER=$(gh api "repos/$REPO/actions/runs/$RUN_ID/attempts/$N" --jq '.conclusion // "none"' 2>/dev/null); then
+                  ci_tally "$EARLIER"
+                else
+                  READ=0
+                fi
+                N=$((N + 1))
+              done
+            done <<< "$RUNS"
+            if [ "$READ" = 1 ] && [ "$FINISHED" -gt 0 ]; then
+              CI_COMMIT_HISTORY="CI finished $FINISHED time(s) on this exact commit, counting re-runs, and passed $PASSED time(s)."
+            fi
+          fi
           {
             echo 'prompt<<PROMPT_EOF_9Z3Q'
-            # `|` delimiters on the four facts: the values are ISO-8601 UTC
-            # stamps and English weekday names, so none of `|`, `&`, `\` can
-            # occur in them and the replacement text is inert. No placeholder is
+            # `|` delimiters on the five facts: the values are ISO-8601 UTC
+            # stamps, English weekday names and a sentence of fixed words and
+            # counts, so none of `|`, `&`, `\` can occur in them and the
+            # replacement text is inert. No placeholder is
             # a prefix of another, so the order of the expressions is free.
             sed -e "s/\$PR_NUMBER/$PR_NUMBER/g" \
                 -e "s|\$CI_RUN_STARTED|$CI_RUN_STARTED|g" \
                 -e "s|\$CI_RUN_WEEKDAY|$CI_RUN_WEEKDAY|g" \
                 -e "s|\$NOW_UTC|$NOW_UTC|g" \
                 -e "s|\$NOW_WEEKDAY|$NOW_WEEKDAY|g" \
+                -e "s|\$CI_COMMIT_HISTORY|$CI_COMMIT_HISTORY|g" \
                 "$RUNNER_TEMP/dep-steward/dependabot-autofix-prompt.md"
             echo 'PROMPT_EOF_9Z3Q'
           } >> "$GITHUB_OUTPUT"

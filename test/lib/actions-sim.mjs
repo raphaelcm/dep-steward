@@ -402,7 +402,9 @@ export async function runJob(jobs, jobName, { github, secrets = {}, uses = {}, c
   const job = jobs[jobName];
   if (!job) throw new Error(`no job "${jobName}"`);
   const scratch = mkdtempSync(join(tmpdir(), 'ds-sim-'));
-  const ctx = { github, secrets, env: {}, steps: {}, inputs: {}, vars: {}, job: {}, runner: {}, needs, jobFailed: false };
+  // `runner.temp` is the runner's temp directory, which a step sees as RUNNER_TEMP.
+  const runner = { temp: env.RUNNER_TEMP ?? '', os: 'Linux' };
+  const ctx = { github, secrets, env: {}, steps: {}, inputs: {}, vars: {}, job: {}, runner, needs, jobFailed: false };
 
   if (!conditionHolds(job.if, ctx)) return { skipped: true, steps: [], failed: false, jobEnv: {}, outputs: {} };
   for (const [k, v] of Object.entries(job.env ?? {})) ctx.env[k] = interpolate(v, ctx);

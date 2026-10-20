@@ -43,6 +43,11 @@ run-name: "${{ inputs.pr_number && format('Dependabot PR review of #{0}', inputs
 #  - autofix (on: workflow_run of CI, when autofix is installed): when CI fails
 #    on a Dependabot PR, a Claude agent drafts a small mechanical fix. A
 #    separate job with no agent re-checks it and pushes it.
+#
+#  - regenerate (on: pull_request, when the installer was given a regenerate
+#    command): re-runs the repo's code generator for the bump, with no agent,
+#    and leaves a verdict artifact. When CI then fails, autofix pushes a
+#    verified regeneration instead of running its fixer.
 
 on:
   pull_request:
@@ -402,4 +407,5 @@ jobs:
           gh pr edit "$PR_NUMBER" --repo "$REPO" --add-label needs-human-review__ASSIGN_FLAG__
           exit 1
 
+#__REGENERATE_JOBS__
 #__AUTOFIX_JOB__
