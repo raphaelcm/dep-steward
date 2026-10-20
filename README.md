@@ -113,9 +113,26 @@ sh -c "$(curl -fsSL https://raw.githubusercontent.com/raphaelcm/dep-steward/main
 - **The fix is bounds-limited** — a handful of lines, existing source files only, never the bumped manifest/lockfile, never anything under `.github/`. A larger or out-of-scope change is discarded and escalated to you instead.
 - **An autofixed PR can't be auto-merged.** Because the fix adds source changes, the gate's path whitelist refuses to auto-merge it — by construction it always waits for your review. So even a maximally prompt-injected "fix" can at most land a tiny, reviewed source edit on a PR branch, never on your default branch.
 
-When autofix can't produce a clean, minimal fix — the break isn't clearly the bump's fault, it would need real code changes or a new dependency, or it's simply not confident — it escalates to you, exactly like the review job does.
+When autofix can't produce a clean, minimal fix — the evidence doesn't show the bump caused the failure, it would need real code changes or a new dependency, or it's simply not confident — it escalates to you, exactly like the review job does. Its comment names each failure's cause with the evidence for it, and calls a failure with no evidence either way unexplained. The fixer is told how often CI passed on that exact commit, so a test that "sometimes fails" is a claim it can only make with a passing run to point to.
 
 **One attempt per PR.** If CI fails again on a PR that already carries dep-steward's fix, autofix does not try a second time: it labels, assigns and comments once, and the PR waits for you. That holds even after someone pushes on top of the fix, so autofix can never chase its own failures.
+
+### Regenerated output
+
+Some repos commit code a generator writes from a dependency: a Prisma client, an OpenAPI client. A bump that changes what the generator writes leaves that output stale, and a CI check that regenerates and diffs it goes red. The fix is to run the generator, which is mechanical, so no agent does it. Tell the installer the command, the paths it writes, and any environment it needs:
+
+```sh
+sh -c "$(curl -fsSL https://raw.githubusercontent.com/raphaelcm/dep-steward/main/plugin/install.sh)" -- \
+  --regenerate 'npm run db:generate' \
+  --regenerate-path src/generated/prisma \
+  --regenerate-env DATABASE_URL=postgresql://user:pass@localhost:5432/db
+```
+
+On every Dependabot PR, two jobs in the review workflow run the install and the command on the PR head, then run the command again on a fresh runner over the result: the output must not change, which is what your CI's sync check asks of it. When CI then fails, autofix pushes that regeneration as the Claude GitHub App instead of running its fixer, and you review and merge it. A regeneration has no line budget, since a correct one can be thousands of lines, but it may change only the paths you declared: never anything under `.github/` or a bumped manifest or lockfile. When regenerating changes nothing, autofix runs its fixer as usual; when the output changes from one run to the next, it tells you instead of pushing.
+
+The install and the generator are the bump's own code, so those jobs run where your CI runs on the PR: on `pull_request`, with a token that can only read and no secrets. The values you pass with `--regenerate-env` are written into the workflow, so give placeholders, never secrets (`prisma generate` needs `DATABASE_URL` set but never connects to it).
+
+The installer finds a Prisma schema whose generator writes into a directory git tracks, and the `package.json` script that runs `prisma generate`; when Prisma's config reads a variable with `env()`, it asks you for a value (without a terminal it leaves the regeneration off and prints the flags that turn it on). A re-run keeps the settings it finds in the workflow, `--regenerate` flags replace them, and `--no-regenerate` removes them.
 
 ### CI on the fix
 
@@ -213,7 +230,7 @@ Delete the files above, remove the `needs-human-review` label, and delete the `C
 Zero runtime dependencies. The gate is one vanilla-Node file; the installer is POSIX `sh`; the tests use the Node built-in test runner.
 
 ```sh
-shellcheck -s sh install.sh
+shellcheck -s sh install.sh plugin/install.sh
 node --test test/*.test.mjs
 ```
 
@@ -222,6 +239,8 @@ node --test test/*.test.mjs
 - `test/wiring.test.mjs` — the installer stores the verified token itself in both secret stores (the value, not just the command), creates the label, and enables auto-merge (stubbed `gh`).
 - `test/workflow-shell.test.mjs` — every `run:` block in the rendered workflow parses under `bash -n` (the shell GitHub actually runs `run:` blocks with). Nothing else parses the shell the templates generate.
 - `test/autofix-push.test.mjs` — runs the rendered autofix job end to end (only the agent is simulated), pushing through real `git` to a local `git http-backend` that records who pushed: the fix lands as the Claude GitHub App, though the working tree still holds `GITHUB_TOKEN` where checkout and claude-code-action leave it, and falls back loudly when it cannot; the App token exists only for a fix that will be pushed, scoped to `contents: write`; a PR gets one autofix push; the review job starts only for pushers its action accepts.
+- `test/regenerate.test.mjs` — runs the regeneration end to end: the two `pull_request` jobs with a stand-in generator, then autofix and its push job against a stub of GitHub's REST routes. A stale committed client is regenerated and pushed as the Claude GitHub App with no agent; the bump's code runs only in the `pull_request` jobs; an unchanged regeneration leaves the fixer as it was; output that changes from run to run, writes outside its paths, or touches `.github/` or the lockfile is never pushed; and a crafted artifact or a turned fixer's claim cannot change what is pushed.
+- `test/autofix-bounds.test.mjs` — the bounds check in both of its modes: the fixer's small source-only edit, and a regeneration confined to its declared paths with no line budget.
 - `test/actionlint.test.mjs` — the rendered workflow passes actionlint, which adopters' CI runs on it (skipped where actionlint is not installed; required in this repo's CI).
 - `test/agent-writes.test.mjs` — runs the rendered review job with a reviewer that rewrites every pipeline script it can reach: none of the rewrites runs, and the real lint and gate still do their jobs (the autofix bounds check has the same test in `autofix-push.test.mjs`).
 - `test/actions-sim.test.mjs` — the GitHub rules the step simulator (`test/lib/actions-sim.mjs`) copies: implicit `success()`, `continue-on-error`, unset outputs, case-insensitive comparison, loud refusal of anything it does not simulate.

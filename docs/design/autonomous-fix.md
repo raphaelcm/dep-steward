@@ -86,6 +86,21 @@ still holds. The reviewer likewise runs on its job's token, which can comment
 and not push, and the gate moved to its own workflow, woken when CI or the
 review finishes.
 
+### Update (2026-10-20): a regeneration, pushed with no agent
+
+Runsense-ai/runsense#3034 bumped prisma from 7.10.0 to 7.10.1. Runsense commits its generated Prisma client, so CI's sync check went red, and the fix was `npm run db:generate`: two files, twelve lines, every one a version string. Autofix escalated it, for two reasons. The fixer's allow-list holds no generator to run. And the bounds' ten-line budget would have refused the output anyway, because a line budget measures how much an agent wrote and says nothing about whether a generator's output is right.
+
+Regenerating is mechanical, so no LLM does it. The installer takes the command, the paths it writes and the environment it needs (`--regenerate`, `--regenerate-path`, `--regenerate-env`; Prisma is detected). It keeps them in the regenerate job's env, where a reinstall reads them back.
+
+- **Where it runs.** The install and the generator are the bump's own code. A `workflow_run` job, where autofix runs, is in the default branch's cache scope, and code run there can save a cache entry that the default branch's workflows later restore, so a malicious bump could poison them before anyone looks at it. So two jobs in the review workflow do it on `pull_request`, with a read-only token and no secrets, which is less than the PR's own CI gets. `regenerate` runs the install and the command on the PR head. `regenerate-verify` runs them again on a fresh runner over the result, and marks the regeneration verified only if nothing changes: the tree is the generator's own fixed point, which is what a sync check asks. Their verdict is an artifact of that run.
+- **How it is taken.** When CI fails, autofix's one-push check, on a first attempt, finds the PR's own `pull_request` run for the failing commit, waits up to ten minutes for its verdict, and reads three named entries from the artifact as data. Verified: the regeneration is the fix and no agent runs. Unreproducible: a person is told. Unchanged, or no verdict: the fixer runs exactly as before.
+- **How it is pushed.** Through the same push job, as the Claude GitHub App, and under the same one-push rule. The push job does not take the regeneration from the autofix job: it reads it again from the PR's run, requires it verified for exactly the commit the branch is at, and runs the bounds check in its regenerate mode. That mode has no line budget, allows added, modified and deleted regular files, and refuses anything outside the declared paths, under `.github/`, or in a bumped manifest or lockfile.
+- **What it does not prove.** The second run proves the output is stable, not that it is benign. The generator is the bumped dependency, so its output is exactly as trusted as the dependency's runtime code. That is why it is confined to the declared paths and a person merges it: the gate never merges a PR that changes them.
+
+The alternatives were weaker. Running the generator as a step in the `workflow_run` autofix job would run the bump's code in the default branch's cache scope. Allow-listing `npm` for the fixer would do the same, and would put a command runner in the hands of an agent reading the bump's changelog. Asking adopters to make their own CI upload the regenerated diff would touch a workflow dep-steward promises not to touch, and would tie every install to one CI's shape.
+
+The same PR's fixer also called three failing tests "likely flaky". They were a real vitest 5.0.3 to 5.0.5 regression. The prompt had offered the word ("not flaky") with no way to check it. The fixer is now told how often CI passed on that exact commit, and its escalation names each failure's cause with its evidence, or calls it unexplained.
+
 Everything from §4 onward is **D** and is **not being built now** — preserved as
 the deferred design for if a central GitHub App is ever added and we choose to
 remove the human.

@@ -101,7 +101,7 @@ function parses(script) {
   }
 }
 
-for (const [variant, args] of [['default', []], ['--no-autofix', ['--no-autofix']]]) {
+for (const [variant, args] of [['default', []], ['--no-autofix', ['--no-autofix']], ['--regenerate', ['--regenerate', 'npm run db:generate', '--regenerate-path', 'src/generated/prisma', '--regenerate-env', 'DATABASE_URL=postgresql://runsense:runsense@localhost:5432/runsense']]]) {
   const workflow = render(args);
   const blocks = runBlocks(workflow);
 
@@ -928,7 +928,26 @@ for a in "$@"; do [ "$a" = "+%A" ] && { echo "Thursday"; exit 0; }; done
 echo "2026-09-21T06:12:00Z"
 `;
 
-function runAutofixPromptLoadStep({ runStartedAt = '', createdAt = '', realDate = false } = {}) {
+// What GitHub's runs API says about the failing commit: each run as
+// `id attempts conclusion`, and each earlier attempt's conclusion. `ciRuns`
+// null makes every lookup fail.
+function ciHistoryStub(ciRuns, earlierAttempts = {}) {
+  return `#!/usr/bin/env bash
+printf '%s\\n' "$*" >> "$(dirname "$0")/gh.log"
+${ciRuns === null ? 'exit 1' : ''}
+case "$2" in
+  repos/octocat/repo/actions/workflows/4242/runs\?head_sha=81252f2*)
+    cat <<'RUNS'
+${ciRuns?.map((r) => r.join(' ')).join('\n') ?? ''}
+RUNS
+    ;;
+${Object.entries(earlierAttempts).map(([k, v]) => `  repos/octocat/repo/actions/runs/${k}) echo ${v} ;;`).join('\n')}
+  *) echo "gh stub: unexpected $*" >&2; exit 1 ;;
+esac
+`;
+}
+
+function runAutofixPromptLoadStep({ runStartedAt = '', createdAt = '', realDate = false, ciRuns = [['900', '1', 'failure']], earlierAttempts = {} } = {}) {
   const out = renderTo();
   const workflow = readFileSync(join(out, '.github/workflows/dependabot-review.yml'), 'utf8');
   const block = runBlocks(workflow).find((b) => b.stepName === 'Load the autofix prompt');
@@ -936,6 +955,7 @@ function runAutofixPromptLoadStep({ runStartedAt = '', createdAt = '', realDate 
 
   const bin = mkdtempSync(join(tmpdir(), 'ds-afp-'));
   if (!realDate) writeFileSync(join(bin, 'date'), AUTOFIX_DATE_STUB, { mode: 0o755 });
+  writeFileSync(join(bin, 'gh'), ciHistoryStub(ciRuns, earlierAttempts), { mode: 0o755 });
   // The snapshot step's copy of the prompt, where this step reads it.
   const runnerTemp = mkdtempSync(join(tmpdir(), 'ds-afp-rt-'));
   mkdirSync(join(runnerTemp, 'dep-steward'));
@@ -960,6 +980,9 @@ function runAutofixPromptLoadStep({ runStartedAt = '', createdAt = '', realDate 
         CI_RUN_STARTED_AT: runStartedAt,
         CI_RUN_CREATED_AT: createdAt,
         GITHUB_OUTPUT: githubOutput,
+        REPO: 'octocat/repo',
+        CI_WORKFLOW_ID: '4242',
+        CI_HEAD_SHA: '81252f2277a6cc1ca2d8e12d6b0e2e5f7c9d3a10',
       },
     });
   } catch (e) {
@@ -977,7 +1000,7 @@ test('autofix prompt-load: the failing run\'s instant and weekday reach the prom
   assert.ok(output.includes('2026-09-21T06:12:00Z') && output.includes('a **Thursday**'), 'and "now" must be carried separately');
   // Same denial class as the review prompt: an unsubstituted $-token in an
   // allow-listed command is "Contains expansion" and every gh call is denied.
-  for (const token of ['$PR_NUMBER', '$CI_RUN_STARTED', '$CI_RUN_WEEKDAY', '$NOW_UTC', '$NOW_WEEKDAY']) {
+  for (const token of ['$PR_NUMBER', '$CI_RUN_STARTED', '$CI_RUN_WEEKDAY', '$NOW_UTC', '$NOW_WEEKDAY', '$CI_COMMIT_HISTORY']) {
     assert.ok(!output.includes(token), `an unsubstituted ${token} reached the agent`);
   }
   assert.ok(output.includes('gh pr comment 123 --body-file .dep-steward-autofix-comment.md'),
@@ -1012,6 +1035,33 @@ test('autofix prompt-load: with the real date, 2026-09-21T04:41:00Z is a Monday'
   const { status, output } = runAutofixPromptLoadStep({ runStartedAt: '2026-09-21T04:41:00Z', realDate: true });
   assert.equal(status, 0);
   assert.ok(output.includes('(UTC), a **Monday**'), 'the weekday of the batch that got this wrong');
+});
+
+// "Likely flaky" was the fixer's word for three tests that a vitest bump broke
+// on every run (Runsense-ai/runsense#3034). A test that passes and fails on the
+// same code shows it on the same commit, so the step counts what CI did there
+// and the agent gets that count as a fact, not a guess.
+
+test('autofix prompt-load: how often CI passed on this exact commit reaches the prompt', () => {
+  const { status, stderr, output } = runAutofixPromptLoadStep({ ciRuns: [['900', '1', 'failure'], ['901', '1', 'cancelled']] });
+  assert.equal(status, 0, stderr);
+  assert.ok(output.includes('CI finished 1 time(s) on this exact commit, counting re-runs, and passed 0 time(s).'),
+    'a cancelled run says nothing about the code, so it is not counted');
+});
+
+test('autofix prompt-load: a run\'s earlier attempts count too, a pass among them included', () => {
+  const { output } = runAutofixPromptLoadStep({
+    ciRuns: [['900', '3', 'failure']],
+    earlierAttempts: { '900/attempts/1': 'failure', '900/attempts/2': 'success' },
+  });
+  assert.ok(output.includes('CI finished 3 time(s) on this exact commit, counting re-runs, and passed 1 time(s).'), output);
+});
+
+test('autofix prompt-load: when GitHub cannot be read, the fact says so and the fixer still gets its prompt', () => {
+  const { status, output } = runAutofixPromptLoadStep({ ciRuns: null });
+  assert.equal(status, 0, 'a lookup that fails must not cost the fixer its run');
+  assert.ok(output.includes('How often CI has passed on this exact commit could not be read.'));
+  assert.ok(!/passed \d+ time/.test(output), 'and no count is made up');
 });
 
 // The bounds step is executed in autofix-push.test.mjs, together with the push

@@ -22,6 +22,9 @@
 #   --ci-name NAME       the CI workflow whose green status gates merges
 #   --model NAME         Claude model for the review job (default below)
 #   --render-only --out DIR   render those files to DIR and stop (no gh)
+#   --regenerate CMD, --regenerate-path PATH, --regenerate-env NAME=VALUE
+#                        the command that regenerates this repo's committed
+#                        output, so autofix can push it (see usage below)
 #
 # It writes files and (label/secret/setting) via `gh`. It never touches your
 # source, your existing CI workflow, branch-protection rules, or git history.
@@ -67,6 +70,15 @@ ASSIGNEE=''
 ASSIGNEE_EXPLICIT=0
 AUTOFIX=1
 COPY_CI_SECRETS=''
+# The regeneration: the command that regenerates committed output, the paths it
+# writes (space-separated), and its environment (NAME=VALUE, one per line).
+REGEN_COMMAND=''
+REGEN_PATHS=''
+REGEN_ENV=''
+REGEN_FROM_FLAGS=0
+REGEN_OFF=0
+REGEN_NOTE=''
+TAB=$(printf '\t')
 
 say()  { printf '%s\n' "$*"; }
 info() { printf '  %s\n' "$*"; }
@@ -99,6 +111,17 @@ Flags:
                        store without asking (GitHub runs a Dependabot PR's CI
                        with that store only, so CI fails there without them)
   --no-copy-ci-secrets don't copy them, and don't ask
+  --regenerate CMD     the command that regenerates output this repo commits
+                       (a Prisma client, say). When a Dependabot bump leaves
+                       that output stale and CI fails, autofix re-runs it, with
+                       no agent, and pushes the result for you to merge.
+                       Detected for Prisma; kept by every reinstall.
+  --regenerate-path PATH   a file or directory CMD writes; repeat for each.
+                       A regeneration may change nothing else.
+  --regenerate-env NAME=VALUE  an environment variable CMD needs; repeat for
+                       each. The value is written into the workflow, so give
+                       a placeholder, never a secret.
+  --no-regenerate      turn the regeneration off
   --render-only --out DIR   render into DIR and stop (no gh calls)
   -h, --help           show this help
 
@@ -124,6 +147,18 @@ while [ $# -gt 0 ]; do
     --model=*) MODEL="${1#--model=}" ;;
     --assignee) ASSIGNEE="${2:-}"; ASSIGNEE_EXPLICIT=1; shift ;;
     --assignee=*) ASSIGNEE="${1#--assignee=}"; ASSIGNEE_EXPLICIT=1 ;;
+    --regenerate) REGEN_COMMAND="${2:-}"; REGEN_FROM_FLAGS=1; shift ;;
+    --regenerate=*) REGEN_COMMAND="${1#--regenerate=}"; REGEN_FROM_FLAGS=1 ;;
+    --regenerate-path|--regenerate-path=*)
+      if [ "$1" = --regenerate-path ]; then _p="${2:-}"; shift; else _p="${1#--regenerate-path=}"; fi
+      # One spelling per path: no leading ./, no trailing /.
+      while :; do case "$_p" in ./*) _p=${_p#./} ;; */) _p=${_p%/} ;; *) break ;; esac; done
+      case "$_p" in *[!A-Za-z0-9._/@+-]*) die "--regenerate-path $_p: only letters, digits and . _ / @ + - are supported in a path" ;; esac
+      REGEN_PATHS="${REGEN_PATHS:+$REGEN_PATHS }$_p"; REGEN_FROM_FLAGS=1 ;;
+    --regenerate-env|--regenerate-env=*)
+      if [ "$1" = --regenerate-env ]; then _e="${2:-}"; shift; else _e="${1#--regenerate-env=}"; fi
+      REGEN_ENV="${REGEN_ENV:+$REGEN_ENV$NL}$_e"; REGEN_FROM_FLAGS=1 ;;
+    --no-regenerate) REGEN_OFF=1 ;;
     -h|--help) usage ;;
     *) die "unknown argument: $1 (try --help)" ;;
   esac
@@ -393,6 +428,223 @@ resolve_action_pins() {
 report_action_pins() { # report_action_pins <say|info>
   "$1" "$REVIEW_PIN_NOTE"
   if [ "$AUTOFIX" -eq 1 ]; then "$1" "$AUTOFIX_PIN_NOTE"; fi
+  if [ -n "$REGEN_NOTE" ]; then "$1" "$REGEN_NOTE"; fi
+}
+
+# ---- the regeneration (the installed repo owns it) -------------------------
+# A repo that commits generated output (a Prisma client, an API client) breaks
+# CI on a bump that changes what the generator writes, and the fix is to run
+# the generator, which no agent should do: it is mechanical, and it runs the
+# bump's own code. So the installer is told the command, the paths it writes
+# and the environment it needs, and the workflow re-runs it on pull_request
+# (dependabot-regenerate-jobs.yml). Resolved per run, like the action pin:
+#
+#   --regenerate flags              exactly what they say
+#   --no-regenerate                 off
+#   an existing regenerate job      its settings, so a reinstall keeps them
+#   a Prisma schema whose generator writes into a tracked directory
+#                                   that command, detected; a value its config
+#                                   reads with env() is asked for, or the
+#                                   regeneration stays off without a terminal
+#
+# Settings live in the regenerate job's env, as YAML single-quoted scalars,
+# and that block is where a reinstall reads them back.
+
+yaml_sq() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/''/g")"; }
+
+# Dies on a setting the workflow cannot carry safely.
+regen_validate() {
+  case "$REGEN_COMMAND" in
+    '') die "--regenerate needs the command, e.g. --regenerate 'npm run db:generate'" ;;
+    *"$NL"*) die "--regenerate: the command must be one line" ;;
+    *"\${{"*) die "--regenerate: '\${{' would be read by GitHub Actions as an expression" ;;
+  esac
+  [ -n "$REGEN_PATHS" ] || die "--regenerate needs at least one --regenerate-path: the files or directories the command writes, which are all a regeneration may change"
+  for _p in $REGEN_PATHS; do
+    case "$_p" in
+      ''|/*|.|..|../*|*/..|*/../*|*//*) die "--regenerate-path $_p: give a path inside the repository, relative to its root" ;;
+      .github|.github/*) die "--regenerate-path $_p: autofix never pushes under .github/" ;;
+      *[!A-Za-z0-9._/@+-]*) die "--regenerate-path $_p: only letters, digits and . _ / @ + - are supported in a path" ;;
+    esac
+  done
+  _names=' '
+  while IFS= read -r _kv; do
+    [ -n "$_kv" ] || continue
+    _n=${_kv%%=*}
+    case "$_kv" in *=*) : ;; *) die "--regenerate-env $_kv: give NAME=VALUE" ;; esac
+    case "$_n" in ''|[0-9]*|*[!A-Za-z0-9_]*) die "--regenerate-env $_kv: $_n is not a variable name" ;; esac
+    case "$_n" in GITHUB_*|RUNNER_*|ACTIONS_*|REGENERATE_*|PATH|HOME|CI|GH_TOKEN) die "--regenerate-env $_n: that name belongs to the runner or to dep-steward" ;; esac
+    case "${_kv#*=}" in *"\${{"*) die "--regenerate-env $_n: '\${{' would be read by GitHub Actions as an expression" ;; esac
+    case "$_names" in *" $_n "*) die "--regenerate-env $_n is given twice" ;; esac
+    _names="$_names$_n "
+  done <<EOF_ENV
+$REGEN_ENV
+EOF_ENV
+}
+
+# The regenerate job's env in an existing workflow, as NAME<TAB>value lines.
+existing_regeneration() { # existing_regeneration <workflow>
+  awk -v q="'" '
+    { sub(/\r$/, "") }
+    /^  [A-Za-z0-9_-]+:[ \t]*(#.*)?$/ { job = $0; sub(/^  /, "", job); sub(/:.*$/, "", job); inenv = 0; next }
+    job == "regenerate" && /^    env:[ \t]*$/ { inenv = 1; next }
+    job == "regenerate" && inenv {
+      if ($0 ~ /^[ \t]*(#.*)?$/) next
+      if ($0 !~ /^      [A-Za-z_][A-Za-z0-9_]*: /) { inenv = 0; next }
+      name = $0; sub(/^      /, "", name); sub(/:.*$/, "", name)
+      val = $0; sub(/^      [A-Za-z_][A-Za-z0-9_]*: /, "", val)
+      if (length(val) >= 2 && substr(val, 1, 1) == q && substr(val, length(val), 1) == q) {
+        val = substr(val, 2, length(val) - 2); gsub(q q, q, val)
+      }
+      printf "%s\t%s\n", name, val
+    }
+  ' "$1"
+}
+
+# Prisma: a schema whose generator writes into a directory git tracks. Sets
+# REGEN_COMMAND and REGEN_PATHS, and DETECTED_ENV to the names the Prisma
+# config reads with env(), which `prisma generate` needs set though it never
+# connects. Sets nothing when there is no such schema.
+DETECTED_ENV=''
+detect_regeneration() {
+  { [ -f package-lock.json ] || [ -f npm-shrinkwrap.json ]; } || return 0
+  _cfg=''
+  _schema=''
+  for _c in prisma.config.ts prisma.config.mts prisma.config.cts prisma.config.js prisma.config.mjs prisma.config.cjs; do
+    if [ -f "$_c" ]; then
+      _cfg=$_c
+      _schema=$(sed -n "s/^[[:space:]]*schema:[[:space:]]*[\"']\([^\"']*\)[\"'].*/\1/p" "$_c" | head -1)
+      break
+    fi
+  done
+  if [ -z "$_schema" ]; then
+    if [ -f prisma/schema.prisma ]; then _schema=prisma/schema.prisma
+    elif [ -d prisma/schema ]; then _schema=prisma/schema
+    elif [ -f schema.prisma ]; then _schema=schema.prisma
+    else return 0
+    fi
+  fi
+  _root=$(pwd -P)
+  _found=''
+  _outs=$(mktemp)
+  for _f in $(if [ -d "$_schema" ]; then find "$_schema" -type f -name '*.prisma'; elif [ -f "$_schema" ]; then printf '%s\n' "$_schema"; fi); do
+    sed -n 's/^[[:space:]]*output[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$_f" > "$_outs"
+    while IFS= read -r _o; do
+      _abs=$(cd "$(dirname "$_f")/$_o" 2>/dev/null && pwd -P) || continue
+      case "$_abs" in "$_root"/*) _rel=${_abs#"$_root"/} ;; *) continue ;; esac
+      # Committed output only: an untracked one cannot go stale in the repo.
+      [ -n "$(git ls-files -- "$_rel" 2>/dev/null | head -1)" ] || continue
+      case " $_found " in *" $_rel "*) : ;; *) _found="${_found:+$_found }$_rel" ;; esac
+    done < "$_outs"
+  done
+  rm -f "$_outs"
+  [ -n "$_found" ] || return 0
+  _script=$(sed -n 's/^[[:space:]]*"\([^"]*\)":[[:space:]]*"[^"]*prisma generate[^"]*".*/\1/p' package.json 2>/dev/null | head -1)
+  if [ -n "$_script" ]; then REGEN_COMMAND="npm run $_script"; else REGEN_COMMAND='npx prisma generate'; fi
+  REGEN_PATHS=$_found
+  if [ -n "$_cfg" ]; then
+    DETECTED_ENV=$(grep -o "env([\"'][A-Za-z_][A-Za-z0-9_]*[\"'])" "$_cfg" | sed "s/^env([\"']//; s/[\"'])\$//" | sort -u | tr '\n' ' ')
+  fi
+}
+
+resolve_regeneration() {
+  if [ "$REGEN_OFF" -eq 1 ]; then
+    REGEN_COMMAND=''; REGEN_PATHS=''; REGEN_ENV=''
+    REGEN_NOTE='regenerate: off (--no-regenerate)'
+    return 0
+  fi
+  if [ "$REGEN_FROM_FLAGS" -eq 1 ]; then
+    [ "$AUTOFIX" -eq 1 ] || die "--regenerate pushes its result through autofix, so it cannot be used with --no-autofix"
+    regen_validate
+    regen_describe 'from the flags'
+    return 0
+  fi
+  [ "$AUTOFIX" -eq 1 ] || return 0
+  if [ -f "$EXISTING_WORKFLOW" ]; then
+    _kept=$(existing_regeneration "$EXISTING_WORKFLOW")
+    REGEN_COMMAND=$(printf '%s\n' "$_kept" | sed -n "s/^REGENERATE_COMMAND$TAB//p" | head -1)
+    if [ -n "$REGEN_COMMAND" ]; then
+      REGEN_PATHS=$(printf '%s\n' "$_kept" | sed -n "s/^REGENERATE_PATHS$TAB//p" | head -1)
+      REGEN_ENV=$(printf '%s\n' "$_kept" | grep -v '^REGENERATE_' | sed "s/$TAB/=/") || REGEN_ENV=''
+      regen_validate
+      regen_describe 'kept from the existing workflow'
+      return 0
+    fi
+  fi
+  detect_regeneration
+  [ -n "$REGEN_COMMAND" ] || return 0
+  for _n in $DETECTED_ENV; do
+    _v=''
+    if [ -t 0 ]; then
+      printf "Prisma reads %s when it loads its config, so \`%s\` needs it set (nothing connects to it). Value to generate with (empty: no regeneration): " "$_n" "$REGEN_COMMAND"
+      read -r _v
+    fi
+    if [ -z "$_v" ]; then
+      _flags="--regenerate '$REGEN_COMMAND'"
+      for _p in $REGEN_PATHS; do _flags="$_flags --regenerate-path $_p"; done
+      [ -t 0 ] || warn "found Prisma output in $REGEN_PATHS, but its config reads $_n, so the regeneration stays off. Turn it on with: $_flags --regenerate-env $_n=<any value of the right shape>"
+      REGEN_COMMAND=''; REGEN_PATHS=''; REGEN_ENV=''
+      return 0
+    fi
+    REGEN_ENV="${REGEN_ENV:+$REGEN_ENV$NL}$_n=$_v"
+  done
+  regen_validate
+  regen_describe 'detected: Prisma'
+}
+
+# What the summary and the render say about it: the command, the paths, and the
+# names (never the values) of its environment.
+regen_describe() { # <where it came from>
+  _names=$(printf '%s\n' "$REGEN_ENV" | sed -n 's/=.*//p' | tr '\n' ' ' | sed 's/ $//')
+  REGEN_NOTE="regenerate: \`$REGEN_COMMAND\` -> $REGEN_PATHS${_names:+ (env: $_names)} ($1)"
+}
+
+# The pieces the regenerate jobs and the autofix jobs carry. Each is indented
+# for the marker it replaces.
+regen_settings_block() { # <indent>
+  printf '%sREGENERATE_COMMAND: %s\n%sREGENERATE_PATHS: %s\n' "$1" "$(yaml_sq "$REGEN_COMMAND")" "$1" "$(yaml_sq "$REGEN_PATHS")"
+}
+regen_env_block() { # <indent>
+  printf '%s\n' "$REGEN_ENV" | while IFS= read -r _kv; do
+    [ -n "$_kv" ] || continue
+    printf '%s%s: %s\n' "$1" "${_kv%%=*}" "$(yaml_sq "${_kv#*=}")"
+  done
+}
+# Node at the version this repo declares, and its lockfile installed, when it
+# has them; a generator outside npm installs what it needs in its command.
+regen_setup_block() {
+  if [ -f package.json ]; then
+    _vf=package.json
+    for _c in .nvmrc .node-version .tool-versions; do
+      if [ -f "$_c" ]; then _vf=$_c; break; fi
+    done
+    printf '%s\n' \
+      '      - name: Set up Node (the version this repo declares)' \
+      '        uses: actions/setup-node@v7' \
+      '        with:' \
+      "          node-version-file: $_vf"
+  fi
+  if [ -f package-lock.json ] || [ -f npm-shrinkwrap.json ]; then
+    [ -f package.json ] && printf '\n'
+    printf '%s\n' \
+      "      - name: Install dependencies (the bump's lockfile)" \
+      '        run: npm ci'
+  fi
+}
+
+# Keeps a template's #__REGENERATE_BEGIN__..ELSE part when the regeneration is
+# on and its ELSE..END part when it is off, and drops the markers: only the
+# taken branch reaches the workflow.
+select_regenerate_blocks() {
+  _on=0
+  [ -n "$REGEN_COMMAND" ] && _on=1
+  awk -v on="$_on" '
+    { t = $0; sub(/^[ \t]+/, "", t) }
+    t == "#__REGENERATE_BEGIN__" { inb = 1; keep = (on == 1); next }
+    t == "#__REGENERATE_ELSE__" { keep = (on != 1); next }
+    t == "#__REGENERATE_END__" { inb = 0; next }
+    !inb || keep { print }
+  '
 }
 
 # ---- render helpers --------------------------------------------------------
@@ -447,12 +699,23 @@ subst_workflow() {
 render_workflow() {
   frag=''
   trig=''
+  regen=''
   if [ "$AUTOFIX" -eq 1 ]; then
     frag=$(cat "$SRC/templates/dependabot-autofix-job.yml")
     trig=$(printf '%s\n' '  workflow_run:' '    workflows: ["__CI_NAME__"]' '    types: [completed]')
   fi
+  if [ -n "$REGEN_COMMAND" ]; then
+    regen=$(cat "$SRC/templates/dependabot-regenerate-jobs.yml")
+  fi
   inject '#__AUTOFIX_JOB__' "$frag" < "$SRC/templates/dependabot-review.yml" \
     | inject '#__AUTOFIX_TRIGGER__' "$trig" \
+    | inject '#__REGENERATE_JOBS__' "$regen" \
+    | select_regenerate_blocks \
+    | inject '          #__REGENERATE_TAKE_FUNCTIONS__' "$(cat "$SRC/templates/regenerate-take.sh")" \
+    | inject '      #__REGENERATE_SETTINGS__' "$(regen_settings_block '      ')" \
+    | inject '          #__REGENERATE_SETTINGS__' "$(regen_settings_block '          ')" \
+    | inject '      #__REGENERATE_ENV__' "$(regen_env_block '      ')" \
+    | inject '      #__REGENERATE_SETUP__' "$(regen_setup_block)" \
     | subst_workflow
 }
 
@@ -643,6 +906,7 @@ if [ "$RENDER_ONLY" -eq 1 ]; then
   # Before any emit: --out may be the target repo itself, and the pin has to be
   # read from the workflow before the render replaces it.
   resolve_action_pins
+  resolve_regeneration
   emit render_dependabot_yml "$OUT/.github/dependabot.yml"
   emit render_prompt          "$OUT/.github/dependabot-review-prompt.md"
   emit render_workflow        "$OUT/.github/workflows/dependabot-review.yml"
@@ -654,7 +918,7 @@ if [ "$RENDER_ONLY" -eq 1 ]; then
     emit render_autofix_bounds "$OUT/$AUTOFIX_BOUNDS_PATH"
   fi
   report_action_pins say
-  say "Rendered to $OUT (ecosystems: $ACTIVE; ci: $CI_NAME; model: $MODEL; assignee: ${ASSIGNEE:-none}; autofix: $([ "$AUTOFIX" -eq 1 ] && echo on || echo off))"
+  say "Rendered to $OUT (ecosystems: $ACTIVE; ci: $CI_NAME; model: $MODEL; assignee: ${ASSIGNEE:-none}; autofix: $([ "$AUTOFIX" -eq 1 ] && echo on || echo off); regenerate: ${REGEN_COMMAND:-off})"
   exit 0
 fi
 
@@ -700,6 +964,7 @@ fi
 # Here, at the repo root and before the render: the existing workflow is read
 # from the same tree the new one is written into.
 resolve_action_pins
+resolve_regeneration
 
 # ---- resolve the escalation assignee (default: you) ------------------------
 if [ "$ASSIGNEE_EXPLICIT" -eq 0 ]; then
