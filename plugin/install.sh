@@ -13,12 +13,15 @@
 #   3. Render the pipeline into .github/ (workflow, prompts, dependabot.yml,
 #      gate, review lint, and the autofix bounds check unless --no-autofix).
 #   4. Create the `needs-human-review` label.
-#   5. Set CLAUDE_CODE_OAUTH_TOKEN in BOTH the Actions and Dependabot stores.
+#   5. Set CLAUDE_CODE_OAUTH_TOKEN in BOTH the Actions and Dependabot stores,
+#      from a token you mint or paste when asked (or pipe in with
+#      --token-stdin). It never reads one from your environment.
 #   6. Enable auto-merge on the repo.
 #   7. Check branch protection and advise (never mutates protection rules).
 #
 # Flags:
 #   --dry-run            show every change without making it
+#   --token-stdin        read CLAUDE_CODE_OAUTH_TOKEN from standard input
 #   --ci-name NAME       the CI workflow whose green status gates merges
 #   --model NAME         Claude model for the review job (default below)
 #   --render-only --out DIR   render those files to DIR and stop (no gh)
@@ -57,6 +60,7 @@ AUTOFIX_BOUNDS_PATH='.github/dependabot-automerge/autofix-bounds.cjs'
 AUTOFIX_PROMPT_PATH='.github/dependabot-autofix-prompt.md'
 LABEL='needs-human-review'
 SECRET='CLAUDE_CODE_OAUTH_TOKEN'
+PUSH_SECRET='DEP_STEWARD_PUSH_TOKEN'
 
 NL='
 '
@@ -70,6 +74,7 @@ ASSIGNEE=''
 ASSIGNEE_EXPLICIT=0
 AUTOFIX=1
 COPY_CI_SECRETS=''
+TOKEN_STDIN=0
 # The regeneration: the command that regenerates committed output, the paths it
 # writes (space-separated), and its environment (NAME=VALUE, one per line).
 REGEN_COMMAND=''
@@ -100,6 +105,10 @@ Usage: run in the repo you want to protect:
 
 Flags:
   --dry-run            show every change without making it
+  --token-stdin        read the CLAUDE_CODE_OAUTH_TOKEN to store from standard
+                       input, e.g. claude setup-token's output you saved:
+                       sh install.sh --token-stdin < token.txt
+                       (without it, the installer asks you for the token)
   --ci-name NAME       the CI workflow whose green status gates merges
   --model NAME         Claude model for the review job (default: claude-opus-4-8)
   --assignee HANDLE    GitHub user assigned when a PR is escalated, so GitHub
@@ -134,6 +143,7 @@ USAGE
 while [ $# -gt 0 ]; do
   case "$1" in
     --dry-run) DRY_RUN=1 ;;
+    --token-stdin) TOKEN_STDIN=1 ;;
     --autofix) AUTOFIX=1 ;;
     --no-autofix) AUTOFIX=0 ;;
     --copy-ci-secrets) COPY_CI_SECRETS=yes ;;
@@ -1016,12 +1026,12 @@ if [ "$DRY_RUN" -eq 1 ]; then
   done
   say ""
   say "[dry-run] GitHub changes that would be made:"
-  if [ "$AUTOFIX" -eq 1 ]; then
-    info "manual, web: install the Claude Code GitHub App on $NWO, which autofix pushes as — https://github.com/apps/claude"
-  fi
   info "gh label create $LABEL (if missing)"
   info "gh secret set $SECRET            (Actions store)"
   info "gh secret set $SECRET --app dependabot   (Dependabot store)"
+  if [ "$AUTOFIX" -eq 1 ]; then
+    info "optional, yours to run: gh secret set $PUSH_SECRET, so CI starts on autofix's fixes"
+  fi
   _would=$(ci_secrets_dependabot_lacks 2>/dev/null || true)
   if [ -n "$_would" ]; then
     info "copy into Dependabot's secrets what '$CI_NAME' reads and that store lacks: $_would"
@@ -1053,28 +1063,6 @@ else
   fi
 fi
 
-# ---- Claude GitHub App (autofix's push; not automatable) -------------------
-# Autofix pushes its fixes as the Claude Code GitHub App, which is what makes CI
-# run on them: a push with GITHUB_TOKEN starts no workflow. The review and the
-# fixer run on their jobs' own GITHUB_TOKEN and do not need the App, so neither
-# does an install without autofix. Installing it is a web consent flow with no
-# user-token API to perform or verify it, so we surface it and open it when we
-# can.
-if [ "$AUTOFIX" -eq 1 ]; then
-  say ""
-  say "Install the Claude Code GitHub App on $NWO. Autofix pushes its fixes as this App,"
-  say "which is what makes CI run on them; without it, a fix goes out with the workflow's"
-  say "token and CI does not start on it by itself. Grant it access to this repo:"
-  info "https://github.com/apps/claude  ->  Configure  ->  add $NWO"
-  if [ -t 0 ]; then
-    printf 'Open that page now? [Y/n] '
-    read -r ans
-    case "$ans" in ''|[Yy]*) open_url "https://github.com/apps/claude/installations/new" ;; esac
-    printf 'Press Enter once the App has access to %s... ' "$NWO"
-    read -r _
-  fi
-fi
-
 # ---- secret in BOTH stores (the marquee gotcha) ----------------------------
 # The single worst install outcome is storing a token that does not work: the
 # pipeline then fails three steps later, in CI, with an opaque "no verdict" — the
@@ -1093,18 +1081,23 @@ token_authenticates() {
   esac
 }
 
-TOKEN="${CLAUDE_CODE_OAUTH_TOKEN:-}"
-# A token from the environment is verified too — a stale/expired paste is the most
-# common trap, and looks identical to a good one until CI rejects it hours later.
-if [ -n "$TOKEN" ]; then
-  token_authenticates "$TOKEN" && _rc=0 || _rc=$?
-  if [ "${_rc:-0}" -eq 1 ]; then
-    warn "CLAUDE_CODE_OAUTH_TOKEN from the environment is invalid (401 Invalid bearer token) — ignoring it."
-    TOKEN=''
+# The token is only ever one the user hands over: minted or pasted at the
+# prompt below, or piped in with --token-stdin. A token piped in is verified
+# too — a stale/expired paste is the most common trap, and looks identical to a
+# good one until CI rejects it hours later.
+TOKEN=''
+if [ "$TOKEN_STDIN" -eq 1 ]; then
+  IFS= read -r TOKEN || true
+  if [ -z "$TOKEN" ]; then
+    warn "--token-stdin: nothing on standard input."
+  else
+    token_authenticates "$TOKEN" && _rc=0 || _rc=$?
+    if [ "${_rc:-0}" -eq 1 ]; then
+      warn "the token from standard input is invalid (401 Invalid bearer token) — not storing it."
+      TOKEN=''
+    fi
   fi
-fi
-
-if [ -z "$TOKEN" ] && [ -t 0 ]; then
+elif [ -t 0 ]; then
   # `claude setup-token` is interactive by design (browser OAuth) and prints the
   # token for manual copy, so we launch it inline and read the token back here.
   # Up to 3 attempts: mint or paste, then verify; a rejected token re-prompts
@@ -1170,6 +1163,23 @@ else
   warn "no CLAUDE_CODE_OAUTH_TOKEN provided — set it in BOTH stores yourself:"
   info "gh secret set $SECRET --repo $NWO"
   info "gh secret set $SECRET --repo $NWO --app dependabot"
+fi
+
+# ---- optional: the token autofix pushes with -------------------------------
+# GitHub starts no workflow for a commit pushed with a workflow's own
+# GITHUB_TOKEN, so without this secret an autofix push leaves CI for a person to
+# start (the PR comment says how). With it, CI starts on the fix by itself. The
+# installer never handles this value: `gh secret set` asks for it.
+if [ "$AUTOFIX" -eq 1 ]; then
+  if gh secret list --repo "$NWO" --json name --jq '.[].name' 2>/dev/null | grep -qxF "$PUSH_SECRET"; then
+    info "$PUSH_SECRET is set; autofix pushes with it, so CI starts on its fixes."
+  else
+    say ""
+    say "Optional: for CI to start on autofix's fixes by itself, give it a token to push with:"
+    info "a fine-grained token with Contents: read and write on $NWO (https://github.com/settings/personal-access-tokens/new), then"
+    info "gh secret set $PUSH_SECRET --repo $NWO"
+    info "Without it, autofix still pushes its fixes, and the PR says how to start CI."
+  fi
 fi
 
 copy_ci_secrets
