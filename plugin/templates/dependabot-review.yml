@@ -70,12 +70,12 @@ jobs:
     # bots in that step's `allowed_bots`. claude-code-action refuses any other
     # bot actor ("Workflow initiated by non-human actor", its checkHumanActor),
     # and the deliverable assertion below would then label and assign a PR
-    # whose review was never attempted. Autofix's push is such an event: it
-    # is made as the Claude GitHub App (claude[bot]) so that CI runs on the
-    # fix, and it fires `synchronize`. That push is deliberately not
-    # re-reviewed. The bump already has its verdict, and the fix waits for a
-    # person, who is assigned once CI finishes on it (by the gate when CI is
-    # green, by the autofix job's one-push guard when it is red).
+    # whose review was never attempted. Autofix's push made with GITHUB_TOKEN
+    # starts no workflow at all. One made with DEP_STEWARD_PUSH_TOKEN is the
+    # token owner's push, so it is re-reviewed like any person's push. Either
+    # way the fix waits for a person, who is assigned once CI finishes on it
+    # (by the gate when CI is green, by the autofix job's one-push guard when
+    # it is red).
     if: >
       github.event_name == 'workflow_dispatch' ||
       (github.event_name == 'pull_request' &&
@@ -87,8 +87,8 @@ jobs:
       # Everything this job's token can do, and the review step hands the
       # same token to the agent (its `github_token` input): read the repo and
       # the PR, comment, label. It cannot push or merge, and there is no
-      # id-token grant, so nothing in this job can mint the Claude App's
-      # installation token, which could. checks and actions stay ungranted on
+      # id-token grant, so nothing in this job can mint a token that could.
+      # checks and actions stay ungranted on
       # purpose: the reviewer judges the bump, never CI (see the header).
       contents: read
       pull-requests: write

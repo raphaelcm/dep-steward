@@ -246,14 +246,14 @@ function runInstaller({ args = ['--copy-ci-secrets'], dependabotNames = 'CLAUDE_
     workflow: join(root, 'seal-workflow.yml'), sealLog: join(root, 'seal-run.log'), run: join(root, 'seal-run.json'),
   };
   writeFileSync(files.log, '');
-  const r = spawnSync('sh', [join(REPO, 'plugin', 'install.sh'), '--ci-name', 'CI', ...args], {
+  const r = spawnSync('sh', [join(REPO, 'plugin', 'install.sh'), '--ci-name', 'CI', '--token-stdin', ...args], {
     cwd: repoDir,
     encoding: 'utf8',
+    input: 'oauth-tok-xyz\n',
     env: {
       ...process.env,
       PATH: `${bin}:${process.env.PATH}`,
       DEP_STEWARD_SRC: join(REPO, 'plugin'),
-      CLAUDE_CODE_OAUTH_TOKEN: 'oauth-tok-xyz',
       GH_LOG: files.log,
       GH_SECRETS: secretsDir,
       ACTIONS_SECRET_NAMES: Object.keys(ACTIONS_SECRETS).join(' ') + ' CLAUDE_CODE_OAUTH_TOKEN',

@@ -88,7 +88,9 @@ esac
 exit 0
 `;
 
-function runInstaller(extraEnv = {}, { args = [], setup = () => {}, expectFailure = false } = {}) {
+// The token reaches the installer the one way it takes one without a terminal:
+// on standard input, under --token-stdin. token: '' runs without it.
+function runInstaller(extraEnv = {}, { args = [], setup = () => {}, expectFailure = false, token = 'oauth-tok-xyz' } = {}) {
   const bin = mkdtempSync(join(tmpdir(), 'ds-bin-'));
   const ghLog = join(bin, 'gh.log');
   writeFileSync(ghLog, '');
@@ -105,15 +107,15 @@ function runInstaller(extraEnv = {}, { args = [], setup = () => {}, expectFailur
   execFileSync('git', ['init', '-q'], { cwd: repoDir });
   setup(repoDir);
 
-  const r = spawnSync('sh', [join(REPO, 'plugin', 'install.sh'), '--ci-name', 'CI', ...args], {
+  const r = spawnSync('sh', [join(REPO, 'plugin', 'install.sh'), '--ci-name', 'CI', ...(token ? ['--token-stdin'] : []), ...args], {
     cwd: repoDir,
+    input: token ? `${token}\n` : '',
     env: {
       ...process.env,
       PATH: `${bin}:${process.env.PATH}`,
       GH_LOG: ghLog,
       GH_SECRETS: secretsDir,
       DEP_STEWARD_SRC: join(REPO, 'plugin'),
-      CLAUDE_CODE_OAUTH_TOKEN: 'oauth-tok-xyz',
       ...extraEnv,
     },
     encoding: 'utf8',
@@ -127,7 +129,7 @@ function runInstaller(extraEnv = {}, { args = [], setup = () => {}, expectFailur
   return { log: readFileSync(ghLog, 'utf8'), repoDir, stdout: r.stdout, stderr: r.stderr, status: r.status, stored };
 }
 
-const { log, repoDir, stored } = runInstaller();
+const { log, repoDir, stored, stdout: stdoutOfDefault } = runInstaller();
 const lines = log.split('\n');
 
 test('sets the secret in the Actions store (no --app)', () => {
@@ -206,7 +208,7 @@ test('reports required status checks from the effective-rules endpoint (regressi
 });
 
 test('a token that fails verification is never stored (no opaque bad-token installs)', () => {
-  // With the `claude` probe returning 401, the env-provided token is invalid.
+  // With the `claude` probe returning 401, the token handed over is invalid.
   // Non-interactively the installer must store NOTHING rather than poison both
   // secret stores with a token that fails three steps later, opaquely, in CI.
   const { log: badLog } = runInstaller({ CLAUDE_STUB_FAIL: '1' });
@@ -219,10 +221,29 @@ test('a token that fails verification is never stored (no opaque bad-token insta
 test('a reinstall without the token, where both stores already hold it, keeps it and asks for nothing', () => {
   // Re-running the installer is how a repo upgrades. A token already in both
   // stores is the installed state, not something the user still has to set.
-  const { stdout, stderr, log: reLog } = runInstaller({ CLAUDE_CODE_OAUTH_TOKEN: '', GH_LISTED_SECRETS: 'CLAUDE_CODE_OAUTH_TOKEN' });
+  const { stdout, stderr, log: reLog } = runInstaller({ GH_LISTED_SECRETS: 'CLAUDE_CODE_OAUTH_TOKEN' }, { token: '' });
   assert.match(stdout, /CLAUDE_CODE_OAUTH_TOKEN is already set in both secret stores/);
   assert.doesNotMatch(`${stdout}${stderr}`, /set it in BOTH stores yourself/);
   assert.doesNotMatch(reLog, /secret set CLAUDE_CODE_OAUTH_TOKEN/);
+});
+
+test('a token in the environment is never read, let alone stored', () => {
+  // The plugin directory's policy: a credential already on the user's machine
+  // must not be picked up and sent anywhere. Only a token the user hands over
+  // (at the prompt, or with --token-stdin) is stored.
+  const { stdout, stderr, log: envLog, stored: envStored } = runInstaller({ CLAUDE_CODE_OAUTH_TOKEN: 'oauth-tok-from-env' }, { token: '' });
+  assert.doesNotMatch(envLog, /secret set CLAUDE_CODE_OAUTH_TOKEN/, envLog);
+  assert.ok(!Object.values(envStored).includes('oauth-tok-from-env'), 'the environment\'s token reached a secret store');
+  assert.match(`${stdout}${stderr}`, /no CLAUDE_CODE_OAUTH_TOKEN provided/);
+});
+
+test('autofix\'s push token is the user\'s to set: the installer names it and never handles it', () => {
+  assert.match(stdoutOfDefault, /gh secret set DEP_STEWARD_PUSH_TOKEN --repo acme\/widgets/);
+  assert.doesNotMatch(log, /secret set DEP_STEWARD_PUSH_TOKEN/, 'the installer must not set it');
+  const { stdout: setOut } = runInstaller({ GH_LISTED_SECRETS: 'DEP_STEWARD_PUSH_TOKEN' });
+  assert.match(setOut, /DEP_STEWARD_PUSH_TOKEN is set/);
+  const { stdout: offOut } = runInstaller({}, { args: ['--no-autofix'] });
+  assert.doesNotMatch(offOut, /DEP_STEWARD_PUSH_TOKEN/, 'without autofix there is nothing to push');
 });
 
 test('a reinstall that changes no file says so, and asks for no commit', () => {

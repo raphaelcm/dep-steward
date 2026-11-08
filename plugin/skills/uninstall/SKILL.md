@@ -36,6 +36,8 @@ rm -f .github/dependabot.yml
 gh label delete needs-human-review --yes
 gh secret delete CLAUDE_CODE_OAUTH_TOKEN
 gh secret delete CLAUDE_CODE_OAUTH_TOKEN --app dependabot
+# only if it is set (gh secret list):
+gh secret delete DEP_STEWARD_PUSH_TOKEN
 ```
 
 The installer may also have copied the secrets the repo's CI reads into the Dependabot store, so CI could pass on Dependabot's PRs. They are copies of the Actions secrets, which stay. Show the user the other names `gh secret list --app dependabot` lists, and delete with `gh secret delete <NAME> --app dependabot` only the ones they confirm, since they may have set some themselves.

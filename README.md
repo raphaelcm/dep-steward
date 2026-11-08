@@ -24,9 +24,9 @@ sh -c "$(curl -fsSL https://raw.githubusercontent.com/raphaelcm/dep-steward/main
 
 ### Prerequisites
 
-- **The [Claude Code GitHub App](https://github.com/apps/claude) installed on your repo** (open it → Configure → add the repo). Autofix pushes its fixes as this App, which is what makes CI run on them. Without it, reviews and fix drafts still run (both agents use their job's own token), but a fix is pushed with the workflow's token, CI does not start on it by itself, and the PR asks you to close and reopen it. The installer opens the page and waits; there's no API to install or verify it for you.
 - **[GitHub CLI](https://cli.github.com) (`gh`), authenticated** with `repo` + `workflow` scopes (`gh auth login`). The installer uses it to write the label, secrets, and repo settings.
-- **A `CLAUDE_CODE_OAUTH_TOKEN`** — the OAuth token `anthropics/claude-code-action` uses, from a Claude Pro/Max subscription. If [Claude Code](https://claude.com/claude-code) is installed, the installer offers to mint one for you inline via `claude setup-token` and reads it from the prompt — no separate step; otherwise `export CLAUDE_CODE_OAUTH_TOKEN=…` beforehand. Minting is browser-interactive by design, so expect one paste — it can't be captured unattended. The installer then **verifies the token authenticates before storing it** (a quick `claude -p` probe), so a wrong or expired token fails at install with a clear message rather than silently breaking the pipeline in CI later. Setup-token OAuth tokens are long-lived (a year); a copied keychain access token is short-lived and will expire.
+- **A `CLAUDE_CODE_OAUTH_TOKEN`** — the OAuth token `anthropics/claude-code-action` uses, from a Claude Pro/Max subscription. If [Claude Code](https://claude.com/claude-code) is installed, the installer offers to mint one for you inline via `claude setup-token` and reads it from the prompt — no separate step; otherwise paste one at the prompt, or pipe one in with `--token-stdin`. The installer never reads a token from your environment. Minting is browser-interactive by design, so expect one paste — it can't be captured unattended. The installer then **verifies the token authenticates before storing it** (a quick `claude -p` probe), so a wrong or expired token fails at install with a clear message rather than silently breaking the pipeline in CI later. Setup-token OAuth tokens are long-lived (a year); a copied keychain access token is short-lived and will expire.
+- **Optional: a `DEP_STEWARD_PUSH_TOKEN` secret**, for CI to start on autofix's fixes by itself (see [CI on the fix](#ci-on-the-fix)). It's a [fine-grained token](https://github.com/settings/personal-access-tokens/new) with Contents: read and write on the repo, set with `gh secret set DEP_STEWARD_PUSH_TOKEN`. The installer names it and never handles it.
 - **A CI workflow** whose green status should gate merges. The installer detects it or asks; pass `--ci-name "<name>"` to be explicit.
 
 ## How it works
@@ -97,7 +97,7 @@ It does not touch your source, your existing CI workflow, or your git history. (
 
 ## Autofix (on by default)
 
-When a dependency bump **breaks your CI** in a small, mechanical way — a renamed export, a changed signature, a moved default — a Claude agent makes the minimal fix, pushes it to the PR branch, and leaves it for **you** to review and merge. It turns "escalate, go diagnose and fix it yourself" into "here's an already-fixed PR, take a look." It needs **nothing beyond the install**: the fix is pushed as the Claude Code GitHub App you already installed, so CI runs on it by itself ([CI on the fix](#ci-on-the-fix)).
+When a dependency bump **breaks your CI** in a small, mechanical way — a renamed export, a changed signature, a moved default — a Claude agent makes the minimal fix, pushes it to the PR branch, and leaves it for **you** to review and merge. It turns "escalate, go diagnose and fix it yourself" into "here's an already-fixed PR, take a look." With a `DEP_STEWARD_PUSH_TOKEN` secret, CI starts on the fix by itself; without one, the PR says how to start it ([CI on the fix](#ci-on-the-fix)).
 
 The fixer is also told the failing run's own timestamp and weekday rather than left to work them out, because a bump that breaks a time-dependent test is exactly where a guessed weekday turns into a confident, wrong diagnosis.
 
@@ -128,7 +128,7 @@ sh -c "$(curl -fsSL https://raw.githubusercontent.com/raphaelcm/dep-steward/main
   --regenerate-env DATABASE_URL=postgresql://user:pass@localhost:5432/db
 ```
 
-On every Dependabot PR, two jobs in the review workflow run the install and the command on the PR head, then run the command again on a fresh runner over the result: the output must not change, which is what your CI's sync check asks of it. When CI then fails, autofix pushes that regeneration as the Claude GitHub App instead of running its fixer, and you review and merge it. A regeneration has no line budget, since a correct one can be thousands of lines, but it may change only the paths you declared: never anything under `.github/` or a bumped manifest or lockfile. When regenerating changes nothing, autofix runs its fixer as usual; when the output changes from one run to the next, it tells you instead of pushing.
+On every Dependabot PR, two jobs in the review workflow run the install and the command on the PR head, then run the command again on a fresh runner over the result: the output must not change, which is what your CI's sync check asks of it. When CI then fails, autofix pushes that regeneration instead of running its fixer, and you review and merge it. A regeneration has no line budget, since a correct one can be thousands of lines, but it may change only the paths you declared: never anything under `.github/` or a bumped manifest or lockfile. When regenerating changes nothing, autofix runs its fixer as usual; when the output changes from one run to the next, it tells you instead of pushing.
 
 The install and the generator are the bump's own code, so those jobs run where your CI runs on the PR: on `pull_request`, with a token that can only read and no secrets. The values you pass with `--regenerate-env` are written into the workflow, so give placeholders, never secrets (`prisma generate` needs `DATABASE_URL` set but never connects to it).
 
@@ -136,11 +136,12 @@ The installer finds a Prisma schema whose generator writes into a directory git 
 
 ### CI on the fix
 
-Who pushes the fix decides whether CI runs on it: GitHub starts no workflow for a commit a workflow pushes with its own `GITHUB_TOKEN`. So autofix pushes the fix **as the Claude Code GitHub App** — the one you installed for dep-steward anyway — and CI starts on it by itself. You're assigned when CI finishes: by the gate when it's green (an autofixed PR always waits for you), by the one-attempt rule when it's red.
+Who pushes the fix decides whether CI runs on it: GitHub starts no workflow for a commit a workflow pushes with its own `GITHUB_TOKEN`.
 
-The App token comes from the same exchange `claude-code-action` uses for every review: the job's OIDC identity traded at Anthropic's endpoint for an installation token on this repository. It is asked for only after the bounds check accepts a fix, scoped to `contents: write`, used for that one push, and revoked right after; the fixer never sees it.
+- **With a `DEP_STEWARD_PUSH_TOKEN` secret** (a fine-grained token with Contents: read and write on the repo), autofix pushes the fix with it and CI starts on it by itself. You're assigned when CI finishes: by the gate when it's green (an autofixed PR always waits for you), by the one-attempt rule when it's red. The push counts as the token owner's, so the review runs again on it, as it does after any person's push.
+- **Without one**, autofix pushes the fix with `GITHUB_TOKEN`, and the PR says to start CI by **closing and reopening it** (or pushing any commit to its branch).
 
-If that token can't be had or the push is refused, the fix still goes out with `GITHUB_TOKEN`, the PR says to start CI by **closing and reopening it** (or pushing any commit to its branch) and why, and the job goes red so you notice. Nothing merges un-tested either way. Because CI on the fix is started by an App rather than by Dependabot, it runs with your Actions secrets, just as it would after a person's push — see [SECURITY.md](SECURITY.md).
+The token is read only by the push step, used only to push to your repository, and only after the bounds check accepts a fix; the fixer never sees it. If GitHub refuses it, the fix still goes out with `GITHUB_TOKEN`, the PR says why CI didn't start, and the job goes red so you notice. Nothing merges un-tested either way. CI started by the token's push runs with your Actions secrets, just as it would after a person's push — see [SECURITY.md](SECURITY.md).
 
 ## Claude Code plugin
 
@@ -157,7 +158,7 @@ The plugin itself is the [`plugin/`](plugin) folder: its manifest, its three ski
 
 | Command | What it does |
 |---|---|
-| `/dep-steward:install` | Preflights the prerequisites in whatever repo you're in, shows you the `--dry-run` plan, then installs. Hands off cleanly for the two steps that need a browser (minting the token, granting the GitHub App). |
+| `/dep-steward:install` | Preflights the prerequisites in whatever repo you're in, shows you the `--dry-run` plan, then installs. Hands off cleanly for the step that needs a browser (minting the token). |
 | `/dep-steward:summary` | Read-only readout: what was auto-merged, what was escalated and why, any security updates it landed, and an honest time-saved estimate. Takes a window: `/dep-steward:summary 90d`. |
 | `/dep-steward:uninstall` | Removes the pipeline from a repo — the files above, the label, and the token from **both** secret stores (forgetting the second one is the usual half-uninstall). |
 
@@ -223,7 +224,7 @@ The review job's final step prints the agent's *actual* error, read from `claude
 It's conservative by default: a major bump merges only if the model affirmatively recommends it *and* finds no affected usage. To make majors always wait for a human, tell the reviewer to always escalate majors (edit `.github/dependabot-review-prompt.md`), or require human review on those PRs via branch protection.
 
 **How do I uninstall?**
-Delete the files above, remove the `needs-human-review` label, and delete the `CLAUDE_CODE_OAUTH_TOKEN` secret from both stores, plus any CI secrets the installer copied into the Dependabot store. No other footprint. `/dep-steward:uninstall` walks it for you, including the second secret store people forget.
+Delete the files above, remove the `needs-human-review` label, and delete the `CLAUDE_CODE_OAUTH_TOKEN` secret from both stores and `DEP_STEWARD_PUSH_TOKEN` if you set it, plus any CI secrets the installer copied into the Dependabot store. No other footprint. `/dep-steward:uninstall` walks it for you, including the second secret store people forget.
 
 ## Development
 
@@ -236,10 +237,10 @@ node --test test/*.test.mjs
 
 - `test/gate.test.mjs` — the gate's decision logic (rendered fresh from the templates, so it tests what actually ships).
 - `test/render.test.mjs` — render parity: the installer reproduces a known-good reference pipeline byte-for-byte.
-- `test/wiring.test.mjs` — the installer stores the verified token itself in both secret stores (the value, not just the command), creates the label, and enables auto-merge (stubbed `gh`).
+- `test/wiring.test.mjs` — the installer stores the verified token itself in both secret stores (the value, not just the command), never reads one from the environment, creates the label, and enables auto-merge (stubbed `gh`).
 - `test/workflow-shell.test.mjs` — every `run:` block in the rendered workflow parses under `bash -n` (the shell GitHub actually runs `run:` blocks with). Nothing else parses the shell the templates generate.
-- `test/autofix-push.test.mjs` — runs the rendered autofix job end to end (only the agent is simulated), pushing through real `git` to a local `git http-backend` that records who pushed: the fix lands as the Claude GitHub App, though the working tree still holds `GITHUB_TOKEN` where checkout and claude-code-action leave it, and falls back loudly when it cannot; the App token exists only for a fix that will be pushed, scoped to `contents: write`; a PR gets one autofix push; the review job starts only for pushers its action accepts.
-- `test/regenerate.test.mjs` — runs the regeneration end to end: the two `pull_request` jobs with a stand-in generator, then autofix and its push job against a stub of GitHub's REST routes. A stale committed client is regenerated and pushed as the Claude GitHub App with no agent; the bump's code runs only in the `pull_request` jobs; an unchanged regeneration leaves the fixer as it was; output that changes from run to run, writes outside its paths, or touches `.github/` or the lockfile is never pushed; and a crafted artifact or a turned fixer's claim cannot change what is pushed.
+- `test/autofix-push.test.mjs` — runs the rendered autofix job end to end (only the agent is simulated), pushing through real `git` to a local `git http-backend` that records who pushed: with a `DEP_STEWARD_PUSH_TOKEN` the fix lands with it, though the working tree still holds `GITHUB_TOKEN` where checkout and claude-code-action leave it, and falls back loudly when it is refused; without one it lands with `GITHUB_TOKEN` and the PR says how to start CI; the push token goes only to the git remote, only for a fix that will be pushed; a PR gets one autofix push; the review job starts only for pushers its action accepts.
+- `test/regenerate.test.mjs` — runs the regeneration end to end: the two `pull_request` jobs with a stand-in generator, then autofix and its push job against a stub of GitHub's REST routes. A stale committed client is regenerated and pushed with the push token, with no agent; the bump's code runs only in the `pull_request` jobs; an unchanged regeneration leaves the fixer as it was; output that changes from run to run, writes outside its paths, or touches `.github/` or the lockfile is never pushed; and a crafted artifact or a turned fixer's claim cannot change what is pushed.
 - `test/autofix-bounds.test.mjs` — the bounds check in both of its modes: the fixer's small source-only edit, and a regeneration confined to its declared paths with no line budget.
 - `test/actionlint.test.mjs` — the rendered workflow passes actionlint, which adopters' CI runs on it (skipped where actionlint is not installed; required in this repo's CI).
 - `test/agent-writes.test.mjs` — runs the rendered review job with a reviewer that rewrites every pipeline script it can reach: none of the rewrites runs, and the real lint and gate still do their jobs (the autofix bounds check has the same test in `autofix-push.test.mjs`).

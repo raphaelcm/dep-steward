@@ -72,12 +72,12 @@ jobs:
     # bots in that step's `allowed_bots`. claude-code-action refuses any other
     # bot actor ("Workflow initiated by non-human actor", its checkHumanActor),
     # and the deliverable assertion below would then label and assign a PR
-    # whose review was never attempted. Autofix's push is such an event: it
-    # is made as the Claude GitHub App (claude[bot]) so that CI runs on the
-    # fix, and it fires `synchronize`. That push is deliberately not
-    # re-reviewed. The bump already has its verdict, and the fix waits for a
-    # person, who is assigned once CI finishes on it (by the gate when CI is
-    # green, by the autofix job's one-push guard when it is red).
+    # whose review was never attempted. Autofix's push made with GITHUB_TOKEN
+    # starts no workflow at all. One made with DEP_STEWARD_PUSH_TOKEN is the
+    # token owner's push, so it is re-reviewed like any person's push. Either
+    # way the fix waits for a person, who is assigned once CI finishes on it
+    # (by the gate when CI is green, by the autofix job's one-push guard when
+    # it is red).
     if: >
       github.event_name == 'workflow_dispatch' ||
       (github.event_name == 'pull_request' &&
@@ -89,8 +89,8 @@ jobs:
       # Everything this job's token can do, and the review step hands the
       # same token to the agent (its `github_token` input): read the repo and
       # the PR, comment, label. It cannot push or merge, and there is no
-      # id-token grant, so nothing in this job can mint the Claude App's
-      # installation token, which could. checks and actions stay ungranted on
+      # id-token grant, so nothing in this job can mint a token that could.
+      # checks and actions stay ungranted on
       # purpose: the reviewer judges the bump, never CI (see the header).
       contents: read
       pull-requests: write
@@ -460,8 +460,8 @@ jobs:
     permissions:
       # This job runs the fixer agent, so its token is what a turned fixer
       # holds: it can read and comment, and cannot push or merge. No id-token:
-      # nothing in this job may mint the Claude App's token. The push happens
-      # in the autofix-push job, which runs no agent.
+      # nothing in this job may mint a token that could. The push happens in
+      # the autofix-push job, which runs no agent.
       contents: read
       pull-requests: write
       # The prompt's first step is reading the failing CI run (`gh pr checks`,
@@ -857,34 +857,30 @@ jobs:
 
   autofix-push:
     # Pushes the fix the autofix job drafted. It runs no agent: it is the one
-    # job that can push, and it holds the means to (contents: write for the
-    # GITHUB_TOKEN fallback, id-token for the Claude App's token) only because
-    # nothing in it reads attacker-influenced text. From the autofix job it
+    # job that can push, and it holds the means to (contents: write, and the
+    # optional push token) only because nothing in it reads attacker-influenced
+    # text. From the autofix job it
     # takes a patch and the commit the fixer saw, and trusts neither: it
     # resolves the PR from the event itself, checks the one-push rule again,
     # confirms the branch has not moved, applies the patch, and re-runs the
     # bounds check from the default branch before it pushes.
     #
     # WHO PUSHES decides whether CI runs on the fix. GitHub starts no workflow
-    # for a push made with GITHUB_TOKEN, so a fix pushed that way sat with no CI
-    # run and no merge-gate wake-up until a person pushed to the branch
-    # (Runsense-ai/runsense#2693: nine days). A push made with a GitHub App's
-    # installation token does start them, and the installer asks for one App
-    # on every repo this pipeline runs in: the Claude Code GitHub App. So the
-    # fix is pushed as that App, with a token from the same OIDC
-    # exchange claude-code-action performs (its src/github/token.ts; Anthropic's
-    # own CI auto-fix example relies on it on workflow_run). Nothing to set up.
+    # for a push made with GITHUB_TOKEN, so a fix pushed that way sits with no
+    # CI run and no merge-gate wake-up until a person starts one
+    # (Runsense-ai/runsense#2693: nine days). A push made with any other token
+    # does start them. So when the repo has a DEP_STEWARD_PUSH_TOKEN secret (a
+    # token that can write this repo's contents, set by its owner), the fix is
+    # pushed with it; without one it goes out with GITHUB_TOKEN and the PR
+    # comment says how to start CI.
     needs: autofix
     if: needs.autofix.outputs.decision == 'push'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
-      # The GITHUB_TOKEN fallback push, and the comment and label.
+      # The GITHUB_TOKEN push, and the comment and label.
       contents: write
       pull-requests: write
-      # The OIDC token the push step exchanges for the Claude App's
-      # installation token: the credential that makes CI run on the fix.
-      id-token: write
     env:
       # The same author as the autofix job's: keep these two lines equal.
       AUTOFIX_AUTHOR_NAME: dep-steward[bot]
@@ -1003,7 +999,7 @@ jobs:
             echo "reason=$REASON"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Push the fix (as the Claude GitHub App, so CI runs on it)
+      - name: Push the fix (with the repo's push token when it has one, so CI runs on it)
         id: push
         if: ${{ !cancelled() && steps.recheck.outputs.decision == 'push' }}
         env:
@@ -1016,12 +1012,13 @@ jobs:
           # comment, the identity whose decision blocks the gate trusts.
           REASON: ${{ steps.recheck.outputs.reason }}
           WORKFLOW_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Optional, set by the repo's owner; empty when the secret is not set.
+          PUSH_TOKEN: ${{ secrets.DEP_STEWARD_PUSH_TOKEN }}
         run: |
           set -euo pipefail
-          # Reads the staged fix, this job's OIDC token and GITHUB_TOKEN. Writes
-          # one commit to the PR branch and one comment. Decides nothing about
-          # the fix itself. The Claude App token it pushes with is asked for,
-          # used and revoked inside this step: no other step ever holds it.
+          # Reads the staged fix, GITHUB_TOKEN and the optional push token.
+          # Writes one commit to the PR branch and one comment. Decides nothing
+          # about the fix itself. No other step holds the push token.
           git config user.name "$AUTOFIX_AUTHOR_NAME"
           git config user.email "$AUTOFIX_AUTHOR_EMAIL"
           git commit -m "fix(deps): mechanical fix for the ${HEAD_BRANCH} bump [dep-steward autofix]"
@@ -1044,60 +1041,12 @@ jobs:
               push "$GITHUB_SERVER_URL/$REPO.git" "HEAD:$HEAD_BRANCH" 2>&1
           }
 
-          # The Claude GitHub App's installation token, asked for exactly as
-          # claude-code-action asks for it: this job's OIDC token (audience
-          # claude-code-github-action) exchanged at Anthropic's endpoint, which
-          # answers for any repo the Claude App is installed on. Every curl
-          # here starts with -q, so it reads no ~/.curlrc: the fixer can write
-          # one, and a proxy named there would receive these tokens.
           PUSHED_WITH=''
           TRAIL=''
-          APP_TOKEN=''
-          if [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ]; then
-            TRAIL='as the Claude GitHub App: no OIDC token (this job needs the id-token: write permission)'
-          elif ! OIDC=$(curl -q -sS --fail-with-body -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
-                 "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=claude-code-github-action" 2>&1); then
-            TRAIL="as the Claude GitHub App: the OIDC request failed: $OIDC"
-          else
-            OIDC=$(printf '%s' "$OIDC" | jq -r '.value // empty' 2>/dev/null || true)
-            echo "::add-mask::$OIDC"
-            exchange() { # "$@" = extra curl arguments; sets EXCHANGED and APP_TOKEN
-              if EXCHANGED=$(curl -q -sS --fail-with-body -X POST -H "Authorization: Bearer $OIDC" "$@" \
-                   https://api.anthropic.com/api/github/github-app-token-exchange 2>&1); then
-                APP_TOKEN=$(printf '%s' "$EXCHANGED" | jq -r '.token // .app_token // empty' 2>/dev/null || true)
-              fi
-              [ -n "$APP_TOKEN" ]
-            }
-            # Scoped to what a push needs, asked for the way claude-code-action
-            # asks for a scope, and retried the way it retries: a blip here
-            # would otherwise cost the fix its CI run.
-            SCOPE='contents: write'
-            for ATTEMPT in 1 2 3; do
-              exchange -H 'Content-Type: application/json' --data '{"permissions":{"contents":"write"}}' && break
-              [ "$ATTEMPT" -lt 3 ] && sleep $((ATTEMPT * 2))
-            done
-            # An endpoint that will not narrow the token still grants its
-            # default scope, the one every claude-code-action run here holds.
-            if [ -z "$APP_TOKEN" ]; then
-              NARROW_REFUSAL=$EXCHANGED
-              if exchange; then
-                SCOPE="the exchange's default scope, since it would not narrow the token to contents: write ($NARROW_REFUSAL)"
-              fi
-            fi
-            if [ -n "$APP_TOKEN" ]; then
-              echo "::add-mask::$APP_TOKEN"
-              echo "Got the Claude GitHub App's token for this push, scoped to $SCOPE."
-            else
-              TRAIL="as the Claude GitHub App: the token exchange failed: $EXCHANGED"
-            fi
-          fi
-          if [ -n "$APP_TOKEN" ]; then
-            APP_BASIC=$(basic_for "$APP_TOKEN")
-            echo "::add-mask::$APP_BASIC"
-            if OUT=$(push_with "$APP_BASIC"); then PUSHED_WITH=app; else TRAIL="as the Claude GitHub App: $OUT"; fi
-            # Its one use is over; it does not outlive the push.
-            curl -q -sS -o /dev/null -X DELETE -H "Authorization: Bearer $APP_TOKEN" \
-              "${GITHUB_API_URL:-https://api.github.com}/installation/token" 2>/dev/null || true
+          if [ -n "$PUSH_TOKEN" ]; then
+            PUSH_BASIC=$(basic_for "$PUSH_TOKEN")
+            echo "::add-mask::$PUSH_BASIC"
+            if OUT=$(push_with "$PUSH_BASIC"); then PUSHED_WITH=push-token; else TRAIL="with DEP_STEWARD_PUSH_TOKEN: $OUT"; fi
           fi
           if [ -z "$PUSHED_WITH" ]; then
             WORKFLOW_BASIC=$(basic_for "$WORKFLOW_TOKEN")
@@ -1110,8 +1059,8 @@ jobs:
           fi
 
           case "$PUSHED_WITH" in
-            app)
-              echo "Pushed the fix as the Claude GitHub App ($REASON); CI starts on it by itself."
+            push-token)
+              echo "Pushed the fix with DEP_STEWARD_PUSH_TOKEN ($REASON); CI starts on it by itself."
               gh pr comment "$PR_NUMBER" --repo "$REPO" --body "dep-steward autofix pushed a mechanical fix for this bump ($REASON). CI is now running on the fix; when it is green, review and merge."
               ;;
             workflow)
@@ -1121,11 +1070,15 @@ jobs:
               # person runs CI on it: closing and reopening the PR, or pushing
               # any commit, is a pull_request event from a person. "Re-run" in the
               # UI would only replay the pre-fix commit, so it can't be used here.
-              gh pr comment "$PR_NUMBER" --repo "$REPO" --body "dep-steward autofix pushed a mechanical fix for this bump ($REASON). GitHub doesn't run CI on a workflow-pushed commit, so to check the fix: **close and reopen this PR** (or push any commit to its branch). When CI is green, review and merge. (dep-steward could not push it as the Claude GitHub App, so CI did not start by itself; the autofix run's log says why.)"
-              # Red: the fix is out, but the push that starts CI failed.
-              echo "::error::dep-steward could not push the fix as the Claude GitHub App, so it went out with GITHUB_TOKEN and CI will not start by itself."
-              printf '%s\n' "$TRAIL"
-              exit 1
+              START_CI="GitHub doesn't run CI on a workflow-pushed commit, so to check the fix: **close and reopen this PR** (or push any commit to its branch). When CI is green, review and merge."
+              if [ -n "$PUSH_TOKEN" ]; then
+                gh pr comment "$PR_NUMBER" --repo "$REPO" --body "dep-steward autofix pushed a mechanical fix for this bump ($REASON). $START_CI (GitHub refused the push with DEP_STEWARD_PUSH_TOKEN, so CI did not start by itself; the autofix run's log says why.)"
+                # Red: the fix is out, but the push that starts CI failed.
+                echo "::error::GitHub refused the push with DEP_STEWARD_PUSH_TOKEN, so the fix went out with GITHUB_TOKEN and CI will not start by itself."
+                printf '%s\n' "$TRAIL"
+                exit 1
+              fi
+              gh pr comment "$PR_NUMBER" --repo "$REPO" --body "dep-steward autofix pushed a mechanical fix for this bump ($REASON). $START_CI (For CI to start on autofix's fixes by itself, add a DEP_STEWARD_PUSH_TOKEN secret: a token that can write this repo's contents.)"
               ;;
             *)
               echo "::error::Could not push the fix to $HEAD_BRANCH with any token:"

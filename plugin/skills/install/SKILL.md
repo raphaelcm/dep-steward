@@ -18,7 +18,7 @@ Run these and tell the user what you found. Each failure has a specific fix, so 
 - **A CI workflow exists:** `gh workflow list --json name,state`. The gate keys off one workflow's exact name and cannot fire without it. If there are several and none is obviously "the" CI, ask the user which one gates merges, then pass `--ci-name "<name>"`.
 - **The token secret:** `gh secret list --repo <NWO>` and `gh secret list --repo <NWO> --app dependabot`. `CLAUDE_CODE_OAUTH_TOKEN` must be in **both** stores. A Dependabot-triggered run reads only the Dependabot store, so a token that is only in Actions leaves the review job with an empty token on exactly the PRs it exists to review.
 - **Committed generated output:** if the repo commits code a generator writes from a dependency (a Prisma client, an API client) and CI checks it is in sync, autofix can regenerate it after a bump. The dry run says whether the installer detected one (Prisma). Otherwise ask the user for the command, the paths it writes and any environment it needs, and pass `--regenerate CMD --regenerate-path PATH [--regenerate-env NAME=VALUE]`. Environment values are committed in the workflow, so they must be placeholders, never secrets.
-- **The Claude Code GitHub App:** there is no API that reports this reliably. Treat it as required and tell the user to confirm it at <https://github.com/apps/claude> → Configure → add this repo. Autofix pushes its fixes as this App, which is what makes CI run on them; without it, a fix goes out with the workflow's token and CI does not start on it by itself. Reviews and fix drafts do not need it.
+- **Autofix's push token (optional):** whether `DEP_STEWARD_PUSH_TOKEN` is in the Actions store (same `gh secret list --repo <NWO>`). GitHub starts no CI for a commit a workflow pushes with its own token, so without this secret autofix's fixes wait for a person to start CI, and the PR comment says how. With it, CI starts on them by itself. It is a fine-grained token with Contents: read and write on this repo, which the user creates and sets with `gh secret set DEP_STEWARD_PUSH_TOKEN --repo <NWO>`.
 
 ## 2. Show what will change, before changing it
 
@@ -30,25 +30,17 @@ Add `--ci-name "<name>"` when you determined it in preflight, plus anything from
 
 ## 3. Install
 
-Run the same command without `--dry-run` when both of these hold:
-
-- `CLAUDE_CODE_OAUTH_TOKEN` is already set in the environment, **or** already present in both secret stores; and
-- the user has confirmed the Claude Code GitHub App has access to the repo (autofix pushes its fixes as it; with `--no-autofix` it is not needed).
+Run the same command without `--dry-run` when `CLAUDE_CODE_OAUTH_TOKEN` is already present in both secret stores.
 
 When the dry run lists CI secrets to copy into the Dependabot store, add `--copy-ci-secrets`: without it a run with no terminal copies nothing, and CI then fails on every Dependabot PR. Tell the user which secrets, and why, in your summary.
 
-Otherwise **stop and hand off**, because the two missing pieces are browser-interactive and cannot be completed by a tool:
-
-- Minting a token needs `claude setup-token`, which opens a browser and prints a token to paste.
-- Installing the GitHub App needs the user to grant access on github.com.
-
-Give the user the exact line to run in their own terminal, and say plainly which step needs them:
+Otherwise **stop and hand off**: minting the token needs `claude setup-token`, which opens a browser and prints a token to paste, so the user runs the installer in their own terminal. Give them the exact line:
 
 ```sh
 sh "${CLAUDE_PLUGIN_ROOT}/install.sh"
 ```
 
-Run interactively, the installer mints the token for them, verifies it authenticates before storing it, and opens the App page.
+Run interactively, the installer mints the token for them and verifies it authenticates before storing it.
 
 ## 4. Report
 

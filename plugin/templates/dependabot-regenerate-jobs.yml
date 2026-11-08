@@ -11,8 +11,9 @@
     # could plant a cache entry the default branch's workflows later restore.
     # The autofix jobs only read this run's artifact, as data.
     #
-    # Same pushers as the review job: autofix's own push (as the Claude
-    # GitHub App) does not regenerate again.
+    # Same pushers as the review job. Autofix's push made with GITHUB_TOKEN
+    # starts no run; one made with DEP_STEWARD_PUSH_TOKEN is a person's push,
+    # and regenerates again like any person's push (finding nothing to change).
     if: >
       github.event_name == 'pull_request' &&
       github.event.pull_request.user.login == 'dependabot[bot]' &&

@@ -9,7 +9,7 @@ import { parseJobs, runJob } from './lib/actions-sim.mjs';
 import { startGitServer, tokenOf } from './lib/git-http-server.mjs';
 import {
   CURL_STUB, GIT_ISOLATION, git,
-  WORKFLOW_TOKEN, CLAUDE_APP_TOKEN, OIDC_REQUEST_URL, OIDC_REQUEST_TOKEN, OIDC_JWT, GITHUB_API_URL,
+  WORKFLOW_TOKEN, PUSH_TOKEN, GITHUB_API_URL,
 } from './lib/autofix-harness.mjs';
 
 /**
@@ -350,7 +350,7 @@ async function runRegeneration({ bumpTo = '7.10.1', extra = '', review = 'ours',
         repository: { default_branch: 'main' },
       },
     };
-    const secrets = { GITHUB_TOKEN: WORKFLOW_TOKEN, CLAUDE_CODE_OAUTH_TOKEN: 'sk-ant-oat01-test' };
+    const secrets = { GITHUB_TOKEN: WORKFLOW_TOKEN, CLAUDE_CODE_OAUTH_TOKEN: 'sk-ant-oat01-test', DEP_STEWARD_PUSH_TOKEN: PUSH_TOKEN };
     const wrEnv = (job) => ({
       ...baseEnv,
       RUNNER_TEMP: d(`rt-${job}`),
@@ -358,12 +358,6 @@ async function runRegeneration({ bumpTo = '7.10.1', extra = '', review = 'ours',
       GITHUB_SHA: headSha,
       GITHUB_SERVER_URL: server.url,
       GITHUB_API_URL,
-      EXCHANGE: 'ok',
-      OIDC_JWT,
-      CLAUDE_APP_TOKEN,
-      ...(JOBS[job].permissions?.['id-token'] === 'write'
-        ? { ACTIONS_ID_TOKEN_REQUEST_URL: OIDC_REQUEST_URL, ACTIONS_ID_TOKEN_REQUEST_TOKEN: OIDC_REQUEST_TOKEN }
-        : {}),
     });
     const autofixTree = checkout('autofix');
     const autofix = await runJob(JOBS, 'autofix', { github: wrGithub, secrets, uses: uses(900), cwd: autofixTree, env: wrEnv('autofix') });
@@ -418,12 +412,12 @@ const labelled = (r) => r.ghCalls.some((c) => /^pr edit 1 --repo octocat\/repo -
 let shape3034;
 const run3034 = () => (shape3034 ??= runRegeneration());
 
-test('#3034: a bump that leaves the committed client stale is regenerated and pushed as the Claude App, with no agent', async () => {
+test('#3034: a bump that leaves the committed client stale is regenerated and pushed with the push token, with no agent', async () => {
   const r = await run3034();
   assert.equal(r.verdict, 'verified', r.log);
   assert.equal(r.calls.fixer.length, 0, `the fixer must not run when the regeneration is the fix:\n${r.log}`);
   assert.equal(r.push.failed, false, r.log);
-  assert.deepEqual(r.pushedAs, [CLAUDE_APP_TOKEN], `the push must be the App's, so CI runs on it:\n${r.log}`);
+  assert.deepEqual(r.pushedAs, [PUSH_TOKEN], `the push must be the push token's, so CI runs on it:\n${r.log}`);
   assert.deepEqual(r.pushedFiles.sort(), ['src/generated/prisma/internal/class.ts', 'src/generated/prisma/internal/prismaNamespace.ts']);
   assert.deepEqual(
     r.pushedNumstat.split('\n').map((l) => l.split('\t').slice(0, 2).map(Number)).reduce((n, [a, b]) => n + a + b, 0),
@@ -469,7 +463,7 @@ test('a generator whose output changes from run to run is escalated once, and no
   assert.equal(r.verdict, 'unreproducible', r.log);
   assert.equal(r.calls.fixer.length, 0);
   assert.equal(r.pushed, false);
-  assert.deepEqual(r.tokenCalls, [], 'no push token is asked for');
+  assert.deepEqual(r.tokenCalls, [], 'no step makes a request of its own');
   assert.equal(r.comments.length, 1);
   assert.match(r.comments[0], /changed the output again/);
   assert.ok(labelled(r), r.ghCalls.join('\n'));
@@ -494,7 +488,7 @@ test('with no review run of this PR for the commit, the fixer tries', async () =
 test('a regeneration still running when CI fails is waited for', async () => {
   const r = await runRegeneration({ inProgress: 3 });
   assert.equal(r.calls.fixer.length, 0, r.log);
-  assert.deepEqual(r.pushedAs, [CLAUDE_APP_TOKEN], r.log);
+  assert.deepEqual(r.pushedAs, [PUSH_TOKEN], r.log);
 });
 
 // ---- the push job's bounds ----------------------------------------------------
@@ -508,7 +502,7 @@ for (const [extra, why] of [
     const r = await runRegeneration({ extra });
     assert.equal(r.verdict, 'verified', 'reproducible, so only the bounds can stop it');
     assert.equal(r.pushed, false, r.log);
-    assert.deepEqual(r.tokenCalls, [], 'no push token is asked for');
+    assert.deepEqual(r.tokenCalls, [], 'no step makes a request of its own');
     assert.match(r.comments.join('\n'), why);
     assert.ok(labelled(r));
   });
@@ -562,7 +556,7 @@ with zipfile.ZipFile(sys.argv[1], 'w') as z:
   const r = await runRegeneration({
     zip: ({ headSha, patch }) => craft([...escapes, ['verdict', 'verified\n', false], ['head_sha', `${headSha}\n`, false], ['regeneration.patch', patch, false]], 'b.zip'),
   });
-  assert.deepEqual(r.pushedAs, [CLAUDE_APP_TOKEN], `the three named entries are all it reads:\n${r.log}`);
+  assert.deepEqual(r.pushedAs, [PUSH_TOKEN], `the three named entries are all it reads:\n${r.log}`);
   for (const where of [r.root, join(r.root, 'rt-autofix'), join(r.root, 'rt-autofix-push'), tmpdir(), '/tmp']) {
     assert.ok(!existsSync(join(where, 'escaped-by-zip')), `a zip entry escaped to ${where}`);
   }
