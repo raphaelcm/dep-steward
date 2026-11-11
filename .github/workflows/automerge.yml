@@ -156,7 +156,7 @@ jobs:
         # The gate that authorizes the merge comes from the dep-steward commit
         # the caller pins, never from the repo or the PR. No checkout: the job
         # runs no repo code, only `gh` metadata and the gate.
-        uses: raphaelcm/dep-steward/actions/tools@cf80cd516168b1fe658da12f7d65c09ecbeaeaeb
+        uses: raphaelcm/dep-steward/actions/tools@61527b196cbaee6e310d25a9e87b42548cc81270
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           assignee: ${{ inputs.assignee }}

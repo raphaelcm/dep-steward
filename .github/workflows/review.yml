@@ -142,7 +142,7 @@ jobs:
         # before the agent starts. The reviewer can write files (its comment
         # draft), and every script this job runs once the agent has started
         # would otherwise run an agent's rewrite with what its caller holds.
-        uses: raphaelcm/dep-steward/actions/tools@cf80cd516168b1fe658da12f7d65c09ecbeaeaeb
+        uses: raphaelcm/dep-steward/actions/tools@61527b196cbaee6e310d25a9e87b42548cc81270
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           assignee: ${{ inputs.assignee }}
@@ -790,7 +790,7 @@ jobs:
         # dep-steward commit the caller pins, never from the PR head.
         id: tools
         if: steps.pr.outputs.skip != 'true'
-        uses: raphaelcm/dep-steward/actions/tools@cf80cd516168b1fe658da12f7d65c09ecbeaeaeb
+        uses: raphaelcm/dep-steward/actions/tools@61527b196cbaee6e310d25a9e87b42548cc81270
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           assignee: ${{ inputs.assignee }}
@@ -1238,7 +1238,7 @@ jobs:
 
       - name: dep-steward's bounds check, from this release
         if: steps.pr.outputs.skip != 'true'
-        uses: raphaelcm/dep-steward/actions/tools@cf80cd516168b1fe658da12f7d65c09ecbeaeaeb
+        uses: raphaelcm/dep-steward/actions/tools@61527b196cbaee6e310d25a9e87b42548cc81270
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           assignee: ${{ inputs.assignee }}
