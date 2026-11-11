@@ -1,8 +1,8 @@
 # dep-steward
 
-**Claude-reviewed, injection-safe Dependabot automation for GitHub — auto-update, auto-review, and auto-merge-when-safe, installed in one line.**
+**Claude-reviewed, injection-safe Dependabot automation for GitHub — auto-update, auto-review, and auto-merge-when-safe, installed from Claude Code.**
 
-**[Website](https://raphaelcm.github.io/dep-steward/)** · **[Security model](SECURITY.md)** · Available as a [Claude Code plugin](#claude-code-plugin)
+**[Website](https://raphaelcm.github.io/dep-steward/)** · **[Security model](SECURITY.md)** · A [Claude Code plugin](#install)
 
 A steward is entrusted to manage something with care and judgment on your behalf. `dep-steward` does that for your dependency updates: a Claude cloud agent reviews every Dependabot PR — reading changelogs, enumerating breaking changes, and grepping *your* code for affected usage — and a **fully deterministic gate** decides the merge. The gate re-checks everything the model claims, so a prompt-injected dependency diff can never cause an unsafe merge.
 
@@ -10,24 +10,35 @@ This is not blind merging. `dep-steward` configures Dependabot to **auto-update*
 
 ## Install
 
-Run this in the repo you want to protect:
+dep-steward is a [Claude Code plugin](https://code.claude.com/docs/en/plugins), and this repo is its own marketplace. Add it once:
 
-```sh
-sh -c "$(curl -fsSL https://raw.githubusercontent.com/raphaelcm/dep-steward/main/plugin/install.sh)"
+```
+/plugin marketplace add raphaelcm/dep-steward
+/plugin install dep-steward@dep-steward
 ```
 
-It inspects your repo, shows what it will change, and does it. Re-running is safe (every step is idempotent), and it is how you upgrade. A re-run keeps the `anthropics/claude-code-action` version your repo's Dependabot has already moved to whenever that is newer than the one dep-steward ships, so an upgrade never downgrades the action; every run says which pin it kept. Preview without touching anything:
+Then, in the repo you want to protect:
 
-```sh
-sh -c "$(curl -fsSL https://raw.githubusercontent.com/raphaelcm/dep-steward/main/plugin/install.sh)" -- --dry-run
 ```
+/dep-steward:install
+```
+
+It checks the prerequisites, shows you each file it will write, writes them, and sets up the label, secrets and repo setting. Running it again is safe. (From a shell, the first two are `claude plugin marketplace add raphaelcm/dep-steward` and `claude plugin install dep-steward@dep-steward`.)
+
+### What gets installed
+
+The pipeline's code lives in this repository, and GitHub runs it as [reusable workflows](https://docs.github.com/en/actions/sharing-automations/reusing-workflows) at a commit your repo pins. Your repo gets three short workflow files that call it, plus your Dependabot config. Each file's settings are its `with:` values.
 
 ### Prerequisites
 
-- **[GitHub CLI](https://cli.github.com) (`gh`), authenticated** with `repo` + `workflow` scopes (`gh auth login`). The installer uses it to write the label, secrets, and repo settings.
-- **A `CLAUDE_CODE_OAUTH_TOKEN`** — the OAuth token `anthropics/claude-code-action` uses, from a Claude Pro/Max subscription. If [Claude Code](https://claude.com/claude-code) is installed, the installer offers to mint one for you inline via `claude setup-token` and reads it from the prompt — no separate step; otherwise paste one at the prompt, or pipe one in with `--token-stdin`. The installer never reads a token from your environment. Minting is browser-interactive by design, so expect one paste — it can't be captured unattended. The installer then **verifies the token authenticates before storing it** (a quick `claude -p` probe), so a wrong or expired token fails at install with a clear message rather than silently breaking the pipeline in CI later. Setup-token OAuth tokens are long-lived (a year); a copied keychain access token is short-lived and will expire.
-- **Optional: a `DEP_STEWARD_PUSH_TOKEN` secret**, for CI to start on autofix's fixes by itself (see [CI on the fix](#ci-on-the-fix)). It's a [fine-grained token](https://github.com/settings/personal-access-tokens/new) with Contents: read and write on the repo, set with `gh secret set DEP_STEWARD_PUSH_TOKEN`. The installer names it and never handles it.
-- **A CI workflow** whose green status should gate merges. The installer detects it or asks; pass `--ci-name "<name>"` to be explicit.
+- **[GitHub CLI](https://cli.github.com) (`gh`), authenticated** with `repo` + `workflow` scopes (`gh auth login`). The install uses it to write the label, secrets, and repo setting.
+- **A `CLAUDE_CODE_OAUTH_TOKEN`**: the OAuth token `anthropics/claude-code-action` uses, from a Claude Pro or Max subscription. `claude setup-token` mints one in your browser, and you store it yourself with `gh secret set`, in both secret stores (see FAQ). `/dep-steward:install` gives you the exact lines; it never handles the token. Setup-token OAuth tokens last a year; a copied keychain access token is short-lived and will expire.
+- **Optional: a `DEP_STEWARD_PUSH_TOKEN` secret**, for CI to start on autofix's fixes by itself (see [CI on the fix](#ci-on-the-fix)). It's a [fine-grained token](https://github.com/settings/personal-access-tokens/new) with Contents: read and write on the repo, set with `gh secret set DEP_STEWARD_PUSH_TOKEN`.
+- **A CI workflow** whose green status should gate merges. The install reads your workflows' names and asks when more than one could be it.
+
+### Upgrades
+
+Your repo pins dep-steward to a commit, so a new release reaches you only when you accept it. Dependabot proposes each release as a PR that changes the three workflow files, and the gate always leaves that PR to you: a pipeline never approves its own upgrade.
 
 ## How it works
 
@@ -70,30 +81,26 @@ The whitelist + CI checks are **load-bearing**: even a maximally injection-compr
 
 Minor/patch bumps arrive as one **grouped** Dependabot PR that is non-major *by construction* (guaranteed by the generated `.github/dependabot.yml`), so the gate can merge them with no model call at all. Only singletons and majors spend tokens on a review.
 
-## What the installer changes
+## What the install changes
 
 Files written into your repo (review and commit them like any change):
 
 | File | Purpose |
 |---|---|
-| `.github/workflows/dependabot-review.yml` | the agents: the review, and autofix's fixer and its push |
-| `.github/workflows/dependabot-automerge.yml` | the gate's workflow: the only thing that merges, and it runs no agent |
-| `.github/dependabot-review-prompt.md` | the reviewer's instructions |
+| `.github/workflows/dependabot-review.yml` | calls dep-steward's review workflow: the review, and autofix's fixer and its push |
+| `.github/workflows/dependabot-automerge.yml` | calls dep-steward's auto-merge workflow: the gate, the only thing that merges, and it runs no agent |
+| `.github/workflows/dependabot-seal.yml` | calls dep-steward's seal workflow, which copies CI's secrets for Dependabot; it runs only when started by hand |
 | `.github/dependabot.yml` | groups minor/patch bumps; majors stay individual |
-| `.github/dependabot-automerge/gate.cjs` | the deterministic gate (vanilla Node, zero deps) |
-| `.github/dependabot-automerge/review-lint.cjs` | checks the reviewer's comment against its evidence before it posts |
-| `.github/dependabot-autofix-prompt.md` | the fixer's instructions (autofix only) |
-| `.github/dependabot-automerge/autofix-bounds.cjs` | the fixer's scope limiter (autofix only) |
 
 GitHub settings it configures (via `gh`):
 
 - Creates the `needs-human-review` label.
-- Sets `CLAUDE_CODE_OAUTH_TOKEN` in **both** the Actions secret store **and** the Dependabot secret store (see FAQ — this is the #1 thing people get wrong).
-- Copies the secrets your CI reads into the Dependabot secret store, after asking once, so CI can pass on Dependabot's PRs at all (see FAQ). Nobody handles a value: a short-lived run seals each one for that store and the installer uploads only the sealed copy.
+- Checks that `CLAUDE_CODE_OAUTH_TOKEN` is in **both** the Actions secret store **and** the Dependabot secret store, and gives you the commands when it isn't (see FAQ: this is the #1 thing people get wrong).
+- Once the files are merged, offers to copy the secrets your CI reads into the Dependabot secret store, so CI can pass on Dependabot's PRs at all (see FAQ). Nobody handles a value: the seal workflow seals each one for that store and the install uploads only the sealed copy.
 - Enables "Allow auto-merge" on the repo.
 - Checks branch protection and **advises** if CI isn't a required check (it never changes your protection rules).
 
-It does not touch your source, your existing CI workflow, or your git history. (Copying the CI secrets creates one short-lived branch through GitHub's API, holding only the sealing workflow and sharing no history with yours, and deletes it with its run. Nothing is pushed from your checkout, so your git hooks never run.)
+It does not touch your source, your existing CI workflow, or your git history.
 
 ## Autofix (on by default)
 
@@ -101,11 +108,7 @@ When a dependency bump **breaks your CI** in a small, mechanical way — a renam
 
 The fixer is also told the failing run's own timestamp and weekday rather than left to work them out, because a bump that breaks a time-dependent test is exactly where a guessed weekday turns into a confident, wrong diagnosis.
 
-It's the one part of dep-steward that drafts changes to *your* source — always in a PR you review and merge, never on your default branch. If you'd rather no agent did that, turn it off at install:
-
-```
-sh -c "$(curl -fsSL https://raw.githubusercontent.com/raphaelcm/dep-steward/main/plugin/install.sh)" -- --no-autofix
-```
+It's the one part of dep-steward that drafts changes to *your* source — always in a PR you review and merge, never on your default branch. If you'd rather no agent did that, ask `/dep-steward:install` for no autofix, or set `autofix: false` in both `dependabot-review.yml` and `dependabot-automerge.yml`.
 
 **It never merges — you authorize every merge.** Three things keep that safe:
 
@@ -119,20 +122,18 @@ When autofix can't produce a clean, minimal fix — the evidence doesn't show th
 
 ### Regenerated output
 
-Some repos commit code a generator writes from a dependency: a Prisma client, an OpenAPI client. A bump that changes what the generator writes leaves that output stale, and a CI check that regenerates and diffs it goes red. The fix is to run the generator, which is mechanical, so no agent does it. Tell the installer the command, the paths it writes, and any environment it needs:
+Some repos commit code a generator writes from a dependency: a Prisma client, an OpenAPI client. A bump that changes what the generator writes leaves that output stale, and a CI check that regenerates and diffs it goes red. The fix is to run the generator, which is mechanical, so no agent does it. Give `dependabot-review.yml` the command, the paths it writes, and any environment it needs (`/dep-steward:install` asks when it sees a Prisma schema):
 
-```sh
-sh -c "$(curl -fsSL https://raw.githubusercontent.com/raphaelcm/dep-steward/main/plugin/install.sh)" -- \
-  --regenerate 'npm run db:generate' \
-  --regenerate-path src/generated/prisma \
-  --regenerate-env DATABASE_URL=postgresql://user:pass@localhost:5432/db
+```yaml
+      regenerate-command: npm run db:generate
+      regenerate-paths: src/generated/prisma
+      regenerate-env: |
+        DATABASE_URL=postgresql://user:pass@localhost:5432/db
 ```
 
 On every Dependabot PR, two jobs in the review workflow run the install and the command on the PR head, then run the command again on a fresh runner over the result: the output must not change, which is what your CI's sync check asks of it. When CI then fails, autofix pushes that regeneration instead of running its fixer, and you review and merge it. A regeneration has no line budget, since a correct one can be thousands of lines, but it may change only the paths you declared: never anything under `.github/` or a bumped manifest or lockfile. When regenerating changes nothing, autofix runs its fixer as usual; when the output changes from one run to the next, it tells you instead of pushing.
 
-The install and the generator are the bump's own code, so those jobs run where your CI runs on the PR: on `pull_request`, with a token that can only read and no secrets. The values you pass with `--regenerate-env` are written into the workflow, so give placeholders, never secrets (`prisma generate` needs `DATABASE_URL` set but never connects to it).
-
-The installer finds a Prisma schema whose generator writes into a directory git tracks, and the `package.json` script that runs `prisma generate`; when Prisma's config reads a variable with `env()`, it asks you for a value (without a terminal it leaves the regeneration off and prints the flags that turn it on). A re-run keeps the settings it finds in the workflow, `--regenerate` flags replace them, and `--no-regenerate` removes them.
+The install and the generator are the bump's own code, so those jobs run where your CI runs on the PR: on `pull_request`, with a token that can only read and no secrets. The `regenerate-env` values are committed in the workflow file, so give placeholders, never secrets (`prisma generate` needs `DATABASE_URL` set but never connects to it).
 
 ### CI on the fix
 
@@ -143,28 +144,19 @@ Who pushes the fix decides whether CI runs on it: GitHub starts no workflow for 
 
 The token is read only by the push step, used only to push to your repository, and only after the bounds check accepts a fix; the fixer never sees it. If GitHub refuses it, the fix still goes out with `GITHUB_TOKEN`, the PR says why CI didn't start, and the job goes red so you notice. Nothing merges un-tested either way. CI started by the token's push runs with your Actions secrets, just as it would after a person's push — see [SECURITY.md](SECURITY.md).
 
-## Claude Code plugin
-
-dep-steward is also a [Claude Code plugin](https://code.claude.com/docs/en/plugins), and this repo is **its own marketplace**, so it installs in two commands, straight from here:
-
-```
-/plugin marketplace add raphaelcm/dep-steward
-/plugin install dep-steward@dep-steward
-```
-
-Its three commands — `/dep-steward:install`, `/dep-steward:summary`, `/dep-steward:uninstall` — then follow you into every repo you work in. (From a shell, the same two as `claude plugin marketplace add raphaelcm/dep-steward` and `claude plugin install dep-steward@dep-steward`.)
-
-The plugin itself is the [`plugin/`](plugin) folder: its manifest, its three skills, the installer, and the templates the installer writes. The skills run that bundled installer, so the version you installed is the version that runs.
+## The plugin's commands
 
 | Command | What it does |
 |---|---|
-| `/dep-steward:install` | Preflights the prerequisites in whatever repo you're in, shows you the `--dry-run` plan, then installs. Hands off cleanly for the step that needs a browser (minting the token). |
+| `/dep-steward:install` | Checks the prerequisites in whatever repo you're in, shows you each file it will write, then installs. Hands you the commands for the step that needs a browser (minting the token). |
 | `/dep-steward:summary` | Read-only readout: what was auto-merged, what was escalated and why, any security updates it landed, and an honest time-saved estimate. Takes a window: `/dep-steward:summary 90d`. |
-| `/dep-steward:uninstall` | Removes the pipeline from a repo — the files above, the label, and the token from **both** secret stores (forgetting the second one is the usual half-uninstall). |
+| `/dep-steward:uninstall` | Removes the pipeline from a repo: the files above, the label, and the token from **both** secret stores (forgetting the second one is the usual half-uninstall). |
 
-These are **personal, install-once** tools: they act on whatever repo you're currently in. The per-repo installer deliberately does **not** write to your `~/.claude/` — a repo-setup tool has no business editing your personal config.
+They act on whatever repo you're currently in, and never write to your `~/.claude/`.
 
-**Without the plugin?** The summary command is a plain file you can drop into any Claude command library:
+The plugin is the [`plugin/`](plugin) folder: its manifest, its three skills, and the workflow files the install writes. The pipeline's code is in [`actions/`](actions) and [`.github/workflows/`](.github/workflows), which is what your repo's workflow files call.
+
+**Without the plugin?** Copy the three files in [`plugin/templates/`](plugin/templates) into `.github/workflows/`, replace `__CI_NAME__` with your CI workflow's `name:` and `__ASSIGNEE__` with your GitHub login, and write `.github/dependabot.yml` with the entries the [install skill's table](plugin/skills/install/SKILL.md) lists. Then create the label, set the secrets, and enable auto-merge, as [What the install changes](#what-the-install-changes) lists. The summary command is a plain file you can drop into any Claude command library:
 
 ```sh
 mkdir -p ~/.claude/commands
@@ -172,27 +164,25 @@ curl -fsSL https://raw.githubusercontent.com/raphaelcm/dep-steward/main/plugin/s
   > ~/.claude/commands/dep-steward-summary.md
 ```
 
-That puts `/dep-steward-summary` in your `/` menu everywhere. (Prefer a repo-shared copy for your team? Drop the same file at `.claude/commands/dep-steward-summary.md` in the repo; it'll show for anyone working there.) It's pull, not push — no standing noise.
-
 ## FAQ
 
 **Why does the token need to be in two places?**
-A Dependabot-triggered workflow run reads secrets from the *Dependabot* secret store, not the Actions store — the Actions store is invisible to it. If the token is only in Actions, the review job silently gets an empty token on real Dependabot PRs. The installer sets both so you never hit this. (It cost us weeks before we understood it.)
+A Dependabot-triggered workflow run reads secrets from the *Dependabot* secret store, not the Actions store — the Actions store is invisible to it. If the token is only in Actions, the review job silently gets an empty token on real Dependabot PRs. `/dep-steward:install` checks both so you never hit this. (It cost us weeks before we understood it.)
 
 **My CI needs a secret (an API key, say). Will it pass on Dependabot's PRs?**
-Yes, once it's in the Dependabot secret store, and the installer puts it there. GitHub runs a Dependabot PR's workflows with that store only, so a CI that reads an Actions secret fails on every Dependabot PR, and the gate, which merges only on green CI, never merges one. The installer finds the secrets your CI workflow reads (and the local reusable workflows it calls), and copies any the Dependabot store lacks. It asks first, because a new dependency version's code can then read them while CI runs; pass `--copy-ci-secrets` to say yes without a prompt. It never overwrites a secret already in the Dependabot store.
+Yes, once it's in the Dependabot secret store, and `/dep-steward:install` offers to put it there once its files are merged. GitHub runs a Dependabot PR's workflows with that store only, so a CI that reads an Actions secret fails on every Dependabot PR, and the gate, which merges only on green CI, never merges one. The seal workflow finds the secrets your CI workflow reads (and the local reusable workflows it calls), and the install copies any the Dependabot store lacks. It asks first, because a new dependency version's code can then read them while CI runs. It never overwrites a secret already in the Dependabot store.
 
 **Must my CI workflow be named `CI`?**
-No. The installer detects your CI workflow's name and templates it into the pipeline. Pass `--ci-name "<name>"` to override. The gate keys off this exact name, so it does need *a* CI workflow to exist.
+No. The install reads your CI workflow's name and writes it into the workflow files (`ci-name` and the `workflows:` triggers). The gate keys off this exact name, so it does need *a* CI workflow to exist.
 
 **Which ecosystems are supported?**
-Any Dependabot ecosystem the installer detects at your repo root: **npm/yarn/pnpm, pip (incl. poetry/pipenv), uv, cargo, Go modules, Bundler, Composer, Maven, Gradle, NuGet, Docker, and GitHub Actions** (Actions is always managed). The installer detects which manifests you have and generates the matching `dependabot.yml` entries, group-branch prefixes, and safety whitelist from one catalog (`detect_ecosystems` in `install.sh`) — so a repo with, say, `Cargo.toml` + `go.mod` + a `Dockerfile` gets all three managed.
+Any Dependabot ecosystem with a manifest at your repo root: **npm/yarn/pnpm, pip (incl. poetry/pipenv), uv, cargo, Go modules, Bundler, Composer, Maven, Gradle, NuGet, Docker, and GitHub Actions** (Actions is always managed). The gate derives its group-branch prefixes and safety whitelist from the files at your default branch's root, each time it runs ([`ecosystems.cjs`](actions/tools/ecosystems.cjs)), and the install writes the matching `dependabot.yml` entries from the same catalog, so a repo with, say, `Cargo.toml` + `go.mod` + a `Dockerfile` gets all three managed.
 
 Two things worth knowing:
 - **The whitelist is deliberately conservative.** Docker only auto-merges `Dockerfile`-style files, *not* arbitrary YAML — so a Dependabot bump to an image tag in a Kubernetes manifest is escalated to you rather than silently merged. Anything a routine bump touches that isn't a known manifest/lockfile → escalated, never auto-merged.
 - **Manifests are detected at the repo root** (`directory: /`). Monorepo/subdirectory manifests aren't auto-detected yet — you'd add entries by hand.
 
-Adding an ecosystem is genuinely a small change: one clause in `detect_ecosystems` (its `package-ecosystem`, Dependabot's branch slug, and its manifest paths). The branch slug is Dependabot's own — for most ecosystems it equals the config value, but three don't (`npm`→`npm_and_yarn`, `gomod`→`go_modules`, `github-actions`→`github_actions`), which is exactly the kind of thing this tool gets right for you.
+Adding an ecosystem is one clause in `ecosystems.cjs` (its `package-ecosystem`, Dependabot's branch slug, and its manifest paths) and one row in the install skill's table; a test holds the two together. The branch slug is Dependabot's own — for most ecosystems it equals the config value, but three don't (`npm`→`npm_and_yarn`, `gomod`→`go_modules`, `github-actions`→`github_actions`), which is exactly the kind of thing this tool gets right for you.
 
 **How much does it cost in tokens?**
 Only singleton and major bumps trigger a model review; grouped minor/patch PRs merge with zero model calls. A major-bump review is one bounded agent run (≤60 turns).
@@ -203,7 +193,7 @@ The gate merges only PRs whose every changed file is on the dependency/workflow 
 **How will I know when a PR needs me? / What happens to an escalated PR?**
 When the reviewer judges a PR unsafe or uncertain — a breaking change that affects you, a changelog it can't read, a CVE, files outside the whitelist, or plain uncertainty — dep-steward:
 
-- **assigns you** (or whoever you set with `--assignee`) to the PR, so it lands in your GitHub notifications and your "Assigned" queue — the queue you already triage, no new surface, no chat or issue spam;
+- **assigns you** (or whoever you set as `assignee`) to the PR, so it lands in your GitHub notifications and your "Assigned" queue — the queue you already triage, no new surface, no chat or issue spam;
 - adds the **`needs-human-review`** label; and
 - posts a **comment** explaining exactly why, with its structured decision block. Security advisories (CVEs) are flagged **PRIORITY** at the top.
 
@@ -213,46 +203,55 @@ The PR is then left open and untouched — the gate never merges an escalated PR
 
 This is deliberately an allow-list of permanent reasons, so anything new stays silent by default: being paged about a PR that fixes itself is what teaches you to ignore the label, and then you miss the real one.
 
-**Who tells you about a red build?** Exactly one job, so you're never paged twice for the same failure. With autofix on (the default) it's the autofix job — it tries a fix first, and assigns + labels + comments when it can't. With `--no-autofix` nothing else is watching CI, so the gate takes that job over.
+**Who tells you about a red build?** Exactly one job, so you're never paged twice for the same failure. With autofix on (the default) it's the autofix job — it tries a fix first, and assigns + labels + comments when it can't. With `autofix: false` nothing else is watching CI, so the gate takes that job over.
 
-Default assignee is you (the person who ran the installer). Set a different maintainer with `--assignee HANDLE`, or pass `--assignee ""` to disable assignment (then you triage by the label filter `is:open label:needs-human-review`).
+The default assignee is you (the person who ran the install). Set a different maintainer as `assignee` in both workflow files, or `assignee: ""` to assign nobody (then you triage by the label filter `is:open label:needs-human-review`).
 
 **A review job went red / a PR got no verdict — how do I tell why?**
-The review job's final step prints the agent's *actual* error, read from `claude-code-action`'s execution log (the run log otherwise shows only that it failed, never why). Open the failed run and read that step. By far the most common cause is an **invalid or expired `CLAUDE_CODE_OAUTH_TOKEN`**, which shows as `401 Invalid bearer token` — re-mint it with `claude setup-token` and re-run the installer (which now verifies the token before storing it, so this fails at install instead). If there is no agent error but the PR does carry a decision block from that run, the block was posted under an identity the gate ignores: the review step must give its agent the job's `GITHUB_TOKEN` (its `github_token` input). The autofix job surfaces agent errors the same way. Once the cause is fixed, review the PR again with `gh workflow run dependabot-review.yml -f pr_number=<n>`; the gate wakes when that review finishes.
+The review job's final step prints the agent's *actual* error, read from `claude-code-action`'s execution log (the run log otherwise shows only that it failed, never why). Open the failed run and read that step. By far the most common cause is an **invalid or expired `CLAUDE_CODE_OAUTH_TOKEN`**, which shows as `401 Invalid bearer token` — re-mint it with `claude setup-token` and store it in both secret stores again. If there is no agent error but the PR does carry a decision block from that run, the block was posted under an identity the gate ignores: the review step must give its agent the job's `GITHUB_TOKEN` (its `github_token` input). The autofix job surfaces agent errors the same way. Once the cause is fixed, review the PR again with `gh workflow run dependabot-review.yml -f pr_number=<n>`; the gate wakes when that review finishes.
 
 **How do I stop major bumps from ever merging automatically?**
-It's conservative by default: a major bump merges only if the model affirmatively recommends it *and* finds no affected usage. To make majors always wait for a human, tell the reviewer to always escalate majors (edit `.github/dependabot-review-prompt.md`), or require human review on those PRs via branch protection.
+It's conservative by default: a major bump merges only if the model affirmatively recommends it *and* finds no affected usage. To make majors always wait for a human, require a human review on those PRs via branch protection. (The reviewer's instructions ship with each dep-steward release, so they are the same in every repo.)
 
 **How do I uninstall?**
-Delete the files above, remove the `needs-human-review` label, and delete the `CLAUDE_CODE_OAUTH_TOKEN` secret from both stores and `DEP_STEWARD_PUSH_TOKEN` if you set it, plus any CI secrets the installer copied into the Dependabot store. No other footprint. `/dep-steward:uninstall` walks it for you, including the second secret store people forget.
+Delete the files above, remove the `needs-human-review` label, and delete the `CLAUDE_CODE_OAUTH_TOKEN` secret from both stores and `DEP_STEWARD_PUSH_TOKEN` if you set it, plus any CI secrets the install copied into the Dependabot store. No other footprint. `/dep-steward:uninstall` walks it for you, including the second secret store people forget.
 
 ## Development
 
-Zero runtime dependencies. The gate is one vanilla-Node file; the installer is POSIX `sh`; the tests use the Node built-in test runner.
+Zero runtime dependencies. The gate and its helpers are vanilla Node in [`actions/tools/`](actions/tools); the pipeline is the reusable workflows in [`.github/workflows/`](.github/workflows); the tests use the Node built-in test runner.
 
 ```sh
-shellcheck -s sh install.sh plugin/install.sh
 node --test test/*.test.mjs
 ```
 
-- `test/gate.test.mjs` — the gate's decision logic (rendered fresh from the templates, so it tests what actually ships).
-- `test/render.test.mjs` — render parity: the installer reproduces a known-good reference pipeline byte-for-byte.
-- `test/wiring.test.mjs` — the installer stores the verified token itself in both secret stores (the value, not just the command), never reads one from the environment, creates the label, and enables auto-merge (stubbed `gh`).
-- `test/workflow-shell.test.mjs` — every `run:` block in the rendered workflow parses under `bash -n` (the shell GitHub actually runs `run:` blocks with). Nothing else parses the shell the templates generate.
-- `test/autofix-push.test.mjs` — runs the rendered autofix job end to end (only the agent is simulated), pushing through real `git` to a local `git http-backend` that records who pushed: with a `DEP_STEWARD_PUSH_TOKEN` the fix lands with it, though the working tree still holds `GITHUB_TOKEN` where checkout and claude-code-action leave it, and falls back loudly when it is refused; without one it lands with `GITHUB_TOKEN` and the PR says how to start CI; the push token goes only to the git remote, only for a fix that will be pushed; a PR gets one autofix push; the review job starts only for pushers its action accepts.
-- `test/regenerate.test.mjs` — runs the regeneration end to end: the two `pull_request` jobs with a stand-in generator, then autofix and its push job against a stub of GitHub's REST routes. A stale committed client is regenerated and pushed with the push token, with no agent; the bump's code runs only in the `pull_request` jobs; an unchanged regeneration leaves the fixer as it was; output that changes from run to run, writes outside its paths, or touches `.github/` or the lockfile is never pushed; and a crafted artifact or a turned fixer's claim cannot change what is pushed.
-- `test/autofix-bounds.test.mjs` — the bounds check in both of its modes: the fixer's small source-only edit, and a regeneration confined to its declared paths with no line budget.
-- `test/actionlint.test.mjs` — the rendered workflow passes actionlint, which adopters' CI runs on it (skipped where actionlint is not installed; required in this repo's CI).
-- `test/agent-writes.test.mjs` — runs the rendered review job with a reviewer that rewrites every pipeline script it can reach: none of the rewrites runs, and the real lint and gate still do their jobs (the autofix bounds check has the same test in `autofix-push.test.mjs`).
-- `test/review-diagnose.test.mjs` — runs the rendered review job's diagnosis over a reviewer's execution log: a review whose every `gh pr diff` was denied is void and goes to a person, and one that read the diff stands although a compound command over it was denied.
-- `test/actions-sim.test.mjs` — the GitHub rules the step simulator (`test/lib/actions-sim.mjs`) copies: implicit `success()`, `continue-on-error`, unset outputs, case-insensitive comparison, loud refusal of anything it does not simulate.
-- `test/permissions.test.mjs` — no job that runs an agent can push, merge, or mint a token that could, and the jobs that can run no agent; each agent job grants every GitHub scope the commands in its own prompt need, and the reviewer allow-lists nothing that could reach — even via a flag on a wildcard entry — a scope its job does not grant, nor any `gh` command its prompt never orders. Derived from the rendered workflows and prompts rather than hardcoded.
-- `test/plugin.test.mjs` — the plugin and marketplace manifests parse and agree, every skill carries a description, the README's raw-file links resolve on disk, `plugin/` holds only what the plugin runs, and no skill downloads code.
-- `test/action-pin.test.mjs` — a reinstall keeps the repo's own `claude-code-action` pin when it is newer than the template's, takes the template's when it is older, keeps the repo's and warns when the versions cannot be compared, and renders a fresh install byte-for-byte as before.
-- `test/review-lint.test.mjs` — the reviewer's prose guard, in both of its modes: it refuses the comment that actually leaked and passes verbatim changelog text that merely mentions CI, and as a hook it blocks only the comment post and never blocks on its own failure.
-- `test/prompt-hygiene.test.mjs` — the rendered review prompt never raises CI as something to consider, with a self-check that its patterns still catch what leaked (so it cannot go quietly vacuous).
-- `test/gate-wake.test.mjs` — which finished runs wake the gate and for which PR, a replayed review included, through the real `resolve` job.
-- `test/ci-secrets.test.mjs` — the installer copies exactly the secrets CI reads that the Dependabot store lacks, as values sealed by a run of the workflow it actually pushed (run by the step simulator with a stand-in cipher), on a parentless branch it deletes afterwards, and copies nothing without consent.
+The tests run the shipped files themselves, through a step simulator (`test/lib/actions-sim.mjs`) that runs each `run:` block with bash and stubs only GitHub and the agents:
+
+- `test/gate.test.mjs`: the gate's decision logic, including that a change to dep-steward's own workflow files is always left to a person.
+- `test/ecosystems.test.mjs`: the install skill's `dependabot.yml` table and the gate's ecosystems agree.
+- `test/workflows.test.mjs`: the structure of the reusable workflows and the caller files: hook wiring, token scopes, wake-ups, arming and disarming, escalation, and that each caller passes only inputs its workflow declares.
+- `test/workflow-shell.test.mjs`: every `run:` block parses under `bash -n`.
+- `test/autofix-push.test.mjs` and `test/regenerate.test.mjs`: the autofix and regeneration jobs end to end (only the agent is simulated), pushing through real `git` to a local server that records who pushed.
+- `test/autofix-bounds.test.mjs`, `test/review-lint.test.mjs`: the bounds check and the reviewer's prose guard, in each of their modes.
+- `test/agent-writes.test.mjs`, `test/review-diagnose.test.mjs`, `test/prompt-hygiene.test.mjs`, `test/gate-wake.test.mjs`: the review job against a reviewer that rewrites what it can reach, a denied diff, prompt leaks, and which runs wake the gate.
+- `test/permissions.test.mjs`: no job that runs an agent can push, merge, or mint a token that could; each caller grants at least what its workflow's jobs need.
+- `test/ci-secrets.test.mjs`: the seal workflow seals exactly the secrets CI reads, with the Dependabot store's key.
+- `test/actionlint.test.mjs`: the reusable workflows and the installed caller files pass actionlint (required in this repo's CI).
+- `test/plugin.test.mjs`, `test/plugin-policy.test.mjs`: the manifests agree, and every file in `plugin/` is a type Anthropic's plugin directory accepts (Markdown, text, JSON, YAML, images; nothing that starts with `#!`).
+- `test/release-pin.test.mjs`: the pinned commits run the code in this tree.
+- `test/actions-sim.test.mjs`: the GitHub rules the simulator copies.
+
+### Releasing
+
+A pinned workflow must run the code it was released with, and a called workflow cannot learn its own commit, so every dep-steward ref is a full SHA that [`scripts/pin.mjs`](scripts/pin.mjs) writes:
+
+```sh
+node scripts/pin.mjs tools            # the reusable workflows use actions/tools at HEAD
+git commit -am "Pin the tools"        # the release commit: tag vX.Y.Z here
+node scripts/pin.mjs callers vX.Y.Z   # the caller templates pin that commit; plugin.json version
+git commit -am "Pin the callers"
+```
+
+Merge the release PR with a merge commit, not a squash, so every pinned commit stays on `main`.
 
 Working on the plugin locally:
 

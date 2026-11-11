@@ -1,5 +1,5 @@
 import { spawn } from 'node:child_process';
-import { mkdtempSync, writeFileSync, readFileSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -240,6 +240,14 @@ export function evaluate(expression, ctx) {
       : String(s ?? '').toLowerCase().includes(String(x ?? '').toLowerCase())),
     // GitHub's format(): `{N}` is the Nth argument as text, `{{` and `}}` are
     // literal braces.
+    toJSON: (v) => JSON.stringify(v ?? null, null, 2),
+    fromJSON: (v) => JSON.parse(String(v)),
+    // hashFiles(): '' when no file in the workspace matches, else a digest.
+    // Literal paths only (no globs), which is all the workflows pass.
+    hashFiles: (...paths) => {
+      const hits = paths.filter((f) => ctx.cwd && existsSync(join(ctx.cwd, String(f))));
+      return hits.length ? `sim-${hits.join(',')}` : '';
+    },
     format: (fmt, ...args) => String(fmt).replace(/\{\{|\}\}|\{(\d+)\}/g, (m, n) => {
       if (m === '{{') return '{';
       if (m === '}}') return '}';
@@ -404,7 +412,7 @@ export async function runJob(jobs, jobName, { github, secrets = {}, uses = {}, c
   const scratch = mkdtempSync(join(tmpdir(), 'ds-sim-'));
   // `runner.temp` is the runner's temp directory, which a step sees as RUNNER_TEMP.
   const runner = { temp: env.RUNNER_TEMP ?? '', os: 'Linux' };
-  const ctx = { github, secrets, env: {}, steps: {}, inputs, vars: {}, job: {}, runner, needs, jobFailed: false };
+  const ctx = { github, secrets, env: {}, steps: {}, inputs, vars: {}, job: {}, runner, needs, jobFailed: false, cwd };
   // `env:` at the top of the workflow, then the job's own (a reusable
   // workflow's `inputs` are visible to both).
   for (const [k, v] of Object.entries(workflowEnv)) ctx.env[k] = interpolate(v, ctx);

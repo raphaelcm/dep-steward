@@ -45,7 +45,7 @@ name: dep-steward review
 #    on a Dependabot PR, a Claude agent drafts a small mechanical fix. A
 #    separate job with no agent re-checks it and pushes it.
 #
-#  - regenerate (on: pull_request, when the installer was given a regenerate
+#  - regenerate (on: pull_request, when the caller gives a regenerate
 #    command): re-runs the repo's code generator for the bump, with no agent,
 #    and leaves a verdict artifact. When CI then fails, autofix pushes a
 #    verified regeneration instead of running its fixer.
@@ -441,7 +441,7 @@ jobs:
 
   regenerate:
     # Re-runs this repo's code generator for a Dependabot bump, with the
-    # command the installer was given, and leaves what it found as an
+    # command the caller gives, and leaves what it found as an
     # artifact of this run. No agent: regenerating is mechanical.
     #
     # The install and the generator are the bump's own code, so this runs
@@ -454,7 +454,9 @@ jobs:
     # Same pushers as the review job. Autofix's push made with GITHUB_TOKEN
     # starts no run; one made with DEP_STEWARD_PUSH_TOKEN is a person's push,
     # and regenerates again like any person's push (finding nothing to change).
+    # Only autofix reads what it leaves, so it runs only with autofix on.
     if: >
+      inputs.autofix &&
       inputs.regenerate-command != '' &&
       github.event_name == 'pull_request' &&
       github.event.pull_request.user.login == 'dependabot[bot]' &&
@@ -467,8 +469,7 @@ jobs:
       group: dependabot-regenerate-${{ github.event.pull_request.number }}
       cancel-in-progress: true
     env:
-      # The installer's settings for this repo. A reinstall reads them back
-      # from here, so re-running the installer keeps them.
+      # The caller's settings for this repo.
       REGENERATE_COMMAND: ${{ inputs.regenerate-command }}
       REGENERATE_PATHS: ${{ inputs.regenerate-paths }}
       REGENERATE_ENV: ${{ inputs.regenerate-env }}
@@ -700,7 +701,7 @@ jobs:
     #      the push job re-checks that itself, with the default branch's copy;
     #   4. a human authorizes every merge, so an injected "fix" can at most land a
     #      tiny reviewed source edit on a PR branch — never on your default branch.
-    # When the installer was given a regenerate command, the fix can instead be
+    # When the caller gives a regenerate command, the fix can instead be
     # the regeneration: the repo's own generator, re-run for the bump by the
     # regenerate jobs on pull_request (where the bump's code may run). This
     # job then only reads that run's verdict, and when it is verified, no
@@ -787,6 +788,7 @@ jobs:
         # Read-only copies outside the checkout, taken before the fixer
         # starts; every later step runs only these. They come from the
         # dep-steward commit the caller pins, never from the PR head.
+        id: tools
         if: steps.pr.outputs.skip != 'true'
         uses: raphaelcm/dep-steward/actions/tools@__TOOLS_REF__
         with:
@@ -1057,7 +1059,9 @@ jobs:
 
       - name: Bounds-check the fix (decide it is pushed, or discard and escalate)
         id: bounds
-        if: ${{ !cancelled() && steps.attempt.outputs.proceed == 'true' }}
+        # Also when the tools step failed: then nothing after it ran, the
+        # build was never diagnosed, and this step is what tells a person.
+        if: ${{ !cancelled() && (steps.attempt.outputs.proceed == 'true' || steps.tools.outcome == 'failure') }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
@@ -1110,7 +1114,7 @@ jobs:
                 case "$AGENT_ERR" in
                   *'Invalid bearer token'*|*authentication*|*401*)
                     echo "  -> CLAUDE_CODE_OAUTH_TOKEN is invalid or expired. Re-mint it with 'claude setup-token'."
-                    DETAIL="$DETAIL (CLAUDE_CODE_OAUTH_TOKEN looks invalid or expired — re-mint it with \`claude setup-token\` and re-run the installer.)" ;;
+                    DETAIL="$DETAIL (CLAUDE_CODE_OAUTH_TOKEN looks invalid or expired — re-mint it with \`claude setup-token\` and store it in both secret stores again.)" ;;
                 esac
               fi
             fi

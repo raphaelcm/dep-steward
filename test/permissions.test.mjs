@@ -1,10 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, writeFileSync, readFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join, dirname } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { join } from 'node:path';
+import { TOOLS_DIR, REFERENCE_ROOT_FILES, workflowText, callerText } from './lib/dep-steward.mjs';
 
 /**
  * Which token the agent actually holds, and what that token can read.
@@ -52,29 +50,25 @@ import { fileURLToPath } from 'node:url';
  * Runsense-ai/runsense#2561, run 33357967765). Verb-level scoping is how
  * that entry survived the assertion below.
  *
- * Byte-parity (render.test.mjs) cannot catch any of this: it would have
- * locked the original bug in. Everything below runs over the RENDERED tree,
- * which is what an adopter ships.
+ * A snapshot test cannot catch any of this: it would have locked the
+ * original bug in. Everything below runs over the SHIPPED reusable workflows
+ * (.github/workflows/{review,automerge,seal-ci-secrets}.yml), the prompts as
+ * the tools action fills them, and the caller templates the plugin installs,
+ * which is what an adopter runs.
  */
 
-const REPO = dirname(dirname(fileURLToPath(import.meta.url)));
-const REFERENCE_MANIFESTS = ['package.json', 'package-lock.json', 'requirements.txt', 'Cargo.toml', 'go.mod', 'Dockerfile'];
+const WORKFLOW = workflowText('review');
+const AUTOMERGE = workflowText('automerge');
+const SEAL = workflowText('seal');
 
-function renderReference() {
-  const fakeRepo = mkdtempSync(join(tmpdir(), 'ds-perm-repo-'));
-  for (const m of REFERENCE_MANIFESTS) writeFileSync(join(fakeRepo, m), '\n');
-  const out = mkdtempSync(join(tmpdir(), 'ds-perm-out-'));
-  execFileSync(
-    'sh',
-    [join(REPO, 'plugin', 'install.sh'), '--render-only', '--out', out, '--ci-name', 'CI', '--assignee', 'octocat'],
-    { cwd: fakeRepo, env: { ...process.env, DEP_STEWARD_SRC: join(REPO, 'plugin') }, stdio: 'pipe' },
-  );
-  return out;
+// A prompt as the tools action fills it for the reference repo (assignee
+// octocat), from actions/tools/<name>.
+function filledPrompt(name) {
+  return execFileSync('node', [join(TOOLS_DIR, 'render-prompt.cjs'), join(TOOLS_DIR, name)], {
+    env: { ...process.env, ROOT_FILES: REFERENCE_ROOT_FILES.join('\n'), ASSIGNEE: 'octocat' },
+    encoding: 'utf8',
+  });
 }
-
-const rendered = renderReference();
-const WORKFLOW = readFileSync(join(rendered, '.github/workflows/dependabot-review.yml'), 'utf8');
-const AUTOMERGE = readFileSync(join(rendered, '.github/workflows/dependabot-automerge.yml'), 'utf8');
 
 // ---- the scope lattice ----------------------------------------------------
 // `contents: write` satisfies a `contents: read` requirement, which the autofix
@@ -88,7 +82,7 @@ const LEVEL = { none: 0, read: 1, write: 2 };
 //
 // Judgment recorded deliberately: `gh pr checks` reads `statusCheckRollup`,
 // which merges check runs (`checks`) AND legacy commit statuses (`statuses`).
-// `statuses: read` is omitted — the installer requires an Actions workflow by
+// `statuses: read` is omitted — the install requires an Actions workflow by
 // construction, and the gate's authoritative CI signal is
 // `gh run list --workflow`, so the fixer's check view is advisory. If a repo
 // ever gates on a non-Actions commit status, this is the line to revisit.
@@ -201,8 +195,9 @@ function parseJobs(workflow) {
 
 const JOBS = parseJobs(WORKFLOW);
 const AM_JOBS = parseJobs(AUTOMERGE);
+const SEAL_JOBS = parseJobs(SEAL);
 
-// ---- requirement discovery, derived from the rendered artifacts -----------
+// ---- requirement discovery, derived from the shipped artifacts ------------
 function allowlistedTools(jobBody) {
   const m = /--allowedTools "([^"]*)"/.exec(jobBody);
   if (!m) return null; // not an agent job
@@ -222,8 +217,9 @@ function hasTokenPassthrough(jobBody) {
 
 // The prompt the job loads, discovered from the job body rather than mapped by
 // hand — so the job→prompt pairing cannot drift out from under the assertions.
+// Jobs load the tools action's filled copy from $RUNNER_TEMP/dep-steward/.
 function promptFor(jobBody) {
-  const names = new Set([...jobBody.matchAll(/\.github\/([a-z0-9-]+-prompt\.md)/g)].map((m) => m[1]));
+  const names = new Set([...jobBody.matchAll(/dep-steward\/([a-z0-9-]+-prompt\.md)/g)].map((m) => m[1]));
   return [...names];
 }
 
@@ -278,9 +274,11 @@ const AGENT_JOBS = Object.entries(JOBS).filter(([, j]) => allowlistedTools(j.bod
 test('the parser finds every job with a non-empty permissions block', () => {
   // A parser that silently finds nothing would make every assertion below
   // vacuously true, so this is the load-bearing precondition for the file.
-  assert.deepEqual(Object.keys(JOBS).sort(), ['autofix', 'autofix-push', 'review']);
+  // review.yml ships every job (regenerate ones included); inputs switch them.
+  assert.deepEqual(Object.keys(JOBS).sort(), ['autofix', 'autofix-push', 'regenerate', 'regenerate-verify', 'review']);
   assert.deepEqual(Object.keys(AM_JOBS), ['resolve', 'auto-merge']);
-  for (const [n, j] of [...Object.entries(JOBS), ...Object.entries(AM_JOBS)]) {
+  assert.deepEqual(Object.keys(SEAL_JOBS), ['seal']);
+  for (const [n, j] of [...Object.entries(JOBS), ...Object.entries(AM_JOBS), ...Object.entries(SEAL_JOBS)]) {
     assert.ok(
       Object.keys(j.permissions).length > 0,
       `job "${n}" parsed with an empty permissions block — the parser is broken or the block is missing`,
@@ -301,7 +299,7 @@ test('each agent job loads exactly one prompt, so the job→prompt map is derive
 
 for (const [name, j] of AGENT_JOBS) {
   test(`${name}: every gh command its prompt orders is allow-listed (un-allowlisted = silently denied)`, () => {
-    const promptText = readFileSync(join(rendered, '.github', promptFor(j.body)[0]), 'utf8');
+    const promptText = filledPrompt(promptFor(j.body)[0]);
     const allowed = new Set(allowlistedTools(j.body).filter((t) => t.kind === 'gh').map((t) => t.name));
     for (const cmd of commandsOrderedBy(promptText)) {
       assert.ok(allowed.has(cmd), `prompt orders "gh ${cmd}" but ${name} does not allow-list it`);
@@ -441,7 +439,7 @@ for (const [name, j] of AGENT_JOBS) {
     // governed by the grant assertions above, and its un-ordered entries
     // are legitimate diagnosis latitude. Local commands (grep) have no
     // token or scope surface and are not covered.
-    const promptText = readFileSync(join(rendered, '.github', promptFor(j.body)[0]), 'utf8');
+    const promptText = filledPrompt(promptFor(j.body)[0]);
     const ordered = new Set(commandsOrderedBy(promptText));
     for (const t of allowlistedTools(j.body)) {
       if (t.kind !== 'gh') continue;
@@ -497,7 +495,7 @@ test('autofix keeps Bash(gh pr checks:*) and Bash(gh run view:*) — reading the
 // and merging happen in jobs that run no agent.
 
 test('no job that runs an agent can push, merge, or mint a token that could', () => {
-  const agentJobs = [...Object.entries(JOBS), ...Object.entries(AM_JOBS)].filter(([, j]) => /uses: anthropics\/claude-code-action@/.test(j.body));
+  const agentJobs = [...Object.entries(JOBS), ...Object.entries(AM_JOBS), ...Object.entries(SEAL_JOBS)].filter(([, j]) => /uses: anthropics\/claude-code-action@/.test(j.body));
   assert.deepEqual(agentJobs.map(([n]) => n).sort(), ['autofix', 'review']);
   for (const [name, j] of agentJobs) {
     assert.notEqual(j.permissions.contents, 'write', `${name} runs an agent and can push or merge`);
@@ -507,9 +505,50 @@ test('no job that runs an agent can push, merge, or mint a token that could', ()
 });
 
 test('the jobs that can push or merge run no agent', () => {
-  const writers = [...Object.entries(JOBS), ...Object.entries(AM_JOBS)].filter(([, j]) => j.permissions.contents === 'write' || j.permissions['id-token'] === 'write');
+  const writers = [...Object.entries(JOBS), ...Object.entries(AM_JOBS), ...Object.entries(SEAL_JOBS)].filter(([, j]) => j.permissions.contents === 'write' || j.permissions['id-token'] === 'write');
   assert.deepEqual(writers.map(([n]) => n).sort(), ['auto-merge', 'autofix-push']);
   for (const [name, j] of writers) {
     assert.doesNotMatch(j.body, /uses: anthropics\/claude-code-action@/, `${name} can push or merge and must run no agent`);
   }
 });
+
+// ---- 13. a called workflow cannot exceed its caller ------------------------
+//
+// The adopter's caller files hold the workflow-level `permissions:` every
+// dep-steward job runs under: GitHub caps a called job's token at what its
+// caller grants. So each caller must grant at least what every job in the
+// workflow it calls declares, or that job runs with less than its block says
+// (and the assertions above, which read the called job's block, would
+// describe a token nobody holds). The caller is the ceiling, the called job's
+// block the real grant.
+
+function callerPermissions(text) {
+  const lines = text.split('\n');
+  const start = lines.findIndex((l) => /^permissions:\s*$/.test(l));
+  assert.ok(start >= 0, 'a caller must set workflow-level permissions');
+  const perms = {};
+  for (let i = start + 1; i < lines.length; i++) {
+    const l = lines[i];
+    if (l.trim() === '' || /^\s*#/.test(l)) continue;
+    if (/^\S/.test(l)) break;
+    const m = /^ {2}([a-z-]+):\s*(read|write|none)\s*$/.exec(l);
+    if (!m) throw new Error(`caller permissions parser: unrecognised line ${JSON.stringify(l)}`);
+    perms[m[1]] = m[2];
+  }
+  return perms;
+}
+
+for (const [caller, jobs] of [['review', JOBS], ['automerge', AM_JOBS], ['seal', SEAL_JOBS]]) {
+  test(`the ${caller} caller grants at least every scope its called jobs declare`, () => {
+    const ceiling = callerPermissions(callerText(caller));
+    for (const [name, j] of Object.entries(jobs)) {
+      for (const [scope, level] of Object.entries(j.permissions)) {
+        assert.ok(
+          LEVEL[ceiling[scope] ?? 'none'] >= LEVEL[level],
+          `${caller} caller grants ${scope}: ${ceiling[scope] ?? 'none'}, but called job "${name}" declares ${scope}: ${level}`,
+        );
+      }
+    }
+    assert.equal(ceiling['id-token'], undefined, `the ${caller} caller must not grant id-token`);
+  });
+}

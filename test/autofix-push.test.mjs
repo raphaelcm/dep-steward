@@ -5,7 +5,8 @@ import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, readdirSync, realp
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { parseJobs, conditionHolds, runJob } from './lib/actions-sim.mjs';
+import { conditionHolds, runJob } from './lib/actions-sim.mjs';
+import { jobsOf, workflowText, inputDefaults, topLevelEnv, toolsHandler, TOOLS_ACTION } from './lib/dep-steward.mjs';
 import { startGitServer, tokenOf, basicFor } from './lib/git-http-server.mjs';
 import {
   CURL_STUB, GIT_ISOLATION, git,
@@ -26,7 +27,7 @@ import {
  * A push that starts CI also releases the brake GITHUB_TOKEN put on
  * fix -> CI red -> autofix -> fix, so the job makes ONE push per PR.
  *
- * Everything here RUNS the rendered autofix job (test/lib/actions-sim.mjs:
+ * Everything here RUNS the shipped autofix job (.github/workflows/review.yml) (test/lib/actions-sim.mjs:
  * every `if:`, every output, every `run:` block through bash as GitHub runs
  * it). The pushes go through real `git` to a real `git http-backend` behind a
  * local server that records each request's Authorization, which is the thing
@@ -40,23 +41,12 @@ import {
  * `curl` stub logs any request a step makes, and the push makes none.
  */
 
-const REPO = dirname(dirname(fileURLToPath(import.meta.url)));
-const REFERENCE_MANIFESTS = ['package.json', 'package-lock.json', 'requirements.txt', 'Cargo.toml', 'go.mod', 'Dockerfile'];
-
-function render() {
-  const fakeRepo = mkdtempSync(join(tmpdir(), 'ds-ap-repo-'));
-  for (const m of REFERENCE_MANIFESTS) writeFileSync(join(fakeRepo, m), '\n');
-  const out = mkdtempSync(join(tmpdir(), 'ds-ap-out-'));
-  execFileSync(
-    'sh',
-    [join(REPO, 'plugin', 'install.sh'), '--render-only', '--out', out, '--ci-name', 'CI', '--assignee', 'octocat'],
-    { cwd: fakeRepo, env: { ...process.env, DEP_STEWARD_SRC: join(REPO, 'plugin') }, stdio: 'pipe' },
-  );
-  return out;
-}
-
-const RENDERED = render();
-const JOBS = parseJobs(readFileSync(join(RENDERED, '.github/workflows/dependabot-review.yml'), 'utf8'));
+// The shipped reusable workflow, called as the plugin's caller template calls
+// it, with octocat as the assignee and every other input at its default.
+const REVIEW_TEXT = workflowText('review');
+const JOBS = jobsOf('review');
+const INPUTS = { ...inputDefaults(REVIEW_TEXT), assignee: 'octocat' };
+const WORKFLOW_ENV = topLevelEnv(REVIEW_TEXT);
 
 const HEAD_BRANCH = 'dependabot/npm_and_yarn/ioredis-6.0.0';
 
@@ -126,9 +116,8 @@ const IN_BOUNDS_FIX = { 'src/client.ts': 'export const timeout = 2000;\n' };
  *   helper   leave a credential helper in the tree, as claude-code-action's
  *            allowed_non_write_users mode does, instead of a token in origin
  *   jobs     the parsed workflow to run (a test may take a permission away)
- *   pipelineOnBranch  false for a Dependabot branch cut before dep-steward
- *            was installed: the PR head lacks the autofix prompt and bounds
- *   workflowSha  the commit the workflow runs from, when not the seeded one
+ *   toolsFail  the tools action fails (it could not read the default
+ *            branch, say), so the job's scripts never arrive
  *   runnerTemp  a runner temp directory to reuse, as a self-hosted runner can
  *   forge    replace what the agent job hands the push job: { edits } becomes
  *            a patch against the commit the fixer saw, { patch } is used as
@@ -142,7 +131,7 @@ const IN_BOUNDS_FIX = { 'src/client.ts': 'export const timeout = 2000;\n' };
  *            A bare Write or Edit allow rule matches every path but Claude
  *            Code's protected ones, so the agent can.
  */
-async function runAutofix({ edits = IN_BOUNDS_FIX, commits = [DEPENDABOT_COMMIT], labels = [], pushToken, refuse = [], refuseWith = 403, helper = false, jobs = JOBS, pipelineOnBranch = true, workflowSha, runnerTemp: sharedTemp, outsideWrites = {}, forge, moveBranch = false, commitsSeenByPush } = {}) {
+async function runAutofix({ edits = IN_BOUNDS_FIX, commits = [DEPENDABOT_COMMIT], labels = [], pushToken, refuse = [], refuseWith = 403, helper = false, jobs = JOBS, toolsFail = false, runnerTemp: sharedTemp, outsideWrites = {}, forge, moveBranch = false, commitsSeenByPush } = {}) {
   const root = mkdtempSync(join(tmpdir(), 'ds-autofix-'));
   const srv = join(root, 'srv');
   const bare = join(srv, 'octocat', 'repo.git');
@@ -151,27 +140,20 @@ async function runAutofix({ edits = IN_BOUNDS_FIX, commits = [DEPENDABOT_COMMIT]
   const runnerTemp = sharedTemp ?? join(root, 'runner-temp');
   const home = join(root, 'home');
   const commentsDir = join(root, 'comments');
-  for (const d of [srv, work, bin, runnerTemp, home, commentsDir, join(work, 'src'), join(work, '.github/dependabot-automerge')]) {
+  for (const d of [srv, work, bin, runnerTemp, home, commentsDir, join(work, 'src')]) {
     mkdirSync(d, { recursive: true });
   }
 
-  // The PR head as the fixer finds it: the bump plus the pipeline's own files,
-  // committed (uncommitted, `git add -A` would stage them as additions).
+  // The PR head as the fixer finds it: the bump. dep-steward's scripts are
+  // never in the repo; the tools action brings them from the release.
   writeFileSync(join(work, 'src/client.ts'), 'export const timeout = 1000;\n');
   writeFileSync(join(work, 'package.json'), '{"name":"app","dependencies":{"ioredis":"^6.0.0"}}\n');
-  for (const f of ['.github/dependabot-automerge/autofix-bounds.cjs', '.github/dependabot-automerge/review-lint.cjs', '.github/dependabot-autofix-prompt.md']) {
-    writeFileSync(join(work, f), readFileSync(join(RENDERED, f), 'utf8'));
-  }
   git(['init', '-q', '-b', 'main', work]);
   git(['config', 'user.email', 'test@example.invalid'], work);
   git(['config', 'user.name', 'test'], work);
   git(['add', '-A'], work);
   git(['commit', '-q', '-m', 'bump ioredis 5 -> 6'], work);
   const baseSha = git(['rev-parse', 'HEAD'], work).trim();
-  if (!pipelineOnBranch) {
-    git(['rm', '-q', '.github/dependabot-autofix-prompt.md', '.github/dependabot-automerge/autofix-bounds.cjs', '.github/dependabot-automerge/review-lint.cjs'], work);
-    git(['commit', '-q', '-m', 'a branch cut before dep-steward was installed'], work);
-  }
   const headSha = git(['rev-parse', 'HEAD'], work).trim();
   git(['init', '-q', '--bare', bare]);
   git(['push', '-q', bare, `HEAD:refs/heads/${HEAD_BRANCH}`], work);
@@ -182,7 +164,11 @@ async function runAutofix({ edits = IN_BOUNDS_FIX, commits = [DEPENDABOT_COMMIT]
     const creds = join(runnerTemp, 'git-credentials-0b1f.config');
 
     const calls = { fixer: [] };
+    const tools = toolsHandler();
     const uses = {
+      [TOOLS_ACTION]: toolsFail
+        ? async () => ({ exitCode: 1, output: 'gh: HTTP 404: Not Found (repos/octocat/repo/git/trees/main)' })
+        : tools,
       // The tree above already is the checkout. What actions/checkout v7 adds
       // unless told not to persist credentials: GITHUB_TOKEN as an
       // extraheader in a RUNNER_TEMP file the repo's config includes.
@@ -220,8 +206,15 @@ async function runAutofix({ edits = IN_BOUNDS_FIX, commits = [DEPENDABOT_COMMIT]
         }
         for (const [path, content] of Object.entries(outsideWrites)) {
           const abs = path.replace(/^~\//, `${home}/`).replace(/^\$RUNNER_TEMP\//, `${runnerTemp}/`);
-          mkdirSync(dirname(abs), { recursive: true });
-          writeFileSync(abs, content, { mode: 0o755 });
+          // A read-only file or directory refuses the write, as it would the
+          // agent's; the attempt is recorded rather than thrown.
+          try {
+            mkdirSync(dirname(abs), { recursive: true });
+            writeFileSync(abs, content, { mode: 0o755 });
+          } catch (e) {
+            if (e.code !== 'EACCES') throw e;
+            calls.refusedWrites = [...(calls.refusedWrites ?? []), path];
+          }
         }
         return { exitCode: 0, outputs: { execution_file: '' } };
       },
@@ -267,18 +260,16 @@ async function runAutofix({ edits = IN_BOUNDS_FIX, commits = [DEPENDABOT_COMMIT]
       BUMP_PATHS: 'package.json',
       RUNNER_TEMP: runnerTemp,
       HOME: home,
-      // A workflow_run job runs the default branch's workflow at its latest
-      // commit. Here that is the seeded commit, which holds the pipeline.
-      GITHUB_SHA: workflowSha ?? baseSha,
+      GITHUB_SHA: baseSha,
       GITHUB_SERVER_URL: server.url,
       GITHUB_API_URL,
       CURL_LOG: curlLog,
     };
-    const agent = await runJob(jobs, 'autofix', { github, secrets, uses, cwd: work, env });
+    const agent = await runJob(jobs, 'autofix', { github, secrets, uses, cwd: work, env, inputs: INPUTS, workflowEnv: WORKFLOW_ENV });
     // What the fixer faced, before the push job (which shares this temp
     // directory here, as a self-hosted runner can) touches it.
     const copies = join(runnerTemp, 'dep-steward');
-    const copiesAfterAgent = ['', 'autofix-bounds.cjs', 'bump-paths.txt', 'review-lint.cjs', 'dependabot-autofix-prompt.md'].map((f) => {
+    const copiesAfterAgent = ['', 'autofix-bounds.cjs', 'bump-paths.txt', 'review-lint.cjs', 'autofix-prompt.md'].map((f) => {
       const path = join(copies, f);
       let writable = false;
       try { accessSync(path, constants.W_OK); writable = true; } catch { /* read-only, or absent */ }
@@ -322,7 +313,7 @@ async function runAutofix({ edits = IN_BOUNDS_FIX, commits = [DEPENDABOT_COMMIT]
       ...(commitsSeenByPush ? { PR_COMMITS_JSON: JSON.stringify({ commits: commitsSeenByPush }) } : {}),
     };
     const push = await runJob(jobs, 'autofix-push', {
-      github, secrets, uses, cwd: pushTree, env: pushEnv,
+      github, secrets, uses, cwd: pushTree, env: pushEnv, inputs: INPUTS, workflowEnv: WORKFLOW_ENV,
       needs: { autofix: { outputs: handedOver, result: agent.failed ? 'failure' : 'success' } },
     });
     const result = {
@@ -599,13 +590,17 @@ test('bounds: a draft with no fix beside it is "no edits", not a push', async ()
 });
 
 test('bounds: a fixer that rewrites the bounds check can neither run code with it nor talk its way past it', async () => {
-  // The bounds step runs after the fixer, and the fixer can write any file in
-  // the checkout, this script included. Whatever the script runs with, the
-  // fixer's code would run with: GITHUB_TOKEN. And its verdict decides what
-  // is pushed.
+  // The bounds step runs after the fixer, and the fixer can write any file it
+  // can reach: the checkout, and RUNNER_TEMP, where the copy that runs lives.
+  // Whatever the script runs with, the fixer's code would run with:
+  // GITHUB_TOKEN. And its verdict decides what is pushed.
   const ran = join(mkdtempSync(join(tmpdir(), 'ds-ran-')), 'ran');
   const rewrite = `require('fs').writeFileSync(${JSON.stringify(ran)}, 'ran');\nconsole.log('decision=push');\nconsole.log('reason=looks fine');\n`;
-  const r = await runAutofix({ edits: { ...IN_BOUNDS_FIX, '.github/dependabot-automerge/autofix-bounds.cjs': rewrite } });
+  const r = await runAutofix({
+    edits: { ...IN_BOUNDS_FIX, '.github/dependabot-automerge/autofix-bounds.cjs': rewrite },
+    outsideWrites: { '$RUNNER_TEMP/dep-steward/autofix-bounds.cjs': rewrite },
+  });
+  assert.deepEqual(r.calls.refusedWrites, ['$RUNNER_TEMP/dep-steward/autofix-bounds.cjs'], 'the copy that runs is read-only');
   assert.ok(!existsSync(ran), `the fixer's rewrite of the bounds script ran:\n${r.log}`);
   assert.equal(r.pushed, false, 'a fix that touches .github/ is out of bounds, whatever the rewrite says');
   assert.match(r.comments.join('\n'), /exceeded the safe bounds/);
@@ -631,11 +626,12 @@ test('a runner that kept the last autofix job\'s read-only copies still takes fr
   assert.deepEqual(r.pushedAs, [WORKFLOW_TOKEN]);
 });
 
-test('a Dependabot branch cut before the install still gets its attempt: the job takes its own files from the commit its workflow runs from', async () => {
-  // On a fresh install every open Dependabot PR predates it, so its head has
-  // no autofix prompt and no bounds script. The workflow itself runs from the
-  // default branch, and so do the files it needs.
-  const r = await runAutofix({ pipelineOnBranch: false });
+test('the job takes its own files from the dep-steward release, not from the PR head', async () => {
+  // The PR head holds no dep-steward file at all (an open Dependabot PR on a
+  // fresh install predates it anyway). The prompt, the bounds script and the
+  // lint come from the tools action at the release the caller pins.
+  const r = await plainRun();
+  assert.ok(r.copiesAfterAgent.every((c) => c.exists), JSON.stringify(r.copiesAfterAgent));
   assert.equal(r.calls.fixer.length, 1, r.log);
   assert.equal(r.failed, false, r.log);
   assert.deepEqual(r.pushedAs, [WORKFLOW_TOKEN]);
@@ -643,10 +639,10 @@ test('a Dependabot branch cut before the install still gets its attempt: the job
 });
 
 test('a step that fails before the fixer runs is reported as that, not as a fix the fixer declined', async () => {
-  // The files come from the workflow's commit; if that commit cannot be read,
-  // the fixer never starts. "It found nothing it could safely fix" would send
-  // the person looking for a diagnosis that never happened.
-  const r = await runAutofix({ workflowSha: '0000000000000000000000000000000000000001' });
+  // The files come from the tools action; if it fails, the fixer never
+  // starts. "It found nothing it could safely fix" would send the person
+  // looking for a diagnosis that never happened.
+  const r = await runAutofix({ toolsFail: true });
   assert.equal(r.calls.fixer.length, 0, r.log);
   assert.equal(r.pushed, false);
   assert.equal(r.failed, true, 'a step failed, and the job says so');
@@ -663,10 +659,7 @@ test('a step that fails before the fixer runs is reported as that, not as a fix 
 // push job, which can push and runs no agent, re-derives everything it pushes
 // on. These hand it what a turned agent job could.
 
-const PUSH_JOB_TEXT = (() => {
-  const wf = readFileSync(join(RENDERED, '.github/workflows/dependabot-review.yml'), 'utf8');
-  return wf.slice(wf.indexOf('\n  autofix-push:'));
-})();
+const PUSH_JOB_TEXT = REVIEW_TEXT.slice(REVIEW_TEXT.indexOf('\n  autofix-push:'));
 
 test('push job: it takes only a patch and the commit it was drafted for from the agent job', () => {
   // Not the PR, not the branch, not the words of its comment: those it reads
@@ -674,7 +667,9 @@ test('push job: it takes only a patch and the commit it was drafted for from the
   // the push or speak through the github-actions identity the gate trusts.
   const used = new Set([...PUSH_JOB_TEXT.matchAll(/needs\.autofix\.outputs\.([a-z_]+)/g)].map((m) => m[1]));
   assert.deepEqual([...used].sort(), ['base_sha', 'decision', 'patch']);
-  assert.match(PUSH_JOB_TEXT, /^    if: needs\.autofix\.outputs\.decision == 'push'$/m, 'the decision only decides whether to look');
+  // The regeneration's hand-off is the one other decision, and it makes the
+  // push job read the regeneration itself (regenerate.test.mjs).
+  assert.match(PUSH_JOB_TEXT, /^    if: needs\.autofix\.outputs\.decision == 'push' \|\| needs\.autofix\.outputs\.decision == 'regenerate'$/m, 'the decision only decides whether to look');
 });
 
 test('push job: a patch outside the bounds is not pushed, whatever the agent job said', async () => {
