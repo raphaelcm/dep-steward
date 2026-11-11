@@ -16,7 +16,7 @@ jobs:
         with:
           # test/release-pin.test.mjs compares the pinned commits with this tree.
           fetch-depth: 0
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: '24'
       # Adopters run the reusable workflows this repo ships, so the tests lint
