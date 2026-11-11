@@ -107,7 +107,7 @@ test('the secrets CI reads: its own, its local reusable workflows\', never GITHU
   assert.deepEqual(out.trim().split('\n'), ['ALREADY_THERE', 'FROM_REUSABLE', 'NEVER_SET', 'OPENAI_API_KEY']);
 });
 
-async function runSeal() {
+async function runSeal({ passed } = {}) {
   const root = mkdtempSync(join(tmpdir(), 'ds-seal-'));
   const runnerBin = join(root, 'runner-bin');
   const stub = join(root, 'stub-python');
@@ -119,7 +119,11 @@ async function runSeal() {
   writeFileSync(join(runnerBin, 'apt-get'), '#!/bin/sh\necho "apt-get $*" >> "$APT_LOG"\nexit 0\n', { mode: 0o755 });
   writeFileSync(join(stub, 'nacl', '__init__.py'), '');
   writeFileSync(join(stub, 'nacl', 'public.py'), STUB_NACL_PUBLIC);
-  const caller = callerText('seal').replaceAll('__CI_NAME__', 'CI');
+  // As the install skill writes it: one SEAL_<NAME> line per secret CI reads.
+  const names = passed ?? ['ALREADY_THERE', 'FROM_REUSABLE', 'NEVER_SET', 'OPENAI_API_KEY'];
+  const lines = names.map((n) => `          SEAL_${n}: \${{ secrets.${n} }}`).join('\n');
+  const caller = callerText('seal').replaceAll('__CI_NAME__', 'CI')
+    .replace(/^ {10}SEAL___SECRET_NAME__: .*$/m, lines);
   const r = await runJob(parseJobs(caller), 'seal', {
     // The job's secrets, as GitHub hands them to a workflow_dispatch run in
     // the adopter's repo: every Actions secret, whoever owns the repo.
@@ -157,13 +161,25 @@ test('the seal job reads contents only, keeps no credential, and installs only U
   assert.match(aptLog, /install .*python3-nacl/);
 });
 
-test('the seal caller only dispatches by hand, and hands its own job\'s secrets to the seal step (no reusable workflow, no inherit)', () => {
+test('the seal caller only dispatches by hand, and passes secrets by name, never all of them', () => {
+  // GitHub holds a workflow that hands over every secret (toJSON(secrets)) as
+  // possibly malicious, and `inherit` reaches only the caller's own
+  // organization: so each secret CI reads is passed by name.
   const caller = callerText('seal');
   assert.match(caller, /^on:\n {2}workflow_dispatch:/m);
   assert.doesNotMatch(caller, /^ {2}(push|pull_request|workflow_run|schedule):/m);
-  assert.doesNotMatch(caller, /secrets: inherit/, 'inherit reaches only the caller\'s own organization');
+  assert.doesNotMatch(caller, /secrets: inherit|toJSON\(secrets\)/);
   assert.doesNotMatch(caller, /\.github\/workflows\/[a-z-]+\.yml@/, 'the seal is a step of this job, not a reusable workflow');
-  assert.match(caller, /^ {10}secrets: \$\{\{ toJSON\(secrets\) \}\}$/m);
+  assert.match(caller, /^ {10}SEAL___SECRET_NAME__: \$\{\{ secrets\.__SECRET_NAME__ \}\}$/m);
+});
+
+test('a secret CI reads that the seal file does not pass fails the run, naming the line to add, and nothing is sealed for it', async () => {
+  const { r, log } = await runSeal({ passed: ['ALREADY_THERE', 'FROM_REUSABLE', 'NEVER_SET'] });
+  assert.equal(r.failed, true);
+  assert.match(log, /^DEP-STEWARD-NOT-PASSED OPENAI_API_KEY$/m);
+  assert.match(log, /::error::CI reads secret\(s\) this job does not pass: OPENAI_API_KEY\. Add to the seal step's env in \.github\/workflows\/dependabot-seal\.yml: SEAL_OPENAI_API_KEY: \$\{\{ secrets\.OPENAI_API_KEY \}\}/);
+  assert.doesNotMatch(log, /SEALED OPENAI_API_KEY/);
+  assert.ok(!log.includes(ACTIONS_SECRETS.OPENAI_API_KEY));
 });
 
 test('the install skill uploads only what Dependabot\'s store lacks, and deletes the run', () => {

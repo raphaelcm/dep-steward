@@ -1,8 +1,8 @@
 # dep-steward: copies the secrets CI reads into Dependabot's own secret store,
 # sealed so no person or log sees a value. /dep-steward:install runs it; it
 # does nothing on its own. The sealing step is dep-steward's, at the commit
-# pinned below; it is handed this job's secrets and seals only the ones CI
-# reads.
+# pinned below. It is handed, by name, each secret the CI workflow reads, and
+# fails naming any it reads that this file does not pass.
 name: Dependabot seal CI secrets
 
 on:
@@ -30,4 +30,5 @@ jobs:
         with:
           ci-name: "__CI_NAME__"
           public-key: ${{ inputs.public-key }}
-          secrets: ${{ toJSON(secrets) }}
+        env:
+          SEAL___SECRET_NAME__: ${{ secrets.__SECRET_NAME__ }}

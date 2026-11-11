@@ -96,7 +96,7 @@ GitHub settings it configures (via `gh`):
 
 - Creates the `needs-human-review` label.
 - Checks that `CLAUDE_CODE_OAUTH_TOKEN` is in **both** the Actions secret store **and** the Dependabot secret store, and gives you the commands when it isn't (see FAQ: this is the #1 thing people get wrong).
-- Once the files are merged, offers to copy the secrets your CI reads into the Dependabot secret store, so CI can pass on Dependabot's PRs at all (see FAQ). Nobody handles a value: the seal step seals each one for that store and the install uploads only the sealed copy.
+- Once the files are merged, offers to copy the secrets your CI reads into the Dependabot secret store, so CI can pass on Dependabot's PRs at all (see FAQ). Nobody handles a value: the seal step, handed each of those secrets by name, seals each one for that store and the install uploads only the sealed copy.
 - Enables "Allow auto-merge" on the repo.
 - Checks branch protection and **advises** if CI isn't a required check (it never changes your protection rules).
 

@@ -53,6 +53,8 @@ Those files are replaced in step 4, and these are removed:
 
 The three workflow files are `${CLAUDE_PLUGIN_ROOT}/templates/dependabot-review.yml`, `dependabot-automerge.yml` and `dependabot-seal.yml`. Copy each to `.github/workflows/` under the same name, changing only the values in the settings table. The pinned commit after `@` is the release this plugin installs; keep it as it is.
 
+In `dependabot-seal.yml`, the seal step's `env:` passes each secret the CI workflow reads, by name. Find them: every `secrets.<NAME>` in the CI workflow files, and in the local reusable workflows they call (`uses: ./.github/workflows/...`), leaving out `GITHUB_TOKEN` and commented lines. Replace the `SEAL___SECRET_NAME__` line with one line per name, in the form `SEAL_OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}`. When CI reads no secret, delete the step's `env:` block. A seal run checks this list against CI and names any secret that is missing.
+
 Write `.github/dependabot.yml` from `${CLAUDE_PLUGIN_ROOT}/templates/dependabot.yml`: one `updates:` entry per row below whose files exist at the repo root, plus `github-actions`, which is always included. Each entry has the form:
 
 ```yaml
@@ -110,7 +112,7 @@ Tell the user:
 - **CI secrets for Dependabot.** Dependabot's PRs see only the Dependabot secret store. If the CI workflow reads secrets (look for `secrets.` in it), CI will fail on every Dependabot PR until they are copied there. Once the files are on the default branch, copy them without anyone handling a value:
   1. `gh api repos/<NWO>/dependabot/secrets/public-key` gives `key_id` and `key`.
   2. `gh workflow run dependabot-seal.yml --repo <NWO> -f public-key=<key>`. Wait for the run to finish (`gh run list --workflow dependabot-seal.yml`).
-  3. Its log (`gh run view <id> --log`) has `DEP-STEWARD-SEALED <NAME> <value>` lines. For each NAME that `gh secret list --app dependabot` does not list, run `gh api -X PUT repos/<NWO>/dependabot/secrets/<NAME> -f encrypted_value=<value> -f key_id=<key_id>`. `DEP-STEWARD-UNSET <NAME>` means no Actions secret by that name exists.
+  3. Its log (`gh run view <id> --log`) has `DEP-STEWARD-SEALED <NAME> <value>` lines. For each NAME that `gh secret list --app dependabot` does not list, run `gh api -X PUT repos/<NWO>/dependabot/secrets/<NAME> -f encrypted_value=<value> -f key_id=<key_id>`. `DEP-STEWARD-UNSET <NAME>` means no Actions secret by that name exists. A failed run with `DEP-STEWARD-NOT-PASSED <NAME>` means CI reads a secret the seal file does not pass: add its line as its error says, commit, and run it again.
   4. Delete the run: `gh api -X DELETE repos/<NWO>/actions/runs/<id>`.
 
   Offer to do this for them once the files are merged. Tell them the trade-off: a new dependency version's code can read these secrets while CI runs.
