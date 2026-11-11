@@ -17,10 +17,10 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-export const REUSABLE = ['.github/workflows/review.yml', '.github/workflows/automerge.yml', '.github/workflows/seal-ci-secrets.yml'];
+export const REUSABLE = ['.github/workflows/review.yml', '.github/workflows/automerge.yml'];
 export const CALLERS = ['plugin/templates/dependabot-review.yml', 'plugin/templates/dependabot-automerge.yml', 'plugin/templates/dependabot-seal.yml'];
 export const TOOLS_REF = /(uses: raphaelcm\/dep-steward\/actions\/tools@)(\S+)/g;
-export const CALLER_REF = /(uses: raphaelcm\/dep-steward\/\.github\/workflows\/[a-z-]+\.yml@)(\S+)( # v\S+)?/g;
+export const CALLER_REF = /(uses: raphaelcm\/dep-steward\/(?:\.github\/workflows\/[a-z-]+\.yml|actions\/seal)@)(\S+)( # v\S+)?/g;
 
 const git = (...args) => execFileSync('git', args, { cwd: ROOT, encoding: 'utf8' }).trim();
 

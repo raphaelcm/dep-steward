@@ -89,14 +89,14 @@ Files written into your repo (review and commit them like any change):
 |---|---|
 | `.github/workflows/dependabot-review.yml` | calls dep-steward's review workflow: the review, and autofix's fixer and its push |
 | `.github/workflows/dependabot-automerge.yml` | calls dep-steward's auto-merge workflow: the gate, the only thing that merges, and it runs no agent |
-| `.github/workflows/dependabot-seal.yml` | calls dep-steward's seal workflow, which copies CI's secrets for Dependabot; it runs only when started by hand |
+| `.github/workflows/dependabot-seal.yml` | runs dep-steward's seal step, which copies CI's secrets for Dependabot; it runs only when started by hand |
 | `.github/dependabot.yml` | groups minor/patch bumps; majors stay individual |
 
 GitHub settings it configures (via `gh`):
 
 - Creates the `needs-human-review` label.
 - Checks that `CLAUDE_CODE_OAUTH_TOKEN` is in **both** the Actions secret store **and** the Dependabot secret store, and gives you the commands when it isn't (see FAQ: this is the #1 thing people get wrong).
-- Once the files are merged, offers to copy the secrets your CI reads into the Dependabot secret store, so CI can pass on Dependabot's PRs at all (see FAQ). Nobody handles a value: the seal workflow seals each one for that store and the install uploads only the sealed copy.
+- Once the files are merged, offers to copy the secrets your CI reads into the Dependabot secret store, so CI can pass on Dependabot's PRs at all (see FAQ). Nobody handles a value: the seal step, handed each of those secrets by name, seals each one for that store and the install uploads only the sealed copy.
 - Enables "Allow auto-merge" on the repo.
 - Checks branch protection and **advises** if CI isn't a required check (it never changes your protection rules).
 
@@ -170,7 +170,7 @@ curl -fsSL https://raw.githubusercontent.com/raphaelcm/dep-steward/main/plugin/s
 A Dependabot-triggered workflow run reads secrets from the *Dependabot* secret store, not the Actions store — the Actions store is invisible to it. If the token is only in Actions, the review job silently gets an empty token on real Dependabot PRs. `/dep-steward:install` checks both so you never hit this. (It cost us weeks before we understood it.)
 
 **My CI needs a secret (an API key, say). Will it pass on Dependabot's PRs?**
-Yes, once it's in the Dependabot secret store, and `/dep-steward:install` offers to put it there once its files are merged. GitHub runs a Dependabot PR's workflows with that store only, so a CI that reads an Actions secret fails on every Dependabot PR, and the gate, which merges only on green CI, never merges one. The seal workflow finds the secrets your CI workflow reads (and the local reusable workflows it calls), and the install copies any the Dependabot store lacks. It asks first, because a new dependency version's code can then read them while CI runs. It never overwrites a secret already in the Dependabot store.
+Yes, once it's in the Dependabot secret store, and `/dep-steward:install` offers to put it there once its files are merged. GitHub runs a Dependabot PR's workflows with that store only, so a CI that reads an Actions secret fails on every Dependabot PR, and the gate, which merges only on green CI, never merges one. The seal step finds the secrets your CI workflow reads (and the local reusable workflows it calls), and the install copies any the Dependabot store lacks. It asks first, because a new dependency version's code can then read them while CI runs. It never overwrites a secret already in the Dependabot store.
 
 **Must my CI workflow be named `CI`?**
 No. The install reads your CI workflow's name and writes it into the workflow files (`ci-name` and the `workflows:` triggers). The gate keys off this exact name, so it does need *a* CI workflow to exist.
@@ -234,7 +234,7 @@ The tests run the shipped files themselves, through a step simulator (`test/lib/
 - `test/autofix-bounds.test.mjs`, `test/review-lint.test.mjs`: the bounds check and the reviewer's prose guard, in each of their modes.
 - `test/agent-writes.test.mjs`, `test/review-diagnose.test.mjs`, `test/prompt-hygiene.test.mjs`, `test/gate-wake.test.mjs`: the review job against a reviewer that rewrites what it can reach, a denied diff, prompt leaks, and which runs wake the gate.
 - `test/permissions.test.mjs`: no job that runs an agent can push, merge, or mint a token that could; each caller grants at least what its workflow's jobs need.
-- `test/ci-secrets.test.mjs`: the seal workflow seals exactly the secrets CI reads, with the Dependabot store's key.
+- `test/ci-secrets.test.mjs`: the installed seal job, with the real seal step, seals exactly the secrets CI reads, with the Dependabot store's key.
 - `test/actionlint.test.mjs`: the reusable workflows and the installed caller files pass actionlint (required in this repo's CI).
 - `test/plugin.test.mjs`, `test/plugin-policy.test.mjs`: the manifests agree, and every file in `plugin/` is a type Anthropic's plugin directory accepts (Markdown, text, JSON, YAML, images; nothing that starts with `#!`).
 - `test/release-pin.test.mjs`: the pinned commits run the code in this tree.

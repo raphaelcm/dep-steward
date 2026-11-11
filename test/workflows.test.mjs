@@ -4,13 +4,13 @@ import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { interpolate } from './lib/actions-sim.mjs';
-import { workflowText, callerText, toolText, jobsOf, runShippedJob, inputDefaults } from './lib/dep-steward.mjs';
+import { workflowText, callerText, toolText, jobsOf, runShippedJob, inputDefaults, sealActionText } from './lib/dep-steward.mjs';
 
 /**
  * The shipped workflows' structure.
  *
  * What an adopter runs is dep-steward's reusable workflows
- * (.github/workflows/{review,automerge,seal-ci-secrets}.yml) at a pinned
+ * (.github/workflows/{review,automerge}.yml, actions/seal) at a pinned
  * commit, called by the three short files the plugin installs
  * (plugin/templates/dependabot-{review,automerge,seal}.yml), with the scripts
  * and prompts of actions/tools. Nothing is rendered: these tests read those
@@ -534,10 +534,26 @@ function declaredInputs(text) {
   return out;
 }
 
-const WORKFLOW_FILE = { review: 'review', automerge: 'automerge', 'seal-ci-secrets': 'seal' };
+const WORKFLOW_FILE = { review: 'review', automerge: 'automerge' };
+
+test('the seal caller passes only inputs the seal action declares, and every one it requires', () => {
+  const step = /^ {6}- uses: raphaelcm\/dep-steward\/actions\/seal@\S+.*\n {8}with:\n((?: {10}.*\n)+)/m.exec(CALLER_SEAL);
+  assert.ok(step, 'the seal caller runs the seal action as a step');
+  const keys = [...step[1].matchAll(/^ {10}([a-z_-]+):/gm)].map((m) => m[1]);
+  const action = sealActionText();
+  const declared = {};
+  let name = null;
+  for (const l of action.slice(action.indexOf('\ninputs:\n') + 9, action.indexOf('\nruns:')).split('\n')) {
+    const n = /^ {2}([a-z_-]+):\s*$/.exec(l);
+    if (n) { name = n[1]; declared[name] = false; continue; }
+    if (name && /^ {4}required: true/.test(l)) declared[name] = true;
+  }
+  for (const k of keys) assert.ok(k in declared, `seal caller passes ${k}, which actions/seal does not declare`);
+  for (const [k, required] of Object.entries(declared)) if (required) assert.ok(keys.includes(k), `seal caller omits ${k}`);
+});
 
 test('each caller passes only inputs its reusable workflow declares, and every required one', () => {
-  for (const [name, text] of [['review', CALLER_REVIEW], ['automerge', CALLER_AUTOMERGE], ['seal', CALLER_SEAL]]) {
+  for (const [name, text] of [['review', CALLER_REVIEW], ['automerge', CALLER_AUTOMERGE]]) {
     const { workflow, keys } = callerCall(text);
     const declared = declaredInputs(workflowText(WORKFLOW_FILE[workflow]));
     for (const k of keys) assert.ok(k in declared, `${name} caller passes ${k}, which ${workflow}.yml does not declare`);
@@ -561,7 +577,7 @@ test('every caller names CI through the one placeholder the install skill fills'
   assert.match(CALLER_REVIEW, /^ {4}workflows: \["__CI_NAME__"\]$/m);
   assert.match(CALLER_AUTOMERGE, /^ {4}workflows: \["__CI_NAME__", "Dependabot PR review"\]$/m);
   assert.match(CALLER_AUTOMERGE, /^ {6}ci-name: "__CI_NAME__"$/m);
-  assert.match(CALLER_SEAL, /^ {6}ci-name: "__CI_NAME__"$/m);
+  assert.match(CALLER_SEAL, /^ {10}ci-name: "__CI_NAME__"$/m);
 });
 
 test('the auto-merge caller listens to the review caller by its name', () => {

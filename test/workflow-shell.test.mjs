@@ -5,7 +5,7 @@ import { mkdtempSync, writeFileSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { parseJobs, interpolate } from './lib/actions-sim.mjs';
-import { TOOLS_DIR, workflowText, callerText, toolText, toolsHandler, inputDefaults, topLevelEnv } from './lib/dep-steward.mjs';
+import { TOOLS_DIR, workflowText, callerText, toolText, toolsHandler, inputDefaults, topLevelEnv, sealActionText } from './lib/dep-steward.mjs';
 
 /**
  * The shell dep-steward SHIPS must parse.
@@ -43,7 +43,7 @@ import { TOOLS_DIR, workflowText, callerText, toolText, toolsHandler, inputDefau
 const SHIPPED = {
   'review.yml': workflowText('review'),
   'automerge.yml': workflowText('automerge'),
-  'seal-ci-secrets.yml': workflowText('seal'),
+  'actions/seal/action.yml': sealActionText(),
   'actions/tools/action.yml': toolText('action.yml'),
   'templates/dependabot-review.yml': callerText('review'),
   'templates/dependabot-automerge.yml': callerText('automerge'),
@@ -132,7 +132,7 @@ const blocks = Object.entries(SHIPPED).flatMap(([file, text]) => runBlocks(text)
 test('the extractor finds every run block (a silent zero makes the rest vacuous)', () => {
   // If this ever finds nothing, every assertion below passes for free — which
   // is precisely the shape of test that lets a real defect through.
-  for (const f of ['review.yml', 'automerge.yml', 'seal-ci-secrets.yml', 'actions/tools/action.yml']) {
+  for (const f of ['review.yml', 'automerge.yml', 'actions/seal/action.yml', 'actions/tools/action.yml']) {
     assert.ok(blocks.some((b) => b.file === f), `no run block found in ${f}`);
   }
   assert.ok(blocks.length >= 5, `expected several run blocks, found ${blocks.length}`);

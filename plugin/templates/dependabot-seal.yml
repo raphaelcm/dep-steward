@@ -1,7 +1,8 @@
 # dep-steward: copies the secrets CI reads into Dependabot's own secret store,
 # sealed so no person or log sees a value. /dep-steward:install runs it; it
-# does nothing on its own. The pipeline itself lives in raphaelcm/dep-steward
-# at the commit pinned below.
+# does nothing on its own. The sealing step is dep-steward's, at the commit
+# pinned below. It is handed, by name, each secret the CI workflow reads, and
+# fails naming any it reads that this file does not pass.
 name: Dependabot seal CI secrets
 
 on:
@@ -17,8 +18,17 @@ permissions:
 
 jobs:
   seal:
-    uses: raphaelcm/dep-steward/.github/workflows/seal-ci-secrets.yml@e44b43c4b102a91d929892eb14c0e4787f52f420 # v0.18.0
-    with:
-      ci-name: "__CI_NAME__"
-      public-key: ${{ inputs.public-key }}
-    secrets: inherit
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: raphaelcm/dep-steward/actions/seal@3caa96d8a3d6b2d7cbe1954930b46e37306b0fc7 # v0.18.1
+        with:
+          ci-name: "__CI_NAME__"
+          public-key: ${{ inputs.public-key }}
+        env:
+          SEAL___SECRET_NAME__: ${{ secrets.__SECRET_NAME__ }}
