@@ -52,14 +52,16 @@ import { TOOLS_DIR, REFERENCE_ROOT_FILES, workflowText, callerText } from './lib
  *
  * A snapshot test cannot catch any of this: it would have locked the
  * original bug in. Everything below runs over the SHIPPED reusable workflows
- * (.github/workflows/{review,automerge,seal-ci-secrets}.yml), the prompts as
+ * (.github/workflows/{review,automerge}.yml, and the seal caller's own job), the prompts as
  * the tools action fills them, and the caller templates the plugin installs,
  * which is what an adopter runs.
  */
 
 const WORKFLOW = workflowText('review');
 const AUTOMERGE = workflowText('automerge');
-const SEAL = workflowText('seal');
+// The seal runs in the adopter's own job (a reusable workflow in another
+// owner's repo is handed no secrets by `inherit`), so its job is the caller's.
+const SEAL = callerText('seal');
 
 // A prompt as the tools action fills it for the reference repo (assignee
 // octocat), from actions/tools/<name>.

@@ -429,6 +429,9 @@ export async function runJob(jobs, jobName, { github, secrets = {}, uses = {}, c
   for (const step of job.steps) {
     n++;
     for (const k of Object.keys(step)) {
+      // `shell: bash` is what every run step here already runs with (a
+      // composite action must say so); any other shell is not simulated.
+      if (k === 'shell' && step.shell === 'bash') continue;
       if (!STEP_KEYS.has(k)) throw new Error(`step "${step.name}": key "${k}" is not simulated`);
     }
     if (Boolean(step.run) === Boolean(step.uses)) throw new Error(`step "${step.name}": needs exactly one of run/uses`);

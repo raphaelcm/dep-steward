@@ -2,7 +2,7 @@
 // templates the plugin installs, and the tools action they share, exactly as
 // they are in this tree. Nothing here renders or rewrites them.
 //
-// Reads: .github/workflows/{review,automerge,seal-ci-secrets}.yml,
+// Reads: .github/workflows/{review,automerge}.yml, actions/seal/action.yml,
 // plugin/templates/*.yml, actions/tools/*. Writes: only temp directories a
 // test asks for. Touches nothing in the tree.
 
@@ -19,7 +19,6 @@ export const TOOLS_ACTION = 'raphaelcm/dep-steward/actions/tools';
 export const WORKFLOW_PATHS = {
   review: join(REPO, '.github/workflows/review.yml'),
   automerge: join(REPO, '.github/workflows/automerge.yml'),
-  seal: join(REPO, '.github/workflows/seal-ci-secrets.yml'),
 };
 export const CALLER_PATHS = {
   review: join(REPO, 'plugin/templates/dependabot-review.yml'),
@@ -27,6 +26,9 @@ export const CALLER_PATHS = {
   seal: join(REPO, 'plugin/templates/dependabot-seal.yml'),
 };
 export const workflowText = (name) => readFileSync(WORKFLOW_PATHS[name], 'utf8');
+export const SEAL_ACTION = 'raphaelcm/dep-steward/actions/seal';
+export const SEAL_ACTION_DIR = join(REPO, 'actions', 'seal');
+export const sealActionText = () => readFileSync(join(SEAL_ACTION_DIR, 'action.yml'), 'utf8');
 export const callerText = (name) => readFileSync(CALLER_PATHS[name], 'utf8');
 export const toolText = (file) => readFileSync(join(TOOLS_DIR, file), 'utf8');
 
@@ -112,3 +114,24 @@ export function runShippedJob(workflow, jobName, { inputs = {}, uses = {}, rootF
 }
 
 export const jobsOf = (workflow) => parseJobs(workflowText(workflow));
+
+// A composite action's `runs.steps`, as one job the step simulator can run.
+export function compositeJobs(actionText, jobName = 'action') {
+  const lines = actionText.split('\n');
+  const at = lines.findIndex((l) => /^ {2}steps:\s*$/.test(l));
+  if (at < 0) throw new Error('composite action: no runs.steps');
+  const steps = lines.slice(at + 1).map((l) => (l.trim() === '' ? '' : `  ${l}`));
+  return parseJobs(['jobs:', `  ${jobName}:`, '    steps:', ...steps].join('\n'));
+}
+
+// The handler a workflow step `uses:` for a composite action in this tree:
+// its steps run through the simulator with the step's `with:` as `inputs`
+// and GITHUB_ACTION_PATH at the action's directory.
+export function compositeHandler(actionDir, { github = {} } = {}) {
+  return async ({ with: w, env, cwd }) => {
+    const r = await runJob(compositeJobs(readFileSync(join(actionDir, 'action.yml'), 'utf8')), 'action', {
+      github, inputs: w, cwd, env: { ...env, GITHUB_ACTION_PATH: actionDir },
+    });
+    return { exitCode: r.failed ? 1 : 0, output: r.steps.map((s) => s.output).join('\n'), steps: r.steps };
+  };
+}

@@ -1,0 +1,63 @@
+name: dep-steward seal CI secrets
+description: >-
+  Seals each secret the repo's CI workflow reads with the Dependabot secret
+  store's public key, and prints only the sealed copies, for
+  /dep-steward:install to upload. Runs as a step of the adopting repo's own
+  job, so it sees that job's secrets whoever owns the repo.
+inputs:
+  ci-name:
+    description: The exact `name:` of the CI workflow whose secrets Dependabot PRs need.
+    required: true
+  public-key:
+    description: The Dependabot secret store's public key (base64), from GET /repos/{repo}/dependabot/secrets/public-key.
+    required: true
+  secrets:
+    description: The calling job's secrets, as `toJSON(secrets)`. Only the ones CI reads are sealed; no value is printed.
+    required: true
+runs:
+  using: composite
+  steps:
+    # Reads: the checkout's .github/workflows (the caller checks out first),
+    # the secrets the caller hands over. Writes: sealed copies and names to the
+    # log. Does NOT touch any secret store.
+    #
+    # Why a step and not a reusable workflow: `secrets: inherit` passes secrets
+    # only to a workflow in the caller's own organization or enterprise, so a
+    # reusable workflow in raphaelcm/dep-steward saw none of another owner's
+    # secrets (v0.18.0, found installing it in Runsense-ai/runsense).
+    - name: Install libsodium's Python binding from Ubuntu's signed archive
+      shell: bash
+      run: sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends python3-nacl
+
+    - name: Seal each secret CI reads for the Dependabot store
+      shell: bash
+      env:
+        CI_NAME: ${{ inputs.ci-name }}
+        DEPENDABOT_PUBLIC_KEY: ${{ inputs.public-key }}
+        ALL_SECRETS: ${{ inputs.secrets }}
+      run: |
+        set -euo pipefail
+        case "$DEPENDABOT_PUBLIC_KEY" in ''|*[!A-Za-z0-9+/=]*) echo "::error::public-key is not base64"; exit 1 ;; esac
+        case "$CI_NAME" in ''|__*__) echo "::error::ci-name is '$CI_NAME': set it to the exact name: of your CI workflow in .github/workflows/dependabot-seal.yml"; exit 1 ;; esac
+        if [ ! -d .github/workflows ]; then
+          echo "::error::No .github/workflows here: the job must check out the repository before this step."
+          exit 1
+        fi
+        SEAL_NAMES=$(node "$GITHUB_ACTION_PATH/../tools/ci-secrets.cjs" .)
+        if [ -z "$SEAL_NAMES" ]; then
+          echo "No workflow named '$CI_NAME' reads a secret, so there is nothing to seal."
+        fi
+        export SEAL_NAMES
+        python3 - <<'PY'
+        import base64, json, os
+        from nacl.public import PublicKey, SealedBox
+        box = SealedBox(PublicKey(base64.b64decode(os.environ["DEPENDABOT_PUBLIC_KEY"])))
+        secrets = json.loads(os.environ["ALL_SECRETS"])
+        for name in os.environ["SEAL_NAMES"].split():
+            value = secrets.get(name, "")
+            if value:
+                sealed = base64.b64encode(box.encrypt(value.encode())).decode()
+                print("DEP-STEWARD-" + "SEALED", name, sealed)
+            else:
+                print("DEP-STEWARD-" + "UNSET", name)
+        PY
