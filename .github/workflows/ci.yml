@@ -22,7 +22,7 @@ jobs:
       # Adopters run the reusable workflows this repo ships, so the tests lint
       # them, and the caller templates (test/actionlint.test.mjs). Checksummed
       # by the Go module proxy.
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
           go-version: stable
       - name: Install actionlint
