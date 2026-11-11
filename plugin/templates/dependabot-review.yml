@@ -29,7 +29,7 @@ permissions:
 
 jobs:
   review:
-    uses: raphaelcm/dep-steward/.github/workflows/review.yml@__DEP_STEWARD_REF__
+    uses: raphaelcm/dep-steward/.github/workflows/review.yml@e44b43c4b102a91d929892eb14c0e4787f52f420 # v0.18.0
     with:
       pr_number: ${{ inputs.pr_number && format('{0}', inputs.pr_number) || '' }}
       model: claude-opus-4-8
