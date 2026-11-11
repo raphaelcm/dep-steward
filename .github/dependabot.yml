@@ -1,0 +1,13 @@
+version: 2
+updates:
+  # Keeps the actions dep-steward's own workflows pin current, chiefly
+  # anthropics/claude-code-action, which every adopter runs at the version a
+  # dep-steward release pins. dep-steward's refs to itself are written by
+  # scripts/pin.mjs at release, never bumped.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    ignore:
+      - dependency-name: raphaelcm/dep-steward

@@ -13,7 +13,7 @@
  * repo's own code generator re-run for the bump, never an agent's writing. A
  * line budget measures how much an agent wrote and says nothing about whether
  * a generator's output is right, so that kind has none. It is confined instead
- * to the paths the installer was told the generator writes.
+ * to the paths the caller's regenerate-paths input says the generator writes.
  *
  * Inputs (env):
  *   FIX_NAME_STATUS  `git diff --name-status` of the fixer's edits (status<TAB>path)

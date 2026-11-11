@@ -95,19 +95,25 @@ test('the README points at the summary skill where it actually lives', () => {
 test('the plugin folder holds only what the plugin runs', () => {
   // Anthropic's directory scans and ships every file under plugin/. The
   // homepage once sat inside the plugin and held the listing in review, because
-  // its inlined fonts and images could not be inspected.
+  // its inlined fonts and images could not be inspected. The pipeline's code
+  // lives in actions/ and .github/workflows/, which GitHub runs at a pinned
+  // commit; the plugin only installs the files that call it.
   const entries = readdirSync(PLUGIN).sort();
-  assert.deepEqual(entries, ['.claude-plugin', 'install.sh', 'skills', 'templates'],
-    'only the manifest, skills, installer, and templates belong in plugin/');
+  assert.deepEqual(entries, ['.claude-plugin', 'skills', 'templates'],
+    'only the manifest, skills, and caller templates belong in plugin/');
+  assert.deepEqual(readdirSync(join(PLUGIN, 'templates')).sort(),
+    ['dependabot-automerge.yml', 'dependabot-review.yml', 'dependabot-seal.yml', 'dependabot.yml']);
 });
 
-test('skills run the plugin’s own installer, never a downloaded one', () => {
+test('skills never download and run code', () => {
   // A skill that pipes a remote script into a shell runs whatever is on main
   // today, not the version that was reviewed and installed.
   for (const skill of readdirSync(join(PLUGIN, 'skills'))) {
     const body = readFileSync(join(PLUGIN, 'skills', skill, 'SKILL.md'), 'utf8');
-    assert.doesNotMatch(body, /curl|wget|raw\.githubusercontent/, `skills/${skill}/SKILL.md downloads code`);
+    assert.doesNotMatch(body, /curl|wget|raw\.githubusercontent|\| *(ba|z)?sh\b/,`skills/${skill}/SKILL.md downloads code`);
   }
   const install = readFileSync(join(PLUGIN, 'skills', 'install', 'SKILL.md'), 'utf8');
-  assert.match(install, /\$\{CLAUDE_PLUGIN_ROOT\}\/install\.sh/, 'the install skill runs the bundled installer');
+  for (const t of ['dependabot-review.yml', 'dependabot-automerge.yml', 'dependabot-seal.yml', 'dependabot.yml']) {
+    assert.ok(install.includes(t), `the install skill writes templates/${t}`);
+  }
 });

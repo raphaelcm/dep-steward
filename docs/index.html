@@ -4,12 +4,12 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>dep-steward — a steward for your dependencies</title>
-<meta name="description" content="Claude-reviewed, injection-safe Dependabot automation for GitHub — auto-update, auto-review, and auto-merge-when-safe, installed in one line.">
+<meta name="description" content="Claude-reviewed, injection-safe Dependabot automation for GitHub — auto-update, auto-review, and auto-merge-when-safe, installed from Claude Code.">
 <link rel="icon" type="image/svg+xml" href="favicon.svg">
 <link rel="canonical" href="https://raphaelcm.github.io/dep-steward/">
 <meta property="og:type" content="website">
 <meta property="og:title" content="dep-steward — a steward for your dependencies">
-<meta property="og:description" content="Claude-reviewed, injection-safe Dependabot automation for GitHub — auto-update, auto-review, and auto-merge-when-safe, installed in one line.">
+<meta property="og:description" content="Claude-reviewed, injection-safe Dependabot automation for GitHub — auto-update, auto-review, and auto-merge-when-safe, installed from Claude Code.">
 <meta property="og:url" content="https://raphaelcm.github.io/dep-steward/">
 <meta property="og:image" content="https://raphaelcm.github.io/dep-steward/og-image.png">
 <meta name="twitter:card" content="summary_large_image">
@@ -226,11 +226,12 @@ html.js .reveal.in{opacity:1;transform:none}
       <h1>There’s a steward <span class="accent">on your&nbsp;repo.</span></h1>
       <p class="lead">Claude-reviewed, injection-safe Dependabot automation for GitHub. It <strong>auto-updates</strong> your dependencies, <strong>auto-reviews</strong> every PR with a Claude agent, and <strong>auto-merges only when it’s safe</strong> — decided by a fully deterministic gate, not by the model.</p>
       <div class="slip">
-        <code><span class="p">$</span> sh -c "$(curl -fsSL https://raw.githubusercontent.com/raphaelcm/dep-steward/main/plugin/install.sh)"</code>
-        <button class="copy" data-copy='sh -c "$(curl -fsSL https://raw.githubusercontent.com/raphaelcm/dep-steward/main/plugin/install.sh)"'>Copy</button>
+        <code><span class="p">&gt;</span> /plugin marketplace add raphaelcm/dep-steward
+<span class="p">&gt;</span> /plugin install dep-steward@dep-steward</code>
+        <button class="copy" data-copy='/plugin marketplace add raphaelcm/dep-steward'>Copy</button>
       </div>
-      <p class="slipnote">Idempotent — re-running is safe. Preview everything first with <code>--dry-run</code>.</p>
-      <p class="hero-links"><a href="#plugin">Or install the Claude Code plugin ↓</a>&ensp;·&ensp;<a href="https://github.com/raphaelcm/dep-steward">GitHub&nbsp;→</a></p>
+      <p class="slipnote">Then run <code>/dep-steward:install</code> in the repo you want to protect.</p>
+      <p class="hero-links"><a href="#start">How to get started ↓</a>&ensp;·&ensp;<a href="https://github.com/raphaelcm/dep-steward">GitHub&nbsp;→</a></p>
     </div>
 
     <div class="frame reveal" style="background:#FAF6EA">
@@ -328,7 +329,7 @@ html.js .reveal.in{opacity:1;transform:none}
   <div class="wrap">
     <div class="kicker">Autofix</div>
     <h2>A broken build gets the smallest fix it can defend — or a human.</h2>
-    <p class="lead">When a bump breaks CI, an autofix agent reads the failure and proposes a clean, minimal fix. When the break isn’t clearly the bump’s fault, would need real code changes or a new dependency, or it simply isn’t confident — it escalates, exactly like the review job does. On by default; opt out with <code>--no-autofix</code>.</p>
+    <p class="lead">When a bump breaks CI, an autofix agent reads the failure and proposes a clean, minimal fix. When the break isn’t clearly the bump’s fault, would need real code changes or a new dependency, or it simply isn’t confident — it escalates, exactly like the review job does. On by default; ask <code>/dep-steward:install</code> to leave it off.</p>
   </div>
 </section>
 
@@ -337,7 +338,7 @@ html.js .reveal.in{opacity:1;transform:none}
   <div class="wrap">
     <div class="kicker">The Claude Code plugin</div>
     <h2>In your slash menu, everywhere</h2>
-    <p class="lead">dep-steward is also a <a href="https://code.claude.com/docs/en/plugins">Claude Code plugin</a> and its own marketplace, so it installs in two commands — straight from the repo, with no third-party listing in the way. These three then follow you into every repo you work in:</p>
+    <p class="lead">dep-steward is a <a href="https://code.claude.com/docs/en/plugins">Claude Code plugin</a> and its own marketplace, so it installs in two commands, straight from the repo. These three then work in every repo you open:</p>
     <div class="slip">
       <code><span class="p">&gt;</span> /plugin marketplace add raphaelcm/dep-steward
 <span class="p">&gt;</span> /plugin install dep-steward@dep-steward</code>
@@ -346,7 +347,7 @@ html.js .reveal.in{opacity:1;transform:none}
     <div class="grid3">
       <div class="card reveal">
         <h3 class="cmd"><span class="ns">/dep-steward:</span>install</h3>
-        <p>Preflights the prerequisites in whatever repo you’re in, shows you the <code>--dry-run</code> plan, then installs. Hands off cleanly for the two steps that genuinely need a browser — minting the token, granting the GitHub App.</p>
+        <p>Checks the prerequisites in whatever repo you’re in, shows you each file it will write, then installs. Gives you the commands for the one step that needs a browser: minting the token.</p>
       </div>
       <div class="card reveal">
         <h3 class="cmd"><span class="ns">/dep-steward:</span>summary</h3>
@@ -365,18 +366,17 @@ html.js .reveal.in{opacity:1;transform:none}
   <div class="wrap">
     <div class="kicker">Getting started</div>
     <h2>Two minutes to a stewarded repo</h2>
-    <p class="lead">The installer inspects your repo, shows what it will change, and does it. Every step is idempotent, and it verifies the token authenticates <em>before</em> storing it.</p>
+    <p class="lead"><code>/dep-steward:install</code> checks your repo, shows you each file it will write, and writes them: three short workflow files that run dep-steward’s pipeline at a version your repo pins, plus your Dependabot config. Running it again is safe.</p>
     <ul class="prereqs">
-      <li>The <a href="https://github.com/apps/claude">Claude Code GitHub App</a> installed on the repo.</li>
       <li><a href="https://cli.github.com">GitHub CLI</a> authenticated with <code>repo</code> + <code>workflow</code> scopes.</li>
-      <li>A <code>CLAUDE_CODE_OAUTH_TOKEN</code> — the installer offers to mint one inline via <code>claude setup-token</code>.</li>
+      <li>A <code>CLAUDE_CODE_OAUTH_TOKEN</code>, minted with <code>claude setup-token</code> and stored in both of the repo’s secret stores. The install gives you the exact commands.</li>
       <li>A CI workflow whose green status should gate merges.</li>
     </ul>
     <div class="slip">
-      <code><span class="p">$</span> sh -c "$(curl -fsSL https://raw.githubusercontent.com/raphaelcm/dep-steward/main/plugin/install.sh)"</code>
-      <button class="copy" data-copy='sh -c "$(curl -fsSL https://raw.githubusercontent.com/raphaelcm/dep-steward/main/plugin/install.sh)"'>Copy</button>
+      <code><span class="p">&gt;</span> /dep-steward:install</code>
+      <button class="copy" data-copy='/dep-steward:install'>Copy</button>
     </div>
-    <p class="slipnote">Add <code>-- --dry-run</code> to preview without touching anything. Full details — the files it writes, the FAQ, the security model — are in the <a href="https://github.com/raphaelcm/dep-steward#readme">README</a>.</p>
+    <p class="slipnote">New versions arrive as a Dependabot PR, which dep-steward always leaves to you. Full details (the files it writes, the FAQ, the security model) are in the <a href="https://github.com/raphaelcm/dep-steward#readme">README</a>.</p>
   </div>
 </section>
 

@@ -5,7 +5,8 @@ import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, readdirSync, exist
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { parseJobs, runJob } from './lib/actions-sim.mjs';
+import { runJob } from './lib/actions-sim.mjs';
+import { jobsOf, workflowText, inputDefaults, topLevelEnv, toolsHandler, TOOLS_ACTION } from './lib/dep-steward.mjs';
 import { startGitServer, tokenOf } from './lib/git-http-server.mjs';
 import {
   CURL_STUB, GIT_ISOLATION, git,
@@ -22,44 +23,32 @@ import {
  * agent has no generator to run, and the bounds' ten-line budget would have
  * refused the output anyway.
  *
- * Installed with --regenerate, the review workflow's regenerate jobs re-run
+ * With a regenerate command set, the review workflow's regenerate jobs re-run
  * the generator on pull_request (where the bump's code may run) and leave a
  * verdict artifact. When CI fails, autofix reads that verdict as data and,
  * when it is verified, hands the regeneration to the push job, which reads it
  * again for itself and pushes it as the Claude GitHub App. No agent runs.
  *
- * Everything here runs the rendered jobs (test/lib/actions-sim.mjs): the two
+ * Everything here runs the shipped jobs (.github/workflows/review.yml, through
+ * test/lib/actions-sim.mjs): the two
  * pull_request jobs in fresh checkouts with an `npm` whose `run db:generate`
  * is a stand-in generator, the artifacts through a local store, then the two
  * workflow_run jobs against a `gh` that answers GitHub's REST routes from
  * that store, and a real git remote that records who pushed.
  */
 
-const REPO = dirname(dirname(fileURLToPath(import.meta.url)));
 const HEAD_BRANCH = 'dependabot/npm_and_yarn/npm-minor-patch-116ae265fb';
 const REVIEW_RUN = 777;
-const REGEN_FLAGS = [
-  '--regenerate', 'npm run db:generate',
-  '--regenerate-path', 'src/generated/prisma',
-  '--regenerate-env', 'DATABASE_URL=postgresql://runsense:runsense@localhost:5432/runsense',
-];
-
-function render(flags = REGEN_FLAGS) {
-  const fakeRepo = mkdtempSync(join(tmpdir(), 'ds-rg-repo-'));
-  writeFileSync(join(fakeRepo, 'package.json'), '{"name":"app"}\n');
-  writeFileSync(join(fakeRepo, 'package-lock.json'), '{}\n');
-  const out = mkdtempSync(join(tmpdir(), 'ds-rg-out-'));
-  execFileSync(
-    'sh',
-    [join(REPO, 'plugin', 'install.sh'), '--render-only', '--out', out, '--ci-name', 'CI', '--assignee', 'octocat', ...flags],
-    { cwd: fakeRepo, env: { ...process.env, DEP_STEWARD_SRC: join(REPO, 'plugin') }, stdio: 'pipe' },
-  );
-  return out;
-}
-
-const RENDERED = render();
-const WORKFLOW = readFileSync(join(RENDERED, '.github/workflows/dependabot-review.yml'), 'utf8');
-const JOBS = parseJobs(WORKFLOW);
+// The caller's settings for #3034's repo, as the install skill writes them.
+const REGEN_INPUTS = {
+  'regenerate-command': 'npm run db:generate',
+  'regenerate-paths': 'src/generated/prisma',
+  'regenerate-env': 'DATABASE_URL=postgresql://runsense:runsense@localhost:5432/runsense',
+};
+const REVIEW_TEXT = workflowText('review');
+const JOBS = jobsOf('review');
+const WORKFLOW_ENV = topLevelEnv(REVIEW_TEXT);
+const inputsWith = (over = REGEN_INPUTS) => ({ ...inputDefaults(REVIEW_TEXT), assignee: 'octocat', ...over });
 
 // The stand-in generator: Prisma's client embeds the version that generated
 // it, so a version bump changes three lines in each of two files.
@@ -75,7 +64,7 @@ printf 'export type User = { id: string }\\n' > src/generated/prisma/models/User
 case "\${GEN_EXTRA:-}" in
   nondeterministic) date +%s%N > src/generated/prisma/internal/stamp.ts ;;
   outside) echo 'export const timeout = 2000;' > src/client.ts ;;
-  lockfile) sed -i 's/"lockfileVersion":3/"lockfileVersion": 3/' package-lock.json ;;
+  lockfile) sed -i.orig 's/"lockfileVersion":3/"lockfileVersion": 3/' package-lock.json && rm -f package-lock.json.orig ;;
   github) mkdir -p .github/workflows; echo 'name: generated' > .github/workflows/generated.yml ;;
   fails) echo 'Error: the generator crashed' >&2; exit 1 ;;
 esac
@@ -190,8 +179,9 @@ const lockfile = (v) => `{"name":"app","lockfileVersion":3,"packages":{"node_mod
  *   forgeDecision  what a turned autofix job hands the push job instead of its own outputs
  *   moveBranch   push a new commit to the PR branch between the two workflow_run jobs
  *   agentEdits   files the fixer agent writes, when it runs
+ *   inputs       the caller's `with:` values (default: #3034's regeneration)
  */
-async function runRegeneration({ bumpTo = '7.10.1', extra = '', review = 'ours', inProgress = 0, zip, forgeDecision, moveBranch = false, agentEdits = {} } = {}) {
+async function runRegeneration({ bumpTo = '7.10.1', extra = '', review = 'ours', inProgress = 0, zip, forgeDecision, moveBranch = false, agentEdits = {}, inputs = inputsWith() } = {}) {
   const root = mkdtempSync(join(tmpdir(), 'ds-regen-'));
   const d = (...p) => { const x = join(root, ...p); mkdirSync(x, { recursive: true }); return x; };
   const bin = d('bin');
@@ -200,7 +190,8 @@ async function runRegeneration({ bumpTo = '7.10.1', extra = '', review = 'ours',
   const home = d('home');
 
   // The PR head as Dependabot left it: the bump's manifests, and the
-  // generated client still from 7.10.0, committed with the pipeline's files.
+  // generated client still from 7.10.0. dep-steward's own scripts are never
+  // in the repo; the tools action brings them from the release.
   const seed = d('seed');
   git(['init', '-q', '-b', 'main', seed]);
   git(['config', 'user.email', 'test@example.invalid'], seed);
@@ -210,10 +201,6 @@ async function runRegeneration({ bumpTo = '7.10.1', extra = '', review = 'ours',
   writeFileSync(join(seed, 'package-lock.json'), lockfile('7.10.0'));
   mkdirSync(join(seed, 'src'), { recursive: true });
   writeFileSync(join(seed, 'src/client.ts'), 'export const timeout = 1000;\n');
-  for (const f of ['.github/dependabot-automerge/autofix-bounds.cjs', '.github/dependabot-automerge/review-lint.cjs', '.github/dependabot-autofix-prompt.md']) {
-    mkdirSync(dirname(join(seed, f)), { recursive: true });
-    writeFileSync(join(seed, f), readFileSync(join(RENDERED, f), 'utf8'));
-  }
   writeFileSync(join(bin, 'generator'), GENERATOR, { mode: 0o755 });
   mkdirSync(join(seed, 'node_modules/prisma'), { recursive: true });
   writeFileSync(join(seed, 'node_modules/prisma/VERSION'), '7.10.0\n');
@@ -246,7 +233,9 @@ async function runRegeneration({ bumpTo = '7.10.1', extra = '', review = 'ours',
   const ghState = join(bin, 'state.json');
 
   const calls = { fixer: [], setupNode: [], checkouts: [] };
+  const tools = toolsHandler({ rootFiles: ['.gitignore', 'package.json', 'package-lock.json'] });
   const uses = (run) => ({
+    [TOOLS_ACTION]: tools,
     'actions/checkout': async ({ with: w }) => { calls.checkouts.push({ ...w }); return { exitCode: 0 }; },
     'actions/setup-node': async ({ with: w }) => { calls.setupNode.push({ ...w }); return { exitCode: 0 }; },
     'actions/upload-artifact': async ({ with: w }) => {
@@ -296,12 +285,15 @@ async function runRegeneration({ bumpTo = '7.10.1', extra = '', review = 'ours',
       sender: { login: 'dependabot[bot]', type: 'Bot' },
     },
   };
+  const shipped = { inputs, workflowEnv: WORKFLOW_ENV };
+  const pr1 = checkout('pr-1');
   const regen = await runJob(JOBS, 'regenerate', {
-    github: prGithub, uses: uses(REVIEW_RUN), cwd: checkout('pr-1'),
+    ...shipped, github: prGithub, uses: uses(REVIEW_RUN), cwd: pr1,
     env: { ...baseEnv, RUNNER_TEMP: d('rt-1'), DS_JOB: 'regenerate' },
   });
+  const pr2 = checkout('pr-2');
   const verify = await runJob(JOBS, 'regenerate-verify', {
-    github: prGithub, uses: uses(REVIEW_RUN), cwd: checkout('pr-2'),
+    ...shipped, github: prGithub, uses: uses(REVIEW_RUN), cwd: pr2,
     env: { ...baseEnv, RUNNER_TEMP: d('rt-2'), DS_JOB: 'regenerate-verify' },
     needs: { regenerate: { outputs: regen.outputs, result: regen.failed ? 'failure' : 'success' } },
   });
@@ -326,8 +318,9 @@ async function runRegeneration({ bumpTo = '7.10.1', extra = '', review = 'ours',
         status: 'completed',
         jobs: [
           { name: 'review', status: 'completed', conclusion: 'success' },
-          { name: 'regenerate', status: 'completed', conclusion: conclusion(regen) },
-          { name: 'regenerate-verify', status: 'completed', conclusion: conclusion(verify) },
+          // Called through the caller's `review` job, GitHub names them so.
+          { name: 'review / regenerate', status: 'completed', conclusion: conclusion(regen) },
+          { name: 'review / regenerate-verify', status: 'completed', conclusion: conclusion(verify) },
         ],
       },
     },
@@ -360,7 +353,7 @@ async function runRegeneration({ bumpTo = '7.10.1', extra = '', review = 'ours',
       GITHUB_API_URL,
     });
     const autofixTree = checkout('autofix');
-    const autofix = await runJob(JOBS, 'autofix', { github: wrGithub, secrets, uses: uses(900), cwd: autofixTree, env: wrEnv('autofix') });
+    const autofix = await runJob(JOBS, 'autofix', { ...shipped, github: wrGithub, secrets, uses: uses(900), cwd: autofixTree, env: wrEnv('autofix') });
     const handedOver = forgeDecision
       ? { decision: forgeDecision, base_sha: headSha, patch: '' }
       : autofix.outputs;
@@ -376,7 +369,7 @@ async function runRegeneration({ bumpTo = '7.10.1', extra = '', review = 'ours',
     const pushTree = checkout('push');
     git(['remote', 'set-url', 'origin', `${server.url}/octocat/repo.git`], pushTree);
     const push = await runJob(JOBS, 'autofix-push', {
-      github: wrGithub, secrets, uses: uses(900), cwd: pushTree, env: wrEnv('autofix-push'),
+      ...shipped, github: wrGithub, secrets, uses: uses(900), cwd: pushTree, env: wrEnv('autofix-push'),
       needs: { autofix: { outputs: handedOver, result: autofix.failed ? 'failure' : 'success' } },
     });
     const after = git(['--git-dir', bare, 'rev-parse', HEAD_BRANCH]).trim();
@@ -563,7 +556,7 @@ with zipfile.ZipFile(sys.argv[1], 'w') as z:
   assert.ok(!existsSync('/tmp/ds-absolute-escape'));
 });
 
-// ---- the render ---------------------------------------------------------------
+// ---- the shipped jobs ----------------------------------------------------------
 
 test('the regenerate jobs hold a read-only token, no secret, and no agent', () => {
   for (const job of ['regenerate', 'regenerate-verify']) {
@@ -585,12 +578,35 @@ test('the regenerate jobs run only on pull_request; the jobs that can push or ru
   }
 });
 
-test('without --regenerate the workflow carries none of it', () => {
-  const plain = readFileSync(join(render([]), '.github/workflows/dependabot-review.yml'), 'utf8');
-  assert.doesNotMatch(plain, /REGENERATE|take_regeneration|__[A-Z_]+__/);
-  const jobs = parseJobs(plain);
-  assert.deepEqual(Object.keys(jobs).sort(), ['autofix', 'autofix-push', 'review']);
-  assert.equal(jobs['autofix-push'].if, "needs.autofix.outputs.decision == 'push'");
-  assert.equal(jobs.autofix['timeout-minutes'], '20');
-  assert.equal(jobs['autofix-push'].permissions.actions, undefined);
+test('with no regenerate command, the regenerate jobs do not run and autofix never looks for a regeneration', async () => {
+  // Regeneration off is the same jobs with an empty regenerate-command: the
+  // regenerate jobs skip, and the autofix job reads no review run and no
+  // artifact before its fixer gets the attempt.
+  const r = await runRegeneration({ inputs: inputsWith({}) });
+  assert.equal(r.regen.skipped, true, r.log);
+  assert.equal(r.verify.skipped, true, r.log);
+  assert.equal(r.verdict, null);
+  assert.deepEqual(r.npmCalls, [], 'no bump code runs anywhere');
+  assert.equal(r.calls.fixer.length, 1, r.log);
+  assert.ok(
+    !r.ghCalls.some((c) => /actions\/workflows\/dependabot-review\.yml\/runs|\/artifacts/.test(c)),
+    `no review-run or artifact read: ${r.ghCalls.join('\n')}`,
+  );
+  assert.doesNotMatch(r.log, /regeneration/i);
+});
+
+test('regenerate settings the jobs cannot carry safely are refused, red, before the bump runs', async () => {
+  for (const [over, why] of [
+    [{ 'regenerate-paths': '' }, /needs at least one path/],
+    [{ 'regenerate-paths': '.github/x' }, /never pushes under \.github/],
+    [{ 'regenerate-paths': '../up' }, /inside the repository/],
+    [{ 'regenerate-env': 'GITHUB_TOKEN=x' }, /belongs to the runner or to dep-steward/],
+    [{ 'regenerate-env': 'NOEQUALS' }, /give NAME=VALUE/],
+    [{ 'regenerate-env': 'A=1\nA=2' }, /given twice/],
+  ]) {
+    const r = await runRegeneration({ inputs: inputsWith({ ...REGEN_INPUTS, ...over }) });
+    assert.equal(r.regen.failed, true, JSON.stringify(over));
+    assert.match(r.log, why, JSON.stringify(over));
+    assert.ok(!r.npmCalls.some(([job]) => job === 'regenerate'), `${JSON.stringify(over)}: the bump's code ran`);
+  }
 });

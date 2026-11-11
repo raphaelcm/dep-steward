@@ -10,7 +10,7 @@ The half-uninstall to avoid is leaving the token behind: `CLAUDE_CODE_OAUTH_TOKE
 
 Report what exists before removing anything — the repo may have only some of it, or a hand-edited variant.
 
-- Files: `.github/workflows/dependabot-review.yml`, `.github/workflows/dependabot-automerge.yml`, `.github/dependabot-review-prompt.md`, `.github/dependabot.yml`, `.github/dependabot-automerge/` (the gate and the reviewer's prose lint, plus `autofix-bounds.cjs` and `.github/dependabot-autofix-prompt.md` when autofix is on).
+- Files: `.github/workflows/dependabot-review.yml`, `.github/workflows/dependabot-automerge.yml`, `.github/workflows/dependabot-seal.yml`, and `.github/dependabot.yml`. An install from before 0.18 also has `.github/dependabot-automerge/`, `.github/dependabot-review-prompt.md` and `.github/dependabot-autofix-prompt.md`.
 - Label: `gh label list --search needs-human-review`.
 - Secrets: `gh secret list` and `gh secret list --app dependabot`.
 - Open PRs still carrying the label: `gh pr list --label needs-human-review --state open`.
@@ -19,7 +19,7 @@ Report what exists before removing anything — the repo may have only some of i
 
 Show the user the exact list and get their go-ahead. Two things deserve a specific callout rather than a blanket "removing everything":
 
-- **`.github/dependabot.yml` may predate dep-steward.** The installer writes it, but the user may have had Dependabot configured before. Deleting it stops dependency updates entirely. Ask whether to delete it or keep it, and say that keeping it means updates continue with no review and no gate.
+- **`.github/dependabot.yml` may predate dep-steward.** The install writes it, but the user may have had Dependabot configured before. Deleting it stops dependency updates entirely. Ask whether to delete it or keep it, and say that keeping it means updates continue with no review and no gate.
 - **Open PRs labelled `needs-human-review` are waiting on them.** Removing the label loses that queue. Offer to list those PRs so they can triage first.
 
 ## 3. Remove
@@ -27,6 +27,7 @@ Show the user the exact list and get their go-ahead. Two things deserve a specif
 ```sh
 rm -f .github/workflows/dependabot-review.yml \
       .github/workflows/dependabot-automerge.yml \
+      .github/workflows/dependabot-seal.yml \
       .github/dependabot-review-prompt.md \
       .github/dependabot-autofix-prompt.md
 rm -rf .github/dependabot-automerge
@@ -40,13 +41,13 @@ gh secret delete CLAUDE_CODE_OAUTH_TOKEN --app dependabot
 gh secret delete DEP_STEWARD_PUSH_TOKEN
 ```
 
-The installer may also have copied the secrets the repo's CI reads into the Dependabot store, so CI could pass on Dependabot's PRs. They are copies of the Actions secrets, which stay. Show the user the other names `gh secret list --app dependabot` lists, and delete with `gh secret delete <NAME> --app dependabot` only the ones they confirm, since they may have set some themselves.
+The install may also have copied the secrets the repo's CI reads into the Dependabot store, so CI could pass on Dependabot's PRs. They are copies of the Actions secrets, which stay. Show the user the other names `gh secret list --app dependabot` lists, and delete with `gh secret delete <NAME> --app dependabot` only the ones they confirm, since they may have set some themselves.
 
 The file deletions are working-tree changes the user commits like any other change; the pipeline stops when that commit reaches the default branch.
 
 ## 4. Report what was deliberately left alone
 
-- **Auto-merge stays enabled** on the repo (Settings → General). The installer turned it on, but other workflows may rely on it, so it is the user's call: Settings → General → Pull Requests.
-- **Branch protection and required status checks are untouched** — the installer only ever advised on them.
+- **Auto-merge stays enabled** on the repo (Settings → General). The install turned it on, but other workflows may rely on it, so it is the user's call: Settings → General → Pull Requests.
+- **Branch protection and required status checks are untouched** — the install only ever advised on them.
 - **Merged PRs, review comments, and history stay.** Nothing is rewritten.
 - The plugin itself is separate from the pipeline: `/plugin uninstall dep-steward@dep-steward` removes these skills from Claude Code, and can be done independently of removing the pipeline from any repo.

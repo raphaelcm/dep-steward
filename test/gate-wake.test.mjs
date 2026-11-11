@@ -1,11 +1,10 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { execFileSync } from 'node:child_process';
 import { mkdtempSync, writeFileSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, dirname } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { join } from 'node:path';
 import { parseJobs, evaluate, conditionHolds, runJob } from './lib/actions-sim.mjs';
+import { callerText, workflowText } from './lib/dep-steward.mjs';
 
 /**
  * Which wakes reach the gate, and for which PR.
@@ -19,24 +18,10 @@ import { parseJobs, evaluate, conditionHolds, runJob } from './lib/actions-sim.m
  * which for a green PR may never come.
  */
 
-const REPO = dirname(dirname(fileURLToPath(import.meta.url)));
-const REFERENCE_MANIFESTS = ['package.json', 'package-lock.json', 'requirements.txt', 'Cargo.toml', 'go.mod', 'Dockerfile'];
-
-function render() {
-  const fakeRepo = mkdtempSync(join(tmpdir(), 'ds-wake-repo-'));
-  for (const m of REFERENCE_MANIFESTS) writeFileSync(join(fakeRepo, m), '\n');
-  const out = mkdtempSync(join(tmpdir(), 'ds-wake-out-'));
-  execFileSync(
-    'sh',
-    [join(REPO, 'plugin', 'install.sh'), '--render-only', '--out', out, '--ci-name', 'CI', '--assignee', 'octocat'],
-    { cwd: fakeRepo, env: { ...process.env, DEP_STEWARD_SRC: join(REPO, 'plugin') }, stdio: 'pipe' },
-  );
-  return out;
-}
-
-const out = render();
-const REVIEW = readFileSync(join(out, '.github/workflows/dependabot-review.yml'), 'utf8');
-const AUTOMERGE = readFileSync(join(out, '.github/workflows/dependabot-automerge.yml'), 'utf8');
+// The run name lives in the caller the plugin installs (a reusable workflow
+// cannot set one); the resolve job is in the shipped auto-merge workflow.
+const REVIEW = callerText('review');
+const AUTOMERGE = workflowText('automerge');
 const AM_JOBS = parseJobs(AUTOMERGE);
 
 const ctxWith = (over) => ({ github: {}, inputs: {}, secrets: {}, env: {}, steps: {}, vars: {}, job: {}, runner: {}, needs: {}, ...over });
@@ -176,4 +161,13 @@ test('the gate runs only for a resolved PR, one run per PR at a time whatever wo
 
 test('resolving holds nothing but read access to pull requests', () => {
   assert.deepEqual(AM_JOBS.resolve.permissions, { 'pull-requests': 'read' });
+});
+
+test("the replay wake names the installed review caller's own path", async () => {
+  // The resolve job tells a replay by its workflow's path, and that path is
+  // the caller the plugin installs, under its template's name.
+  const { CALLER_PATHS } = await import('./lib/dep-steward.mjs');
+  const { basename } = await import('node:path');
+  assert.equal(`.github/workflows/${basename(CALLER_PATHS.review)}`, REVIEW_PATH);
+  assert.match(AUTOMERGE, /github\.event\.workflow_run\.path == '\.github\/workflows\/dependabot-review\.yml'/);
 });

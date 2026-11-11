@@ -1,11 +1,11 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { execFileSync, spawnSync } from 'node:child_process';
+import { spawnSync } from 'node:child_process';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, accessSync, constants } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, dirname } from 'node:path';
-import { fileURLToPath } from 'node:url';
-import { parseJobs, runJob } from './lib/actions-sim.mjs';
+import { join, dirname, basename } from 'node:path';
+import { runJob } from './lib/actions-sim.mjs';
+import { jobsOf, workflowText, inputDefaults, topLevelEnv, TOOLS_DIR, TOOLS_ACTION, REFERENCE_ROOT_FILES } from './lib/dep-steward.mjs';
 
 /**
  * Nothing an agent writes is ever run.
@@ -25,33 +25,63 @@ import { parseJobs, runJob } from './lib/actions-sim.mjs';
  * A prompt injection in a dependency's changelog would then be code execution
  * with a token that can push to the PR it is reviewing.
  *
- * So every such script runs from a copy taken before the agent starts, kept
- * outside the checkout and read-only (the agent has no shell to change that). This file runs the review job with a reviewer that
- * rewrites every pipeline script it can reach, and checks that none of the
- * rewrites runs while the real scripts still do their jobs. The autofix job's
- * bounds check gets the same test in autofix-push.test.mjs.
+ * So every such script runs from a copy the tools action takes from the
+ * dep-steward release before the agent starts, kept outside the checkout and
+ * read-only (the agent has no shell to change that). This file runs the
+ * shipped review job, with the tools action's own script, and a reviewer
+ * that rewrites every pipeline script it can reach: the copies, and the
+ * scripts an install from before 0.18 left in the checkout. It checks that
+ * none of the rewrites runs while the real scripts still do their jobs. The
+ * autofix job's bounds check gets the same test in autofix-push.test.mjs.
  */
 
-const REPO = dirname(dirname(fileURLToPath(import.meta.url)));
-const REFERENCE_MANIFESTS = ['package.json', 'package-lock.json', 'requirements.txt', 'Cargo.toml', 'go.mod', 'Dockerfile'];
+const JOBS = jobsOf('review');
+const REVIEW_TEXT = workflowText('review');
 
-function render() {
-  const fakeRepo = mkdtempSync(join(tmpdir(), 'ds-aw-repo-'));
-  for (const m of REFERENCE_MANIFESTS) writeFileSync(join(fakeRepo, m), '\n');
-  const out = mkdtempSync(join(tmpdir(), 'ds-aw-out-'));
-  execFileSync(
-    'sh',
-    [join(REPO, 'plugin', 'install.sh'), '--render-only', '--out', out, '--ci-name', 'CI', '--assignee', 'octocat'],
-    { cwd: fakeRepo, env: { ...process.env, DEP_STEWARD_SRC: join(REPO, 'plugin') }, stdio: 'pipe' },
-  );
-  return out;
+// Where a pipeline script can sit within the agent's reach: the job's own
+// read-only copies, and the paths an install from before 0.18 left in the
+// checkout (an adopter mid-upgrade still has them).
+const COPIES = ['gate.cjs', 'review-lint.cjs', 'ecosystems.cjs'];
+const LEGACY_SCRIPTS = ['.github/dependabot-automerge/gate.cjs', '.github/dependabot-automerge/review-lint.cjs'];
+
+// The tools action as a runner runs it: its composite step's own script,
+// with this action's directory as GITHUB_ACTION_PATH and gh answered by the
+// stub. What it appends to GITHUB_ENV reaches later steps.
+const ACTION_YML = readFileSync(join(TOOLS_DIR, 'action.yml'), 'utf8');
+const ACTION_SCRIPT = (() => {
+  const lines = ACTION_YML.split('\n');
+  const i = lines.findIndex((l) => /^\s+run: \|\s*$/.test(l));
+  assert.ok(i > 0, 'the tools action runs one script');
+  const indent = /^(\s*)/.exec(lines[i + 1])[1].length;
+  const body = [];
+  for (const l of lines.slice(i + 1)) {
+    if (l.trim() !== '' && /^(\s*)/.exec(l)[1].length < indent) break;
+    body.push(l.slice(indent));
+  }
+  return body.join('\n');
+})();
+
+function realTools(runnerEnv) {
+  return async ({ with: w }) => {
+    const githubEnv = join(runnerEnv.RUNNER_TEMP, '..', `github_env_${Date.now()}_${Math.random()}`);
+    writeFileSync(githubEnv, '');
+    const r = spawnSync('bash', ['-c', ACTION_SCRIPT], {
+      encoding: 'utf8',
+      env: {
+        ...runnerEnv,
+        GH_TOKEN: w['github-token'],
+        ASSIGNEE: w.assignee ?? '',
+        REPO: 'octocat/repo',
+        GITHUB_ACTION_PATH: TOOLS_DIR,
+        GITHUB_ENV: githubEnv,
+      },
+    });
+    const env = {};
+    const m = /^ROOT_FILES<<(\S+)\n([\s\S]*?)\n\1$/m.exec(readFileSync(githubEnv, 'utf8'));
+    if (m) env.ROOT_FILES = m[2];
+    return { exitCode: r.status, output: r.stdout + r.stderr, env };
+  };
 }
-
-const RENDERED = render();
-const JOBS = parseJobs(readFileSync(join(RENDERED, '.github/workflows/dependabot-review.yml'), 'utf8'));
-
-// The scripts the review job runs, as the installer lays them out.
-const PIPELINE_SCRIPTS = ['.github/dependabot-automerge/gate.cjs', '.github/dependabot-automerge/review-lint.cjs'];
 
 const SINGLETON = 'dependabot/npm_and_yarn/ioredis-6.0.0';
 const REVIEW_STARTED = '2026-09-23T10:00:00Z';
@@ -87,6 +117,8 @@ flag() { local want="$1" prev='' a; shift; for a in "$@"; do if [ "$prev" = "$wa
 if [ "$1" = api ]; then
   case "$*" in
     *repos/octocat/repo/issues/1/comments*) doc=$(cat "$PR_COMMENTS_FILE") ;;
+    *repos/octocat/repo/git/trees/main*) doc=$(printf '%s\\n' $ROOT_FILE_NAMES | jq -Rsc '{tree: [split("\\n")[] | select(. != "") | {path: ., type: "blob"}]}') ;;
+    "api repos/octocat/repo --jq .default_branch") doc='{"default_branch":"main"}' ;;
     *) echo "gh stub: unexpected call: $*" >&2; exit 1 ;;
   esac
 else
@@ -125,9 +157,9 @@ async function runReview({ drafts, runnerTemp: sharedTemp }) {
   const bin = join(root, 'bin');
   const runnerTemp = sharedTemp ?? join(root, 'runner-temp');
   for (const d of [work, bin, runnerTemp]) mkdirSync(d, { recursive: true });
-  for (const f of ['.github/dependabot-review-prompt.md', ...PIPELINE_SCRIPTS]) {
+  for (const f of LEGACY_SCRIPTS) {
     mkdirSync(dirname(join(work, f)), { recursive: true });
-    writeFileSync(join(work, f), readFileSync(join(RENDERED, f)));
+    writeFileSync(join(work, f), readFileSync(join(TOOLS_DIR, basename(f))));
   }
   const ran = join(root, 'ran');
   const commentsFile = join(root, 'comments.json');
@@ -145,20 +177,26 @@ async function runReview({ drafts, runnerTemp: sharedTemp }) {
     GH_LOG: ghLog,
     PR_COMMENTS_FILE: commentsFile,
     HEAD_BRANCH: SINGLETON,
+    ROOT_FILE_NAMES: REFERENCE_ROOT_FILES.join(' '),
   };
 
   const hookRuns = [];
+  const copyWritesRefused = [];
   const uses = {
     // The tree above already is the checkout.
     'actions/checkout': async () => ({ exitCode: 0 }),
+    [TOOLS_ACTION]: realTools(runnerEnv),
     'anthropics/claude-code-action': async ({ with: w, env }) => {
-      for (const f of PIPELINE_SCRIPTS) {
-        writeFileSync(join(work, f), [
-          `require('fs').appendFileSync(${JSON.stringify(ran)}, ${JSON.stringify(`${f}\n`)});`,
-          "console.log('group=true');",
-          "console.log('decision=post');",
-          '',
-        ].join('\n'));
+      const rewrite = (f) => [
+        `require('fs').appendFileSync(${JSON.stringify(ran)}, ${JSON.stringify(`${f}\n`)});`,
+        "console.log('group=true');",
+        "console.log('decision=post');",
+        '',
+      ].join('\n');
+      for (const f of LEGACY_SCRIPTS) writeFileSync(join(work, f), rewrite(f));
+      for (const f of COPIES) {
+        const p = join(runnerTemp, 'dep-steward', f);
+        try { writeFileSync(p, rewrite(p)); } catch { copyWritesRefused.push(f); }
       }
       const [hook] = JSON.parse(w.settings).hooks.PreToolUse.find((h) => h.matcher === 'Bash').hooks;
       const command = 'gh pr comment 1 --body-file .dep-steward-review.md';
@@ -190,6 +228,8 @@ async function runReview({ drafts, runnerTemp: sharedTemp }) {
   };
 
   const result = await runJob(JOBS, 'review', {
+    inputs: { ...inputDefaults(REVIEW_TEXT), assignee: 'octocat' },
+    workflowEnv: topLevelEnv(REVIEW_TEXT),
     github: {
       event_name: 'pull_request',
       repository: 'octocat/repo',
@@ -208,6 +248,7 @@ async function runReview({ drafts, runnerTemp: sharedTemp }) {
     failed: result.failed,
     skipped: result.skipped,
     hookRuns,
+    copyWritesRefused,
     ran: existsSync(ran) ? readFileSync(ran, 'utf8').split('\n').filter(Boolean) : [],
     runnerTemp,
     log: result.steps.map((s) => `--- ${s.name} [${s.status}]\n${s.output}`).join('\n'),
@@ -218,6 +259,7 @@ test('a reviewer that rewrites the pipeline\'s scripts gets none of them run, an
   const r = await runReview({ drafts: [CI_REPORTING_VERDICT, CLEAN_VERDICT] });
   assert.equal(r.skipped, false, 'the review job must run for a Dependabot PR');
   assert.deepEqual(r.ran, [], `a script the agent rewrote was run:\n${r.log}`);
+  assert.deepEqual(r.copyWritesRefused, COPIES, 'the copies the job runs must refuse the agent\'s writes');
   // The hook is the real lint: it refuses the verdict that reports on CI and
   // lets the clean one through.
   assert.deepEqual(r.hookRuns.map((h) => h.status), [2, 0], JSON.stringify(r.hookRuns, null, 2));

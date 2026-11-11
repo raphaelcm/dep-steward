@@ -1,9 +1,10 @@
-name: Dependabot PR review
-# A replay names its PR, so the auto-merge workflow can wake for it when this
-# run finishes: a dispatched run is on the default branch, and a workflow_run
-# payload carries no inputs. Every other run keeps GitHub's default name.
-run-name: "${{ inputs.pr_number && format('Dependabot PR review of #{0}', inputs.pr_number) || '' }}"
-
+name: dep-steward review
+# A reusable workflow. The adopting repo's .github/workflows/
+# dependabot-review.yml ("Dependabot PR review") calls it at a pinned commit of
+# dep-steward from its own triggers (pull_request, workflow_dispatch for a
+# replay, and workflow_run of CI when autofix is on), and carries the run name
+# that lets the auto-merge workflow wake for a replay. Every `github.event`
+# below is that caller's event.
 # The agents. Each reads attacker-influenced text (a dependency's changelog
 # and diff, a failing build's log), so each job that runs one holds a token
 # that can read and comment but cannot push or merge, and no OIDC grant, so
@@ -44,25 +45,54 @@ run-name: "${{ inputs.pr_number && format('Dependabot PR review of #{0}', inputs
 #    on a Dependabot PR, a Claude agent drafts a small mechanical fix. A
 #    separate job with no agent re-checks it and pushes it.
 #
-#  - regenerate (on: pull_request, when the installer was given a regenerate
+#  - regenerate (on: pull_request, when the caller gives a regenerate
 #    command): re-runs the repo's code generator for the bump, with no agent,
 #    and leaves a verdict artifact. When CI then fails, autofix pushes a
 #    verified regeneration instead of running its fixer.
 
 on:
-  pull_request:
-    types: [opened, synchronize, reopened]
-  workflow_dispatch:
+  workflow_call:
     inputs:
       pr_number:
-        description: PR number to review (manual replay against existing dependabot PRs)
+        description: PR number to review (a manual replay against an existing Dependabot PR); empty on pull_request.
+        type: string
+        default: ''
+      model:
+        description: The Claude model the review and autofix agents run.
+        type: string
+        default: claude-opus-4-8
+      assignee:
+        description: GitHub login to assign when a PR needs a person, or empty for nobody.
+        type: string
+        default: ''
+      autofix:
+        description: Whether a failing CI run on a Dependabot PR gets one small automatic fix attempt.
+        type: boolean
+        default: true
+      regenerate-command:
+        description: One-line command that regenerates committed generated code after a bump, or empty for none.
+        type: string
+        default: ''
+      regenerate-paths:
+        description: Space-separated paths the regenerate command writes; all a regeneration may change.
+        type: string
+        default: ''
+      regenerate-env:
+        description: NAME=VALUE lines the regenerate command needs. Committed in the caller, so placeholders only, never secrets.
+        type: string
+        default: ''
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN:
         required: true
-        type: number
-  workflow_run:
-    workflows: ["CI"]
-    types: [completed]
+      DEP_STEWARD_PUSH_TOKEN:
+        required: false
 
 permissions: {}
+
+env:
+  # Who to assign when a PR needs a person (empty: nobody). The tools step
+  # checks it is a GitHub login.
+  ASSIGNEE: ${{ inputs.assignee }}
 
 jobs:
   review:
@@ -107,28 +137,15 @@ jobs:
           persist-credentials: false
 
       - name: Keep this job's scripts where the agent cannot write them
-        # Reads the gate and the lint from the checkout. Writes read-only
-        # copies outside it. Touches nothing else.
-        #
-        # The reviewer can write files (its comment draft). Its Write rule
-        # names no path, so it can write any file but Claude Code's protected
-        # ones (.git, .claude, shell rc files), pipeline scripts included.
-        # Every script this job runs once the agent has started (the lint hook
-        # before each Bash call, the gate and the lint in the deliverable
-        # assertion) would run an agent's rewrite with what its caller holds:
-        # in the hook, the Claude session's environment (GITHUB_TOKEN,
-        # CLAUDE_CODE_OAUTH_TOKEN); in a step, GITHUB_TOKEN. So they run from
-        # these copies, taken before the agent starts and read-only, and the
-        # agent has no shell to change that.
-        run: |
-          set -euo pipefail
-          # A runner that keeps its temp directory between jobs (self-hosted)
-          # can still hold the last job's read-only copies.
-          chmod -R u+w "$RUNNER_TEMP/dep-steward" 2>/dev/null || true
-          mkdir -p "$RUNNER_TEMP/dep-steward"
-          cp .github/dependabot-automerge/gate.cjs "$RUNNER_TEMP/dep-steward/gate.cjs"
-          cp .github/dependabot-automerge/review-lint.cjs "$RUNNER_TEMP/dep-steward/review-lint.cjs"
-          chmod -R a-w "$RUNNER_TEMP/dep-steward"
+        # The gate, the lint and the prompt come from the dep-steward commit
+        # the caller pins, as read-only copies outside the checkout, taken
+        # before the agent starts. The reviewer can write files (its comment
+        # draft), and every script this job runs once the agent has started
+        # would otherwise run an agent's rewrite with what its caller holds.
+        uses: raphaelcm/dep-steward/actions/tools@cf80cd516168b1fe658da12f7d65c09ecbeaeaeb
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          assignee: ${{ inputs.assignee }}
 
       - name: Load agent prompt
         id: load_prompt
@@ -157,7 +174,7 @@ jobs:
             # EVERY routine run. Logins are [A-Za-z0-9-] (EMUs add `_`) plus
             # the app/ prefix and [bot] suffix; none of `|`, `&`, `\` can
             # occur, so the replacement text is inert.
-            sed -e "s/\$PR_NUMBER/$PR_NUMBER/g" -e "s|\$PR_AUTHOR|$PR_AUTHOR|g" .github/dependabot-review-prompt.md
+            sed -e "s/\$PR_NUMBER/$PR_NUMBER/g" -e "s|\$PR_AUTHOR|$PR_AUTHOR|g" "$RUNNER_TEMP/dep-steward/review-prompt.md"
             echo 'PROMPT_EOF_8X2Y'
           } >> "$GITHUB_OUTPUT"
           # Captured BEFORE the agent runs, minus a 60s clock-skew margin: the
@@ -170,7 +187,7 @@ jobs:
         id: review
         # SHA-pinned: the moving @v1 tag silently shipped a breaking bot-gate
         # change that broke this workflow. Bump deliberately, not implicitly.
-        uses: anthropics/claude-code-action@1623c36729ac1cd5895198cded705a287de7db79 # v1.0.187
+        uses: anthropics/claude-code-action@61a9c274fa7110a66dfafc1bbbced03833eb25fe # v1.0.269
         env:
           PR_NUMBER: ${{ inputs.pr_number || github.event.pull_request.number }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -232,7 +249,7 @@ jobs:
           # step and injected as text instead. permissions.test.mjs
           # enforces this at flag granularity.
           claude_args: >-
-            --max-turns 60 --model claude-opus-4-8
+            --max-turns 60 --model ${{ inputs.model }}
             --allowedTools "Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr edit:*),Bash(gh release view:*),Bash(grep:*),Read,Grep,Glob,WebFetch,Write"
 
       - name: Diagnose the review agent (tool calls + denials + error)
@@ -302,7 +319,7 @@ jobs:
             echo "A 'gh pr diff' call was denied, and $READ_DIFF other(s) returned the diff, so the review read it."
           elif [ "$DENIED_DIFF" -gt 0 ] || [ "$DENIED_DIFF_TEXT" -gt 0 ]; then
             echo "::error::The review agent was DENIED 'gh pr diff' on PR #$PR_NUMBER — it reviewed without reading the diff, so its verdict is void."
-            gh pr edit "$PR_NUMBER" --repo "$REPO" --add-label needs-human-review --add-assignee octocat || true
+            gh pr edit "$PR_NUMBER" --repo "$REPO" --add-label needs-human-review ${ASSIGNEE:+--add-assignee "$ASSIGNEE"} || true
             exit 1
           fi
 
@@ -412,15 +429,260 @@ jobs:
               case "$AGENT_ERR" in
                 *'Invalid bearer token'*|*authentication*|*401*)
                   echo "  -> CLAUDE_CODE_OAUTH_TOKEN is invalid or expired. Re-mint it with 'claude setup-token'"
-                  echo "     and re-run the dep-steward installer (it verifies the token before storing it)." ;;
+                  echo "     and store it in both secret stores again (/dep-steward:install walks through it)." ;;
               esac
             fi
           fi
           echo "If no agent error is shown above but the PR shows a decision block from this run, it was"
           echo "posted under another identity: the review step must give its agent this job's GITHUB_TOKEN."
-          gh pr edit "$PR_NUMBER" --repo "$REPO" --add-label needs-human-review --add-assignee octocat
+          gh pr edit "$PR_NUMBER" --repo "$REPO" --add-label needs-human-review ${ASSIGNEE:+--add-assignee "$ASSIGNEE"}
           exit 1
 
+
+  regenerate:
+    # Re-runs this repo's code generator for a Dependabot bump, with the
+    # command the caller gives, and leaves what it found as an
+    # artifact of this run. No agent: regenerating is mechanical.
+    #
+    # The install and the generator are the bump's own code, so this runs
+    # where the PR's CI runs: on pull_request, with a token that can only read,
+    # no secret, and the PR's own cache scope. A workflow_run job, like
+    # autofix, runs in the default branch's cache scope, and code run there
+    # could plant a cache entry the default branch's workflows later restore.
+    # The autofix jobs only read this run's artifact, as data.
+    #
+    # Same pushers as the review job. Autofix's push made with GITHUB_TOKEN
+    # starts no run; one made with DEP_STEWARD_PUSH_TOKEN is a person's push,
+    # and regenerates again like any person's push (finding nothing to change).
+    # Only autofix reads what it leaves, so it runs only with autofix on.
+    if: >
+      inputs.autofix &&
+      inputs.regenerate-command != '' &&
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.user.login == 'dependabot[bot]' &&
+      (github.event.sender.type == 'User' || github.actor == 'dependabot[bot]')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    concurrency:
+      group: dependabot-regenerate-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
+    env:
+      # The caller's settings for this repo.
+      REGENERATE_COMMAND: ${{ inputs.regenerate-command }}
+      REGENERATE_PATHS: ${{ inputs.regenerate-paths }}
+      REGENERATE_ENV: ${{ inputs.regenerate-env }}
+    outputs:
+      changed: ${{ steps.regenerate.outputs.changed }}
+    steps:
+      - name: Check the regenerate settings, and give the command its environment
+        # Reads the caller's regenerate inputs. Writes the command's NAME=VALUE
+        # environment to GITHUB_ENV. Refuses a setting the jobs cannot carry
+        # safely, red, before any of the bump's code runs.
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::dep-steward regenerate settings: $1"; exit 1; }
+          case "$REGENERATE_COMMAND" in *$'\n'*) fail "regenerate-command must be one line" ;; esac
+          [ -n "$REGENERATE_PATHS" ] || fail "regenerate-paths needs at least one path: the files or directories the command writes, which are all a regeneration may change"
+          for p in $REGENERATE_PATHS; do
+            case "$p" in
+              ''|/*|.|..|../*|*/..|*/../*|*//*) fail "regenerate-paths $p: give a path inside the repository, relative to its root" ;;
+              .github|.github/*) fail "regenerate-paths $p: autofix never pushes under .github/" ;;
+              *[!A-Za-z0-9._/@+-]*) fail "regenerate-paths $p: only letters, digits and . _ / @ + - are supported in a path" ;;
+            esac
+          done
+          names=' '
+          while IFS= read -r kv; do
+            [ -n "$kv" ] || continue
+            n=${kv%%=*}
+            case "$kv" in *=*) : ;; *) fail "regenerate-env $kv: give NAME=VALUE" ;; esac
+            case "$n" in ''|[0-9]*|*[!A-Za-z0-9_]*) fail "regenerate-env $kv: $n is not a variable name" ;; esac
+            case "$n" in GITHUB_*|RUNNER_*|ACTIONS_*|REGENERATE_*|NODE_OPTIONS|PATH|HOME|CI|GH_TOKEN) fail "regenerate-env $n: that name belongs to the runner or to dep-steward" ;; esac
+            case "$names" in *" $n "*) fail "regenerate-env $n is given twice" ;; esac
+            names="$names$n "
+            printf '%s\n' "$kv" >> "$GITHUB_ENV"
+          done <<< "$REGENERATE_ENV"
+
+      - name: Checkout the PR head
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+
+      - name: Pick the Node version this repo declares
+        id: node
+        if: hashFiles('package.json') != ''
+        run: |
+          for f in .nvmrc .node-version .tool-versions package.json; do
+            if [ -f "$f" ]; then echo "file=$f" >> "$GITHUB_OUTPUT"; break; fi
+          done
+
+      - name: Set up Node (the version this repo declares)
+        if: hashFiles('package.json') != ''
+        uses: actions/setup-node@v7
+        with:
+          node-version-file: ${{ steps.node.outputs.file }}
+
+      - name: Install dependencies (the bump's lockfile)
+        if: hashFiles('package-lock.json', 'npm-shrinkwrap.json') != ''
+        run: npm ci
+
+      - name: Regenerate
+        id: regenerate
+        env:
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          # Reads the PR head and the generator's output. Writes the verdict
+          # files outside the checkout, and `changed`. Pushes nothing.
+          bash -euo pipefail -c "$REGENERATE_COMMAND"
+          git add -A
+          OUT="$RUNNER_TEMP/dep-steward-regenerate"
+          rm -rf "$OUT"
+          mkdir -p "$OUT"
+          printf '%s\n' "$HEAD_SHA" > "$OUT/head_sha"
+          if git diff --cached --quiet HEAD; then
+            echo unchanged > "$OUT/verdict"
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "The committed output already matches this bump: regenerating changed nothing."
+          else
+            git diff --cached --binary HEAD > "$OUT/regeneration.patch"
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            git diff --cached --stat HEAD
+          fi
+
+      - name: Leave the verdict (unchanged)
+        if: steps.regenerate.outputs.changed == 'false'
+        uses: actions/upload-artifact@v7
+        with:
+          name: dep-steward-regenerate
+          path: ${{ runner.temp }}/dep-steward-regenerate
+          retention-days: 30
+          overwrite: true
+
+      - name: Hand the regeneration to the check
+        if: steps.regenerate.outputs.changed == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: dep-steward-regenerate-candidate
+          path: ${{ runner.temp }}/dep-steward-regenerate
+          retention-days: 30
+          overwrite: true
+
+  regenerate-verify:
+    # Runs the generator again, on a fresh runner, over the PR head with the
+    # regeneration applied. It must change nothing: the tree is then the
+    # generator's own fixed point, which is what a CI sync check asks of it.
+    # Only then is the regeneration left as verified. Same trust as the job
+    # above: the bump's code runs here too, so it runs on pull_request.
+    needs: regenerate
+    if: needs.regenerate.outputs.changed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    concurrency:
+      group: dependabot-regenerate-verify-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
+    env:
+      REGENERATE_COMMAND: ${{ inputs.regenerate-command }}
+      REGENERATE_PATHS: ${{ inputs.regenerate-paths }}
+      REGENERATE_ENV: ${{ inputs.regenerate-env }}
+    steps:
+      - name: Check the regenerate settings, and give the command its environment
+        # Reads the caller's regenerate inputs. Writes the command's NAME=VALUE
+        # environment to GITHUB_ENV. Refuses a setting the jobs cannot carry
+        # safely, red, before any of the bump's code runs.
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::dep-steward regenerate settings: $1"; exit 1; }
+          case "$REGENERATE_COMMAND" in *$'\n'*) fail "regenerate-command must be one line" ;; esac
+          [ -n "$REGENERATE_PATHS" ] || fail "regenerate-paths needs at least one path: the files or directories the command writes, which are all a regeneration may change"
+          for p in $REGENERATE_PATHS; do
+            case "$p" in
+              ''|/*|.|..|../*|*/..|*/../*|*//*) fail "regenerate-paths $p: give a path inside the repository, relative to its root" ;;
+              .github|.github/*) fail "regenerate-paths $p: autofix never pushes under .github/" ;;
+              *[!A-Za-z0-9._/@+-]*) fail "regenerate-paths $p: only letters, digits and . _ / @ + - are supported in a path" ;;
+            esac
+          done
+          names=' '
+          while IFS= read -r kv; do
+            [ -n "$kv" ] || continue
+            n=${kv%%=*}
+            case "$kv" in *=*) : ;; *) fail "regenerate-env $kv: give NAME=VALUE" ;; esac
+            case "$n" in ''|[0-9]*|*[!A-Za-z0-9_]*) fail "regenerate-env $kv: $n is not a variable name" ;; esac
+            case "$n" in GITHUB_*|RUNNER_*|ACTIONS_*|REGENERATE_*|NODE_OPTIONS|PATH|HOME|CI|GH_TOKEN) fail "regenerate-env $n: that name belongs to the runner or to dep-steward" ;; esac
+            case "$names" in *" $n "*) fail "regenerate-env $n is given twice" ;; esac
+            names="$names$n "
+            printf '%s\n' "$kv" >> "$GITHUB_ENV"
+          done <<< "$REGENERATE_ENV"
+
+      - name: Checkout the PR head
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+
+      - name: Take the regeneration
+        uses: actions/download-artifact@v8
+        with:
+          name: dep-steward-regenerate-candidate
+          path: ${{ runner.temp }}/dep-steward-regenerate
+
+      - name: Apply it to the PR head
+        env:
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          OUT="$RUNNER_TEMP/dep-steward-regenerate"
+          if [ "$(cat "$OUT/head_sha")" != "$HEAD_SHA" ]; then
+            echo "::error::The regeneration was made for another commit than $HEAD_SHA."
+            exit 1
+          fi
+          git apply --index "$OUT/regeneration.patch"
+
+      - name: Pick the Node version this repo declares
+        id: node
+        if: hashFiles('package.json') != ''
+        run: |
+          for f in .nvmrc .node-version .tool-versions package.json; do
+            if [ -f "$f" ]; then echo "file=$f" >> "$GITHUB_OUTPUT"; break; fi
+          done
+
+      - name: Set up Node (the version this repo declares)
+        if: hashFiles('package.json') != ''
+        uses: actions/setup-node@v7
+        with:
+          node-version-file: ${{ steps.node.outputs.file }}
+
+      - name: Install dependencies (the bump's lockfile)
+        if: hashFiles('package-lock.json', 'npm-shrinkwrap.json') != ''
+        run: npm ci
+
+      - name: Regenerate again (it must change nothing)
+        run: |
+          set -euo pipefail
+          # Reads the regenerated tree. Writes the verdict beside the patch.
+          bash -euo pipefail -c "$REGENERATE_COMMAND"
+          OUT="$RUNNER_TEMP/dep-steward-regenerate"
+          if git diff --quiet && [ -z "$(git ls-files --others --exclude-standard)" ]; then
+            echo verified > "$OUT/verdict"
+            echo "Regenerating over the regeneration changed nothing, so it is verified."
+          else
+            echo unreproducible > "$OUT/verdict"
+            rm -f "$OUT/regeneration.patch"
+            echo "::warning::Regenerating over the regeneration changed it again, so it is not the generator's stable output:"
+            git status --short
+          fi
+
+      - name: Leave the verdict
+        uses: actions/upload-artifact@v7
+        with:
+          name: dep-steward-regenerate
+          path: ${{ runner.temp }}/dep-steward-regenerate
+          retention-days: 30
+          overwrite: true
 
   autofix:
     # Option B — when CI FAILS on a Dependabot PR, a Claude agent attempts a small
@@ -439,7 +701,7 @@ jobs:
     #      the push job re-checks that itself, with the default branch's copy;
     #   4. a human authorizes every merge, so an injected "fix" can at most land a
     #      tiny reviewed source edit on a PR branch — never on your default branch.
-    # When the installer was given a regenerate command, the fix can instead be
+    # When the caller gives a regenerate command, the fix can instead be
     # the regeneration: the repo's own generator, re-run for the bump by the
     # regenerate jobs on pull_request (where the bump's code may run). This
     # job then only reads that run's verdict, and when it is verified, no
@@ -451,12 +713,14 @@ jobs:
     # explicit: one autofix push per PR (the `attempt` step, checked again by
     # the push job).
     if: >
+      inputs.autofix &&
       github.event_name == 'workflow_run' &&
       github.event.workflow_run.event == 'pull_request' &&
       github.event.workflow_run.conclusion == 'failure' &&
       startsWith(github.event.workflow_run.head_branch, 'dependabot/')
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # The regeneration can take ten of these minutes to arrive.
+    timeout-minutes: 30
     permissions:
       # This job runs the fixer agent, so its token is what a turned fixer
       # holds: it can read and comment, and cannot push or merge. No id-token:
@@ -480,8 +744,10 @@ jobs:
       # All the push job takes from this one, and it takes none of it on trust:
       # it checks out the branch afresh, confirms it is still at base_sha,
       # applies the patch, and re-runs the default branch's bounds check.
-      decision: ${{ steps.bounds.outputs.decision }}
-      base_sha: ${{ steps.bump.outputs.base_sha }}
+      # A verified regeneration is decided by the attempt step, and the fixer
+      # steps never run.
+      decision: ${{ steps.bounds.outputs.decision || steps.attempt.outputs.decision }}
+      base_sha: ${{ steps.bump.outputs.base_sha || steps.attempt.outputs.base_sha }}
       patch: ${{ steps.bounds.outputs.patch }}
     env:
       # The fix commit's author. The push job writes it and the attempt steps
@@ -518,6 +784,17 @@ jobs:
           echo "pr_number=$PR_NUMBER" >> "$GITHUB_OUTPUT"
           echo "head_branch=$HEAD_BRANCH" >> "$GITHUB_OUTPUT"
 
+      - name: dep-steward's scripts and prompt, from this release
+        # Read-only copies outside the checkout, taken before the fixer
+        # starts; every later step runs only these. They come from the
+        # dep-steward commit the caller pins, never from the PR head.
+        id: tools
+        if: steps.pr.outputs.skip != 'true'
+        uses: raphaelcm/dep-steward/actions/tools@cf80cd516168b1fe658da12f7d65c09ecbeaeaeb
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          assignee: ${{ inputs.assignee }}
+
       - name: One autofix push per PR (refuse when dep-steward already pushed a fix here)
         id: attempt
         if: steps.pr.outputs.skip != 'true'
@@ -525,11 +802,19 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
           PR_NUMBER: ${{ steps.pr.outputs.pr_number }}
+          CI_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          REGENERATE_COMMAND: ${{ inputs.regenerate-command }}
+          REGENERATE_PATHS: ${{ inputs.regenerate-paths }}
         run: |
           set -euo pipefail
           # Reads the PR's commits. Writes `proceed`, and one escalation when it
           # refuses. Touches no code and no token; every later step runs only on
           # proceed=true.
+          #
+          # On a first attempt it also takes the PR's regeneration: verified,
+          # it writes decision=regenerate and proceed=false, so no agent runs;
+          # unreproducible, it escalates; anything else, the fixer tries.
+          . "$RUNNER_TEMP/dep-steward/regenerate-take.sh"
           #
           # ANY commit on the PR written by this job counts, not only the head:
           # a person's merge commit on top of the fix must not buy a second push.
@@ -548,10 +833,36 @@ jobs:
               "dep-steward could not read this PR's commits, so it cannot tell whether it already pushed a fix here, and it attempted nothing." \
               '' \
               'The deterministic gate will not merge a PR with a red build, so this one waits for a person.')" || true
-            gh pr edit "$PR_NUMBER" --repo "$REPO" --add-label needs-human-review --add-assignee octocat || true
+            gh pr edit "$PR_NUMBER" --repo "$REPO" --add-label needs-human-review ${ASSIGNEE:+--add-assignee "$ASSIGNEE"} || true
             exit 1
           fi
           if [ -z "$PRIOR" ]; then
+            if [ -n "$REGENERATE_COMMAND" ]; then
+            take_regeneration "$RUNNER_TEMP/dep-steward-regeneration.patch" "$CI_HEAD_SHA" 600
+            case "$REGEN_VERDICT" in
+              verified)
+                echo "The PR's regeneration (run $REGEN_RUN) is verified: it is the fix, so the fixer does not run."
+                { echo "proceed=false"; echo "decision=regenerate"; echo "base_sha=$CI_HEAD_SHA"; } >> "$GITHUB_OUTPUT"
+                exit 0 ;;
+              unreproducible)
+                echo "proceed=false" >> "$GITHUB_OUTPUT"
+                echo "::warning::Re-running \`$REGENERATE_COMMAND\` over its own output on PR #$PR_NUMBER changed it again (run $REGEN_RUN); escalating."
+                if gh pr view "$PR_NUMBER" --repo "$REPO" --json labels --jq '.labels[].name' 2>/dev/null | grep -qxF 'needs-human-review'; then
+                  echo "PR #$PR_NUMBER is already labelled needs-human-review, so not commenting again."
+                  exit 0
+                fi
+                gh pr comment "$PR_NUMBER" --repo "$REPO" --body "$(printf '%s\n' \
+                  '## CI is failing and dep-steward could not fix it' \
+                  '' \
+                  "dep-steward re-ran \`$REGENERATE_COMMAND\` for this bump, and running it again over its own output changed the output again. Output that changes from run to run is not one the repo can commit and keep in sync, so nothing was pushed. The regenerate run's log shows which files changed." \
+                  '' \
+                  'The deterministic gate will not merge a PR with a red build, so this one waits for a person.')" || true
+                gh pr edit "$PR_NUMBER" --repo "$REPO" --add-label needs-human-review ${ASSIGNEE:+--add-assignee "$ASSIGNEE"} || true
+                exit 0 ;;
+              *)
+                echo "No regeneration to push (${REGEN_VERDICT}${REGEN_WHY:+: $REGEN_WHY}), so the fixer tries." ;;
+            esac
+            fi
             echo "proceed=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -568,7 +879,7 @@ jobs:
             "dep-steward already pushed a fix to this PR (${PRIOR:0:7}), and CI is failing. Autofix makes one attempt per PR, so it will not push another." \
             '' \
             'The deterministic gate will not merge a PR with a red build, so this one waits for a person.')" || true
-          gh pr edit "$PR_NUMBER" --repo "$REPO" --add-label needs-human-review --add-assignee octocat || true
+          gh pr edit "$PR_NUMBER" --repo "$REPO" --add-label needs-human-review ${ASSIGNEE:+--add-assignee "$ASSIGNEE"} || true
 
       - name: Checkout the PR branch (the code the fixer edits)
         if: steps.attempt.outputs.proceed == 'true'
@@ -608,12 +919,10 @@ jobs:
           #
           # A runner that keeps its temp directory between jobs (self-hosted)
           # can still hold the last job's read-only copies.
-          chmod -R u+w "$RUNNER_TEMP/dep-steward" 2>/dev/null || true
-          mkdir -p "$RUNNER_TEMP/dep-steward"
+          # The prompt, bounds script and lint are already there (the tools
+          # step); this adds the bump's paths and seals the directory again.
+          chmod u+w "$RUNNER_TEMP/dep-steward"
           gh pr diff "$PR_NUMBER" --repo "$REPO" --name-only > "$RUNNER_TEMP/dep-steward/bump-paths.txt"
-          git show "$GITHUB_SHA:.github/dependabot-autofix-prompt.md" > "$RUNNER_TEMP/dep-steward/dependabot-autofix-prompt.md"
-          git show "$GITHUB_SHA:.github/dependabot-automerge/autofix-bounds.cjs" > "$RUNNER_TEMP/dep-steward/autofix-bounds.cjs"
-          git show "$GITHUB_SHA:.github/dependabot-automerge/review-lint.cjs" > "$RUNNER_TEMP/dep-steward/review-lint.cjs"
           chmod -R a-w "$RUNNER_TEMP/dep-steward"
           echo "base_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
@@ -711,7 +1020,7 @@ jobs:
                 -e "s|\$NOW_UTC|$NOW_UTC|g" \
                 -e "s|\$NOW_WEEKDAY|$NOW_WEEKDAY|g" \
                 -e "s|\$CI_COMMIT_HISTORY|$CI_COMMIT_HISTORY|g" \
-                "$RUNNER_TEMP/dep-steward/dependabot-autofix-prompt.md"
+                "$RUNNER_TEMP/dep-steward/autofix-prompt.md"
             echo 'PROMPT_EOF_9Z3Q'
           } >> "$GITHUB_OUTPUT"
 
@@ -719,7 +1028,7 @@ jobs:
         id: fixer
         if: steps.attempt.outputs.proceed == 'true'
         # SHA-pinned, same as the review job — bump deliberately, not implicitly.
-        uses: anthropics/claude-code-action@1623c36729ac1cd5895198cded705a287de7db79 # v1.0.187
+        uses: anthropics/claude-code-action@61a9c274fa7110a66dfafc1bbbced03833eb25fe # v1.0.269
         env:
           PR_NUMBER: ${{ steps.pr.outputs.pr_number }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -745,12 +1054,14 @@ jobs:
           # general Bash, so the PR's untrusted code is never executed in this
           # contents:write context — only the agent's own edits and gh metadata.
           claude_args: >-
-            --max-turns 40 --model claude-opus-4-8
+            --max-turns 40 --model ${{ inputs.model }}
             --allowedTools "Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr checks:*),Bash(gh pr edit:*),Bash(gh pr view:*),Bash(gh release view:*),Bash(gh run view:*),Bash(gh run list:*),Bash(grep:*),Read,Grep,Glob,Edit,Write,WebFetch"
 
       - name: Bounds-check the fix (decide it is pushed, or discard and escalate)
         id: bounds
-        if: ${{ !cancelled() && steps.attempt.outputs.proceed == 'true' }}
+        # Also when the tools step failed: then nothing after it ran, the
+        # build was never diagnosed, and this step is what tells a person.
+        if: ${{ !cancelled() && (steps.attempt.outputs.proceed == 'true' || steps.tools.outcome == 'failure') }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
@@ -803,7 +1114,7 @@ jobs:
                 case "$AGENT_ERR" in
                   *'Invalid bearer token'*|*authentication*|*401*)
                     echo "  -> CLAUDE_CODE_OAUTH_TOKEN is invalid or expired. Re-mint it with 'claude setup-token'."
-                    DETAIL="$DETAIL (CLAUDE_CODE_OAUTH_TOKEN looks invalid or expired — re-mint it with \`claude setup-token\` and re-run the installer.)" ;;
+                    DETAIL="$DETAIL (CLAUDE_CODE_OAUTH_TOKEN looks invalid or expired — re-mint it with \`claude setup-token\` and store it in both secret stores again.)" ;;
                 esac
               fi
             fi
@@ -828,7 +1139,7 @@ jobs:
                 "$DETAIL" \
                 '' \
                 'The deterministic gate will not merge a PR with a red build, so this one waits for a person.')" || true
-              gh pr edit "$PR_NUMBER" --repo "$REPO" --add-label needs-human-review --add-assignee octocat || true
+              gh pr edit "$PR_NUMBER" --repo "$REPO" --add-label needs-human-review ${ASSIGNEE:+--add-assignee "$ASSIGNEE"} || true
             fi
             exit 0
           fi
@@ -841,7 +1152,7 @@ jobs:
           REASON=$(echo "$OUT" | sed -n 's/^reason=//p')
           if [ "$DECISION" != "push" ]; then
             echo "Fix is out of bounds ($REASON) — discarding and escalating (the ephemeral runner is thrown away, so nothing is pushed)."
-            gh pr edit "$PR_NUMBER" --repo "$REPO" --add-label needs-human-review --add-assignee octocat
+            gh pr edit "$PR_NUMBER" --repo "$REPO" --add-label needs-human-review ${ASSIGNEE:+--add-assignee "$ASSIGNEE"}
             gh pr comment "$PR_NUMBER" --repo "$REPO" --body "dep-steward autofix drafted a change but it exceeded the safe bounds ($REASON), so it was discarded and left for a human."
             exit 0
           fi
@@ -874,13 +1185,15 @@ jobs:
     # pushed with it; without one it goes out with GITHUB_TOKEN and the PR
     # comment says how to start CI.
     needs: autofix
-    if: needs.autofix.outputs.decision == 'push'
+    if: needs.autofix.outputs.decision == 'push' || needs.autofix.outputs.decision == 'regenerate'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
       # The GITHUB_TOKEN push, and the comment and label.
       contents: write
       pull-requests: write
+      # The regeneration's artifact, which the recheck reads for itself.
+      actions: read
     env:
       # The same author as the autofix job's: keep these two lines equal.
       AUTOFIX_AUTHOR_NAME: dep-steward[bot]
@@ -923,6 +1236,13 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
+      - name: dep-steward's bounds check, from this release
+        if: steps.pr.outputs.skip != 'true'
+        uses: raphaelcm/dep-steward/actions/tools@cf80cd516168b1fe658da12f7d65c09ecbeaeaeb
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          assignee: ${{ inputs.assignee }}
+
       - name: Check the fix again, from scratch (the autofix job's output is only a claim)
         id: recheck
         if: steps.pr.outputs.skip != 'true'
@@ -932,10 +1252,13 @@ jobs:
           PR_NUMBER: ${{ steps.pr.outputs.pr_number }}
           BASE_SHA: ${{ needs.autofix.outputs.base_sha }}
           PATCH: ${{ needs.autofix.outputs.patch }}
+          DECISION: ${{ needs.autofix.outputs.decision }}
+          REGENERATE_COMMAND: ${{ inputs.regenerate-command }}
+          REGENERATE_PATHS: ${{ inputs.regenerate-paths }}
         run: |
           set -euo pipefail
           # Reads the PR's commits, the branch, the patch, and the bounds
-          # script from the commit this workflow runs from. Writes decision and
+          # script from the dep-steward release the caller pins. Writes decision and
           # reason. Touches no remote; on a refusal it labels and comments once.
           #
           # The autofix job ran an agent over attacker-influenced text, so its
@@ -951,7 +1274,7 @@ jobs:
                 "The fix drafted for this PR did not pass the check made before pushing: $1" \
                 '' \
                 'Nothing was pushed, so this PR waits for a person.')" || true
-              gh pr edit "$PR_NUMBER" --repo "$REPO" --add-label needs-human-review --add-assignee octocat || true
+              gh pr edit "$PR_NUMBER" --repo "$REPO" --add-label needs-human-review ${ASSIGNEE:+--add-assignee "$ASSIGNEE"} || true
             fi
             exit 1
           }
@@ -975,13 +1298,26 @@ jobs:
           # can still hold the autofix job's read-only copies.
           chmod -R u+w "$RUNNER_TEMP/dep-steward" 2>/dev/null || true
           mkdir -p "$RUNNER_TEMP/dep-steward"
-          git show "$GITHUB_SHA:.github/dependabot-automerge/autofix-bounds.cjs" > "$RUNNER_TEMP/dep-steward/autofix-bounds.cjs"
           printf '%s' "$PATCH" | base64 -d > "$RUNNER_TEMP/dep-steward/fix.patch"
+          . "$RUNNER_TEMP/dep-steward/regenerate-take.sh"
+          FIX_KIND=fix
+          if [ "$DECISION" = regenerate ]; then
+            # Not the autofix job's patch: the regeneration's own, read again
+            # here, and only when the PR's run verified it for exactly the
+            # commit the branch is at.
+            take_regeneration "$RUNNER_TEMP/dep-steward/fix.patch" "$HEAD_NOW" 0
+            if [ "$REGEN_VERDICT" != verified ]; then
+              refuse "there is no verified regeneration of $HEAD_NOW (${REGEN_VERDICT}${REGEN_WHY:+: $REGEN_WHY})"
+            fi
+            FIX_KIND=regenerate
+          fi
           if ! APPLY_ERR=$(git apply --index "$RUNNER_TEMP/dep-steward/fix.patch" 2>&1); then
             refuse "the patch does not apply to $BASE_SHA ($APPLY_ERR)"
           fi
           FIX_NAME_STATUS=$(git diff --cached --name-status "$BASE_SHA")
           FIX_NUMSTAT=$(git diff --cached --numstat "$BASE_SHA")
+          FIX_RAW=$(git diff --cached --raw --no-renames "$BASE_SHA")
+          export FIX_KIND FIX_RAW
           BUMP_PATHS=$(gh pr diff "$PR_NUMBER" --repo "$REPO" --name-only)
           if [ -z "$FIX_NAME_STATUS" ]; then
             refuse "the patch changes nothing"
@@ -1099,7 +1435,7 @@ jobs:
                   '```' \
                   '' \
                   'Nothing was pushed, so this PR waits for a person.')" || true
-                gh pr edit "$PR_NUMBER" --repo "$REPO" --add-label needs-human-review --add-assignee octocat || true
+                gh pr edit "$PR_NUMBER" --repo "$REPO" --add-label needs-human-review ${ASSIGNEE:+--add-assignee "$ASSIGNEE"} || true
               fi
               exit 1
               ;;

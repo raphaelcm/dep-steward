@@ -1,5 +1,5 @@
 import { spawn } from 'node:child_process';
-import { mkdtempSync, writeFileSync, readFileSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -240,6 +240,14 @@ export function evaluate(expression, ctx) {
       : String(s ?? '').toLowerCase().includes(String(x ?? '').toLowerCase())),
     // GitHub's format(): `{N}` is the Nth argument as text, `{{` and `}}` are
     // literal braces.
+    toJSON: (v) => JSON.stringify(v ?? null, null, 2),
+    fromJSON: (v) => JSON.parse(String(v)),
+    // hashFiles(): '' when no file in the workspace matches, else a digest.
+    // Literal paths only (no globs), which is all the workflows pass.
+    hashFiles: (...paths) => {
+      const hits = paths.filter((f) => ctx.cwd && existsSync(join(ctx.cwd, String(f))));
+      return hits.length ? `sim-${hits.join(',')}` : '';
+    },
     format: (fmt, ...args) => String(fmt).replace(/\{\{|\}\}|\{(\d+)\}/g, (m, n) => {
       if (m === '{{') return '{';
       if (m === '}}') return '}';
@@ -398,16 +406,23 @@ const STEP_KEYS = new Set(['name', 'id', 'if', 'uses', 'with', 'env', 'run', 'co
  * skipped steps, on the exact env a step was given, and on the job result,
  * plus the job's `outputs:` evaluated after its steps ran.
  */
-export async function runJob(jobs, jobName, { github, secrets = {}, uses = {}, cwd, env = process.env, needs = {} }) {
+export async function runJob(jobs, jobName, { github, secrets = {}, uses = {}, cwd, env = process.env, needs = {}, inputs = {}, workflowEnv = {} }) {
   const job = jobs[jobName];
   if (!job) throw new Error(`no job "${jobName}"`);
   const scratch = mkdtempSync(join(tmpdir(), 'ds-sim-'));
   // `runner.temp` is the runner's temp directory, which a step sees as RUNNER_TEMP.
   const runner = { temp: env.RUNNER_TEMP ?? '', os: 'Linux' };
-  const ctx = { github, secrets, env: {}, steps: {}, inputs: {}, vars: {}, job: {}, runner, needs, jobFailed: false };
+  const ctx = { github, secrets, env: {}, steps: {}, inputs, vars: {}, job: {}, runner, needs, jobFailed: false, cwd };
+  // `env:` at the top of the workflow, then the job's own (a reusable
+  // workflow's `inputs` are visible to both).
+  for (const [k, v] of Object.entries(workflowEnv)) ctx.env[k] = interpolate(v, ctx);
 
   if (!conditionHolds(job.if, ctx)) return { skipped: true, steps: [], failed: false, jobEnv: {}, outputs: {} };
   for (const [k, v] of Object.entries(job.env ?? {})) ctx.env[k] = interpolate(v, ctx);
+  // What a step appends to GITHUB_ENV is in the environment of every later
+  // step, as on a runner.
+  const githubEnvFile = join(scratch, 'github_env');
+  writeFileSync(githubEnvFile, '');
 
   const steps = [];
   let n = 0;
@@ -442,7 +457,7 @@ export async function runJob(jobs, jobName, { github, secrets = {}, uses = {}, c
         env: {
           ...env,
           GITHUB_OUTPUT: outFile,
-          GITHUB_ENV: join(scratch, 'github_env'),
+          GITHUB_ENV: githubEnvFile,
           GITHUB_WORKSPACE: cwd,
           GITHUB_REPOSITORY: github.repository,
           GITHUB_EVENT_NAME: github.event_name,
@@ -461,11 +476,14 @@ export async function runJob(jobs, jobName, { github, secrets = {}, uses = {}, c
       const handler = uses[action];
       if (!handler) throw new Error(`step "${step.name}": no handler for uses: ${step.uses}`);
       for (const [k, v] of Object.entries(step.with ?? {})) record.with[k] = interpolate(v, stepCtx);
-      const res = await handler({ with: record.with, env: stepCtx.env, cwd });
+      const res = await handler({ with: record.with, env: { ...env, ...stepCtx.env }, cwd });
       exitCode = res.exitCode ?? 0;
       outputs = res.outputs ?? {};
       record.output = res.output ?? '';
+      Object.assign(ctx.env, res.env ?? {});
     }
+    Object.assign(ctx.env, parseStepOutputs(readFileSync(githubEnvFile, 'utf8')));
+    writeFileSync(githubEnvFile, '');
 
     const outcome = exitCode === 0 ? 'success' : 'failure';
     const continueOnError = truthy(evaluate(String(step['continue-on-error'] ?? 'false'), ctx));

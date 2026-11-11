@@ -39,13 +39,11 @@ test('every asset the page references resolves on disk', () => {
   }
 });
 
-test('the install one-liner is byte-identical to the README’s', () => {
-  const readme = readFileSync(join(REPO, 'README.md'), 'utf8');
-  const cmd = readme.match(/^sh -c "\$\(curl -fsSL [^\n]*install\.sh\)"$/m)?.[0];
-  assert.ok(cmd, 'README must contain the canonical curl install line');
-  assert.ok(html.includes(cmd), 'the page must carry the README’s install command verbatim — one canonical line, not two drifting copies');
-  const copies = [...html.matchAll(/data-copy='([^']+)'/g)].map((m) => m[1]).filter((c) => c.includes('install.sh'));
-  assert.ok(copies.length >= 1 && copies.every((c) => c === cmd), 'every copy button for the installer must copy exactly the README’s command');
+test('the page offers no shell installer: the plugin is the only install', () => {
+  // dep-steward installs through /dep-steward:install. A curl line on the page
+  // would send a stranger to a script that no longer exists.
+  assert.doesNotMatch(html, /curl -fsSL|install\.sh/, 'the page must not offer a shell installer');
+  assert.ok(text.includes('/dep-steward:install'), 'the page names the install command');
 });
 
 test('the commands the page advertises are the skills that exist', () => {

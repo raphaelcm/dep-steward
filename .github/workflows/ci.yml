@@ -13,13 +13,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # test/release-pin.test.mjs compares the pinned commits with this tree.
+          fetch-depth: 0
       - uses: actions/setup-node@v4
         with:
           node-version: '24'
-      - name: Shellcheck the installer
-        run: shellcheck -s sh install.sh plugin/install.sh
-      # Adopters lint the workflow this repo renders, so the tests lint it too
-      # (test/actionlint.test.mjs). Checksummed by the Go module proxy.
+      # Adopters run the reusable workflows this repo ships, so the tests lint
+      # them, and the caller templates (test/actionlint.test.mjs). Checksummed
+      # by the Go module proxy.
       - uses: actions/setup-go@v5
         with:
           go-version: stable
@@ -27,7 +29,7 @@ jobs:
         run: |
           go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
           echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
-      - name: Run tests (gate logic, render parity, installer wiring, actionlint)
+      - name: Run tests (gate logic, workflows, plugin policy, actionlint)
         env:
           REQUIRE_ACTIONLINT: '1'
         run: node --test test/*.test.mjs

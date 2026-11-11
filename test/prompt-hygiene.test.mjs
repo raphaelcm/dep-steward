@@ -1,10 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, writeFileSync, readFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join, dirname } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { join } from 'node:path';
+import { TOOLS_DIR, REFERENCE_ROOT_FILES } from './lib/dep-steward.mjs';
 
 /**
  * What the reviewer is given to think about.
@@ -32,8 +30,8 @@ import { fileURLToPath } from 'node:url';
  * So the rule this file locks is not a prohibition — a prohibition is a
  * mention, and naming the behaviour is what invites it. The prompt simply does
  * not talk about CI, in any form, and the gate's conditions are described as
- * the gate's own. The assertion below is over the RENDERED prompt, which is
- * what an adopter ships.
+ * the gate's own. The assertion below is over the FILLED prompt, which is
+ * what the agent reads.
  *
  * Note the complementary guard already in permissions.test.mjs: assertion #3
  * fails on any `gh <verb>` the prompt names that the allow-list lacks, and #10
@@ -42,23 +40,12 @@ import { fileURLToPath } from 'node:url';
  * matter of care.
  */
 
-const REPO = dirname(dirname(fileURLToPath(import.meta.url)));
-const REFERENCE_MANIFESTS = ['package.json', 'package-lock.json', 'requirements.txt', 'Cargo.toml', 'go.mod', 'Dockerfile'];
-
-function renderReference() {
-  const fakeRepo = mkdtempSync(join(tmpdir(), 'ds-hyg-repo-'));
-  for (const m of REFERENCE_MANIFESTS) writeFileSync(join(fakeRepo, m), '\n');
-  const out = mkdtempSync(join(tmpdir(), 'ds-hyg-out-'));
-  execFileSync(
-    'sh',
-    [join(REPO, 'plugin', 'install.sh'), '--render-only', '--out', out, '--ci-name', 'CI', '--assignee', 'octocat'],
-    { cwd: fakeRepo, env: { ...process.env, DEP_STEWARD_SRC: join(REPO, 'plugin') }, stdio: 'pipe' },
-  );
-  return out;
-}
-
-const rendered = renderReference();
-const PROMPT = readFileSync(join(rendered, '.github/dependabot-review-prompt.md'), 'utf8');
+// The prompt as the tools action fills it for a run (render-prompt.cjs, from
+// the default branch's root files and the assignee): what the agent reads.
+const PROMPT = execFileSync('node', [join(TOOLS_DIR, 'render-prompt.cjs'), join(TOOLS_DIR, 'review-prompt.md')], {
+  env: { ...process.env, ROOT_FILES: REFERENCE_ROOT_FILES.join('\n'), ASSIGNEE: 'octocat' },
+  encoding: 'utf8',
+});
 
 // Every way the old prompt (and the leaked comments) talked about CI. A bare
 // /\bchecks?\b/ is deliberately absent: the output template's "**Usage
@@ -81,7 +68,7 @@ const CI_VOCABULARY = [
   /\bpipeline\b/i,
 ];
 
-test('the rendered review prompt never raises CI as something to consider', () => {
+test('the filled review prompt never raises CI as something to consider', () => {
   const hits = CI_VOCABULARY.filter((re) => re.test(PROMPT)).map((re) => {
     const m = re.exec(PROMPT);
     const at = PROMPT.slice(Math.max(0, m.index - 60), m.index + 60).replace(/\n/g, ' ');
@@ -127,4 +114,12 @@ test('the prompt states the evidence set the lint enforces', () => {
   // the agent is refused without being told the rule.
   assert.match(PROMPT, /Your evidence/);
   assert.match(PROMPT, /the PR diff, the upstream changelog \/ release notes for the bumped range, and this repository's source/);
+});
+
+test('every install-time placeholder in the prompt is filled', () => {
+  // render-prompt.cjs fills them when the job runs; one left over would reach
+  // the agent as literal text.
+  assert.doesNotMatch(PROMPT, /__[A-Z_]+__/);
+  assert.match(PROMPT, /npm, pip, cargo, gomod, docker, github-actions/);
+  assert.match(PROMPT, /--add-label needs-human-review --add-assignee octocat/);
 });

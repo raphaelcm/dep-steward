@@ -1,11 +1,9 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { execFileSync } from 'node:child_process';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, dirname } from 'node:path';
-import { fileURLToPath } from 'node:url';
-import { parseJobs, runJob } from './lib/actions-sim.mjs';
+import { join } from 'node:path';
+import { runShippedJob } from './lib/dep-steward.mjs';
 
 /**
  * A review is void only when it never read the diff.
@@ -15,37 +13,12 @@ import { parseJobs, runJob } from './lib/actions-sim.mjs';
  * looks like a verdict. An agent that read the diff with a plain `gh pr diff`
  * and then tried a compound command its allowlist does not cover
  * (`gh pr diff 3034 > /tmp/d; wc -l /tmp/d`) has read it, and its verdict
- * stands. This file runs the rendered review job with a reviewer whose
+ * stands. This file runs the shipped review job with a reviewer whose
  * execution log holds each of those shapes and checks which ones fail.
  */
 
-const REPO = dirname(dirname(fileURLToPath(import.meta.url)));
-const REFERENCE_MANIFESTS = ['package.json', 'package-lock.json', 'requirements.txt', 'Cargo.toml', 'go.mod', 'Dockerfile'];
 const DIAGNOSE = 'Diagnose the review agent (tool calls + denials + error)';
 
-function render() {
-  const fakeRepo = mkdtempSync(join(tmpdir(), 'ds-rd-repo-'));
-  for (const m of REFERENCE_MANIFESTS) writeFileSync(join(fakeRepo, m), '\n');
-  const out = mkdtempSync(join(tmpdir(), 'ds-rd-out-'));
-  execFileSync(
-    'sh',
-    [join(REPO, 'plugin', 'install.sh'), '--render-only', '--out', out, '--ci-name', 'CI', '--assignee', 'octocat'],
-    { cwd: fakeRepo, env: { ...process.env, DEP_STEWARD_SRC: join(REPO, 'plugin') }, stdio: 'pipe' },
-  );
-  return out;
-}
-
-const RENDERED = render();
-const JOBS = parseJobs(readFileSync(join(RENDERED, '.github/workflows/dependabot-review.yml'), 'utf8'));
-const PIPELINE_FILES = [
-  '.github/dependabot-review-prompt.md',
-  '.github/dependabot-automerge/gate.cjs',
-  '.github/dependabot-automerge/review-lint.cjs',
-];
-
-// Every gh call is logged. The prompt step reads the PR's author, and `gh pr
-// edit` (the label the step adds on a void review) succeeds; anything else
-// fails, which no step before the one under test needs.
 const GH_STUB = `#!/usr/bin/env bash
 printf '%s\\n' "$*" >> "$GH_LOG"
 case "$1 $2" in
@@ -91,10 +64,6 @@ async function runReview(calls) {
   const bin = join(root, 'bin');
   const runnerTemp = join(root, 'runner-temp');
   for (const d of [work, bin, runnerTemp]) mkdirSync(d, { recursive: true });
-  for (const f of PIPELINE_FILES) {
-    mkdirSync(dirname(join(work, f)), { recursive: true });
-    writeFileSync(join(work, f), readFileSync(join(RENDERED, f)));
-  }
   writeFileSync(join(bin, 'gh'), GH_STUB, { mode: 0o755 });
   writeFileSync(join(bin, 'date'), DATE_STUB, { mode: 0o755 });
   const ghLog = join(root, 'gh.log');
@@ -102,7 +71,8 @@ async function runReview(calls) {
   const execFile = join(root, 'claude-execution-output.json');
   writeFileSync(execFile, JSON.stringify(executionLog(calls)));
 
-  const result = await runJob(JOBS, 'review', {
+  const result = await runShippedJob('review', 'review', {
+    inputs: { assignee: 'octocat' },
     github: {
       event_name: 'pull_request',
       repository: 'octocat/repo',
@@ -143,6 +113,8 @@ test('a review whose every `gh pr diff` was denied is void, and goes to a person
   assert.equal(step.status, 'failure', step.output);
   assert.match(step.output, /::error::The review agent was DENIED 'gh pr diff' on PR #1/);
   assert.equal(ghCalls.filter((c) => c.startsWith('pr edit 1') && c.includes('needs-human-review')).length, 1, ghCalls.join('\n'));
+  // The assignee input reaches the escalation as its own argument.
+  assert.ok(ghCalls.some((c) => c.startsWith('pr edit 1') && c.endsWith('--add-label needs-human-review --add-assignee octocat')), ghCalls.join('\n'));
 });
 
 test('a review with no denial passes', async () => {

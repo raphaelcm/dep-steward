@@ -1,4 +1,4 @@
-name: Dependabot auto-merge
+name: dep-steward auto-merge
 
 # The deterministic gate, and the only part of dep-steward that can merge. It
 # runs no agent. The agents read attacker-influenced text (a dependency's
@@ -14,8 +14,9 @@ name: Dependabot auto-merge
 # waking twice is harmless: only the wake where both are present can return
 # `decision=merge`. Both arrive as workflow_run, which runs in the default
 # branch's context (secrets present, token writable), the only context where a
-# Dependabot PR can be merged. The job checks out the DEFAULT branch, never the
-# PR head, and runs no PR code: only `gh` metadata and the gate.
+# Dependabot PR can be merged. The job checks out nothing and runs no PR code:
+# only `gh` metadata and the gate, taken from the dep-steward commit the
+# caller pins.
 #
 # For group PRs it merges with ZERO LLM input when CI is green, the author is
 # Dependabot, Dependabot itself pushed the commit being merged, the PR is open,
@@ -36,10 +37,25 @@ name: Dependabot auto-merge
 # escalated (label + assignee + comment + red job), because a merge that fails
 # silently is indistinguishable from one that never ran.
 
+# A reusable workflow. The adopting repo's .github/workflows/
+# dependabot-automerge.yml calls it at a pinned commit of dep-steward, from its
+# own `on: workflow_run` of CI and of "Dependabot PR review" (a trigger only
+# the caller can hold), so every `github.event` below is that caller's event.
 on:
-  workflow_run:
-    workflows: ["CI", "Dependabot PR review"]
-    types: [completed]
+  workflow_call:
+    inputs:
+      ci-name:
+        description: The exact `name:` of the CI workflow whose result the gate requires.
+        type: string
+        required: true
+      assignee:
+        description: GitHub login to assign when a PR needs a person, or empty for nobody.
+        type: string
+        default: ''
+      autofix:
+        description: Whether the review workflow runs autofix (which then owns red-CI escalation).
+        type: boolean
+        default: true
 
 permissions: {}
 
@@ -123,6 +139,12 @@ jobs:
       pull-requests: write
       checks: read
       actions: read
+    env:
+      # The assignee (empty: nobody), checked as a GitHub login by the tools
+      # step, and the codes that page a person, computed by expression so the
+      # script sees only the taken branch.
+      ASSIGNEE: ${{ inputs.assignee }}
+      ESCALATABLE_CODES: ${{ inputs.autofix && 'paths_not_whitelisted|verdict_malformed|head_pushed_by_other|dep_steward_upgrade' || 'paths_not_whitelisted|verdict_malformed|head_pushed_by_other|dep_steward_upgrade|ci_failed' }}
     concurrency:
       # One run per PR at a time, whatever woke it. Not the waking run's
       # branch: a replay runs on the default branch, so every replay would
@@ -130,12 +152,14 @@ jobs:
       group: dependabot-automerge-${{ needs.resolve.outputs.pr_number }}
       cancel-in-progress: false
     steps:
-      - name: Checkout default branch (never the PR head)
-        # workflow_run has no PR ref; the default checkout is the
-        # repo default branch. This is intentional and a security property —
-        # the gate script that authorizes the merge must be main's version,
-        # not the PR's.
-        uses: actions/checkout@v7
+      - name: dep-steward's gate, from this release (never the PR's)
+        # The gate that authorizes the merge comes from the dep-steward commit
+        # the caller pins, never from the repo or the PR. No checkout: the job
+        # runs no repo code, only `gh` metadata and the gate.
+        uses: raphaelcm/dep-steward/actions/tools@cf80cd516168b1fe658da12f7d65c09ecbeaeaeb
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          assignee: ${{ inputs.assignee }}
 
       - name: Resolve CI conclusion (re-query — trigger payload may be stale)
         id: ci
@@ -143,18 +167,22 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
           PR_NUMBER: ${{ needs.resolve.outputs.pr_number }}
+          CI_NAME: ${{ inputs.ci-name }}
         run: |
           set -euo pipefail
+          # An unfilled placeholder would read as "CI never finished" on every
+          # wake, forever, and nothing would ever merge. Red instead.
+          case "$CI_NAME" in ''|__*__) echo "::error::ci-name is '$CI_NAME': set it to the exact name: of your CI workflow in .github/workflows/dependabot-automerge.yml"; exit 1 ;; esac
           # Query the latest CI workflow run for this PR's head SHA. The gate
           # needs the current state, not the (possibly older) trigger payload.
           HEAD_SHA=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json headRefOid --jq '.headRefOid')
-          CI_CONCLUSION=$(gh run list --repo "$REPO" --workflow CI --commit "$HEAD_SHA" \
+          CI_CONCLUSION=$(gh run list --repo "$REPO" --workflow "$CI_NAME" --commit "$HEAD_SHA" \
             --limit 1 --json conclusion --jq '.[0].conclusion // "pending"')
           # Who pushed that commit: the actor of the first CI run GitHub created
           # for it. The push itself creates that run; a reopen or a re-run comes
           # later and names whoever clicked. Empty when it cannot be read, which
           # the gate refuses rather than guesses.
-          FIRST_RUN=$(gh run list --repo "$REPO" --workflow CI --commit "$HEAD_SHA" \
+          FIRST_RUN=$(gh run list --repo "$REPO" --workflow "$CI_NAME" --commit "$HEAD_SHA" \
             --limit 100 --json databaseId,createdAt --jq 'sort_by(.createdAt) | .[0].databaseId // empty' 2>/dev/null || true)
           HEAD_PUSHER=''
           if [ -n "$FIRST_RUN" ]; then
@@ -298,7 +326,7 @@ jobs:
 
           export HEAD_BRANCH CI_CONCLUSION PR_AUTHOR PR_STATE CHANGED_PATHS PR_COMMENTS_JSON
           export HEAD_SHA PR_HEAD_SHA HEAD_PUSHER ALLOWED_MERGE_METHODS
-          GATE_OUT=$(node .github/dependabot-automerge/gate.cjs)
+          GATE_OUT=$(node "$RUNNER_TEMP/dep-steward/gate.cjs")
           echo "$GATE_OUT"
           DECISION=$(echo "$GATE_OUT" | sed -n 's/^decision=//p')
           REASON=$(echo "$GATE_OUT" | sed -n 's/^reason=//p')
@@ -316,7 +344,7 @@ jobs:
           # "dep-steward broke" and "dep-steward is correctly stuck".
           notify_human() { # $1 = markdown body
             gh pr comment "$PR_NUMBER" --repo "$REPO" --body "$1" || true
-            gh pr edit "$PR_NUMBER" --repo "$REPO" --add-label needs-human-review --add-assignee octocat || true
+            gh pr edit "$PR_NUMBER" --repo "$REPO" --add-label needs-human-review ${ASSIGNEE:+--add-assignee "$ASSIGNEE"} || true
           }
 
           if [ "$DECISION" != "merge" ]; then
@@ -386,9 +414,16 @@ jobs:
             #   head_pusher_unknown
             #                      a read that failed; the next wake reads again
             #
-            # ci_failed is absent: the autofix job owns it. It wakes on this same event and escalates itself when it cannot fix the build.
-            case "$CODE" in
-              paths_not_whitelisted|verdict_malformed|head_pushed_by_other)
+            #   ci_failed belongs to exactly ONE owner. When CI goes red, the
+            #                      autofix job and this gate wake from the SAME
+            #                      workflow_run event and run in parallel, so if both
+            #                      could escalate you would be paged about a red build
+            #                      the fixer is already fixing. With autofix on,
+            #                      autofix owns it; with it off, nothing else is
+            #                      watching CI, so the gate does. ESCALATABLE_CODES
+            #                      arrives with only the taken branch.
+            case "|$ESCALATABLE_CODES|" in
+              *"|$CODE|"*)
                 # Fires once per PR, not once per wake: this job runs on every CI
                 # and every review completion, so without the label check a
                 # stuck PR would collect a comment each time.

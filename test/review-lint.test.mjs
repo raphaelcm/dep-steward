@@ -33,7 +33,7 @@ import { fileURLToPath } from 'node:url';
  */
 
 const REPO = dirname(dirname(fileURLToPath(import.meta.url)));
-const LINT = join(REPO, 'plugin', 'templates', 'review-lint.cjs');
+const LINT = join(REPO, 'actions', 'tools', 'review-lint.cjs');
 
 // ---- body mode ------------------------------------------------------------
 

@@ -1,19 +1,20 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, dirname } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { join } from 'node:path';
+import { parseJobs, interpolate } from './lib/actions-sim.mjs';
+import { TOOLS_DIR, workflowText, callerText, toolText, toolsHandler, inputDefaults, topLevelEnv } from './lib/dep-steward.mjs';
 
 /**
- * The shell dep-steward GENERATES must parse.
+ * The shell dep-steward SHIPS must parse.
  *
- * The failure this locks: a `run:` block in the rendered workflow with a shell
- * syntax error. CI shellchecks `install.sh` and the unit tests exercise
- * `gate.cjs`, but nothing ever parsed the shell those two conspire to produce —
- * so an unbalanced quote in a template was invisible to a fully green suite and
- * would only surface as a dead pipeline in an adopter's repo.
+ * The failure this locks: a `run:` block in a shipped workflow with a shell
+ * syntax error. The unit tests exercise `gate.cjs`, but nothing else parses
+ * the shell in the reusable workflows — so an unbalanced quote there would be
+ * invisible to a fully green suite and would only surface as a dead pipeline
+ * in every adopter's repo at once.
  *
  * It is not a subtle failure mode. The auto-merge step is one `run:` block; a
  * syntax error anywhere in it kills the whole step, so NO PR merges, ever. That
@@ -36,23 +37,46 @@ import { fileURLToPath } from 'node:url';
  * code runs under, or it reports on a language nobody is writing.
  */
 
-const REPO = dirname(dirname(fileURLToPath(import.meta.url)));
-const REFERENCE_MANIFESTS = ['package.json', 'package-lock.json', 'requirements.txt', 'Cargo.toml', 'go.mod', 'Dockerfile'];
+// Every file with shell dep-steward ships: the three reusable workflows, the
+// tools action, and the caller templates the plugin installs (which hold no
+// run blocks today; they are parsed so one added later is covered).
+const SHIPPED = {
+  'review.yml': workflowText('review'),
+  'automerge.yml': workflowText('automerge'),
+  'seal-ci-secrets.yml': workflowText('seal'),
+  'actions/tools/action.yml': toolText('action.yml'),
+  'templates/dependabot-review.yml': callerText('review'),
+  'templates/dependabot-automerge.yml': callerText('automerge'),
+  'templates/dependabot-seal.yml': callerText('seal'),
+};
 
-function render(extraArgs = []) {
-  const fakeRepo = mkdtempSync(join(tmpdir(), 'ds-sh-repo-'));
-  for (const m of REFERENCE_MANIFESTS) writeFileSync(join(fakeRepo, m), '\n');
-  const out = mkdtempSync(join(tmpdir(), 'ds-sh-out-'));
-  execFileSync(
-    'sh',
-    [join(REPO, 'plugin', 'install.sh'), '--render-only', '--out', out, '--ci-name', 'CI', '--assignee', 'octocat', ...extraArgs],
-    { cwd: fakeRepo, env: { ...process.env, DEP_STEWARD_SRC: join(REPO, 'plugin') }, stdio: 'pipe' },
-  );
-  // Both workflows the installer writes; their run blocks are parsed alike.
-  return ['dependabot-review.yml', 'dependabot-automerge.yml']
-    .map((f) => readFileSync(join(out, '.github/workflows', f), 'utf8'))
-    .join('\n');
+// The reference adopter's settings: the caller template's values, with the
+// assignee every escalation assertion below expects.
+const REFERENCE_INPUTS = { 'ci-name': 'CI', assignee: 'octocat', autofix: true };
+
+// The environment a step of `job` sees from the workflow's and the job's
+// `env:` blocks, evaluated for the reference inputs (ASSIGNEE,
+// ESCALATABLE_CODES): before, the installer rendered these into the script
+// text; now the expressions do, so they are evaluated here, not hand-copied.
+function shippedEnv(workflowName, jobName, inputs = {}) {
+  const text = workflowText(workflowName);
+  const ctx = { github: {}, secrets: {}, env: {}, steps: {}, vars: {}, job: {}, runner: {}, needs: {}, inputs: { ...inputDefaults(text), ...REFERENCE_INPUTS, ...inputs } };
+  for (const [k, v] of Object.entries(topLevelEnv(text))) ctx.env[k] = String(interpolate(v, ctx));
+  for (const [k, v] of Object.entries(parseJobs(text)[jobName].env ?? {})) ctx.env[k] = String(interpolate(v, ctx));
+  return ctx.env;
 }
+
+// What the tools step leaves for later steps: read-only copies of the scripts
+// and the filled prompts in RUNNER_TEMP/dep-steward, and ROOT_FILES. Run the
+// way the jobs run it, before the step under test.
+// Every step under test only reads them, so one copy serves the file.
+async function toolsReady() {
+  const runnerTemp = mkdtempSync(join(tmpdir(), 'ds-rt-'));
+  const res = await toolsHandler()({ with: { assignee: 'octocat' }, env: { RUNNER_TEMP: runnerTemp } });
+  return { RUNNER_TEMP: runnerTemp, ...res.env };
+}
+const TOOLS = await toolsReady();
+const WORKDIR = mkdtempSync(join(tmpdir(), 'ds-work-'));
 
 // Pull every `run: |` block out of the workflow, with the step name that owns it
 // so a failure says WHICH step is broken. Line-oriented on purpose: the project
@@ -101,24 +125,33 @@ function parses(script) {
   }
 }
 
-for (const [variant, args] of [['default', []], ['--no-autofix', ['--no-autofix']], ['--regenerate', ['--regenerate', 'npm run db:generate', '--regenerate-path', 'src/generated/prisma', '--regenerate-env', 'DATABASE_URL=postgresql://runsense:runsense@localhost:5432/runsense']]]) {
-  const workflow = render(args);
-  const blocks = runBlocks(workflow);
+// One shipped tree, not installer variants: autofix and regeneration are
+// switched by inputs at run time, so every block they could run is in it.
+const blocks = Object.entries(SHIPPED).flatMap(([file, text]) => runBlocks(text).map((b) => ({ file, ...b })));
 
-  test(`${variant}: the extractor finds every run block (a silent zero makes the rest vacuous)`, () => {
-    // If this ever finds nothing, every assertion below passes for free — which
-    // is precisely the shape of test that lets a real defect through.
-    assert.ok(blocks.length >= 5, `expected several run blocks, found ${blocks.length}`);
-    assert.ok(blocks.every((b) => b.script.trim().length > 0), 'an empty block means the extractor is broken');
-  });
-
-  for (const { stepName, script } of blocks) {
-    test(`${variant}: shell parses — ${stepName}`, () => {
-      const { ok, err } = parses(script);
-      assert.ok(ok, `\`${stepName}\` does not parse under bash:\n${err}`);
-    });
+test('the extractor finds every run block (a silent zero makes the rest vacuous)', () => {
+  // If this ever finds nothing, every assertion below passes for free — which
+  // is precisely the shape of test that lets a real defect through.
+  for (const f of ['review.yml', 'automerge.yml', 'seal-ci-secrets.yml', 'actions/tools/action.yml']) {
+    assert.ok(blocks.some((b) => b.file === f), `no run block found in ${f}`);
   }
+  assert.ok(blocks.length >= 5, `expected several run blocks, found ${blocks.length}`);
+  assert.ok(blocks.every((b) => b.script.trim().length > 0), 'an empty block means the extractor is broken');
+});
+
+for (const { file, stepName, script } of blocks) {
+  test(`${file}: shell parses — ${stepName}`, () => {
+    const { ok, err } = parses(script);
+    assert.ok(ok, `\`${stepName}\` in ${file} does not parse under bash:\n${err}`);
+  });
 }
+
+// The regeneration hand-off is a file the autofix jobs source; before, it was
+// inlined into a run block and parsed with it.
+test('actions/tools/regenerate-take.sh parses', () => {
+  const { ok, err } = parses(readFileSync(join(TOOLS_DIR, 'regenerate-take.sh'), 'utf8'));
+  assert.ok(ok, `regenerate-take.sh does not parse under bash:\n${err}`);
+});
 
 // ---- the merge-method fallback, EXECUTED ------------------------------------
 //
@@ -127,21 +160,9 @@ for (const [variant, args] of [['default', []], ['--no-autofix', ['--no-autofix'
 // real repo whose restrictions are readable — there the first ranked method just
 // works, and the fallback never fires. So it is exercised here against a `gh`
 // that refuses exactly the way GitHub did on Runsense-ai/runsense#2333, with the
-// REAL rendered gate and the REAL generated shell in between.
+// REAL shipped gate and the REAL shipped shell in between.
 //
 // Without this, the fallback ships unproven.
-
-function renderTo() {
-  const fakeRepo = mkdtempSync(join(tmpdir(), 'ds-run-repo-'));
-  for (const m of REFERENCE_MANIFESTS) writeFileSync(join(fakeRepo, m), '\n');
-  const out = mkdtempSync(join(tmpdir(), 'ds-run-out-'));
-  execFileSync(
-    'sh',
-    [join(REPO, 'plugin', 'install.sh'), '--render-only', '--out', out, '--ci-name', 'CI', '--assignee', 'octocat'],
-    { cwd: fakeRepo, env: { ...process.env, DEP_STEWARD_SRC: join(REPO, 'plugin') }, stdio: 'pipe' },
-  );
-  return out;
-}
 
 // GitHub's two comment surfaces, rendered from one list of comments the way
 // GitHub renders them. Measured on Runsense-ai/runsense#2807 with gh 2.96.0 and
@@ -208,8 +229,7 @@ esac
 const GATE_HEAD = '9ee40cf2a1b3c4d5e6f708192a3b4c5d6e7f8091';
 
 function runGateStep({ acceptMethods, allowedMergeMethods, headPusher = 'dependabot[bot]', prHeadSha = GATE_HEAD, armedBy = 'none', headBranch = 'dependabot/github_actions/actions-minor-patch-a', changedPaths, comments = [] }) {
-  const out = renderTo();
-  const workflow = readFileSync(join(out, '.github/workflows/dependabot-automerge.yml'), 'utf8');
+  const workflow = workflowText('automerge');
   const block = runBlocks(workflow).find((b) => b.stepName === 'Deterministic auto-merge gate');
   assert.ok(block, 'the auto-merge gate step must exist — the rest of this test is vacuous without it');
 
@@ -225,11 +245,13 @@ function runGateStep({ acceptMethods, allowedMergeMethods, headPusher = 'dependa
   let stdout = '';
   try {
     stdout = execFileSync('bash', ['-e', script], {
-      cwd: out,
+      cwd: WORKDIR,
       encoding: 'utf8',
       stdio: 'pipe',
       env: {
         ...process.env,
+        ...TOOLS,
+        ...shippedEnv('automerge', 'auto-merge'),
         PATH: `${bin}:${process.env.PATH}`,
         GH_LOG: ghLog,
         ACCEPT_METHODS: acceptMethods,
@@ -381,8 +403,7 @@ echo "gh stub: unexpected call: $*" >&2; exit 1
 `;
 
 function runResolveCiStep(runs) {
-  const out = renderTo();
-  const workflow = readFileSync(join(out, '.github/workflows/dependabot-automerge.yml'), 'utf8');
+  const workflow = workflowText('automerge');
   const block = runBlocks(workflow).find((b) => b.stepName.startsWith('Resolve CI conclusion'));
   assert.ok(block, 'the CI-resolve step must exist');
   const bin = mkdtempSync(join(tmpdir(), 'ds-ci-'));
@@ -394,15 +415,18 @@ function runResolveCiStep(runs) {
   const script = join(bin, 'step.sh');
   writeFileSync(script, stripActionsExpressions(block.script));
   const stdout = execFileSync('bash', ['-e', script], {
-    cwd: out,
+    cwd: WORKDIR,
     encoding: 'utf8',
     env: {
       ...process.env,
+      ...shippedEnv('automerge', 'auto-merge'),
       PATH: `${bin}:${process.env.PATH}`,
       GH_LOG: ghLog,
       GH_TOKEN: 'x',
       REPO: 'octocat/repo',
       PR_NUMBER: '1',
+      // The step's own env: `CI_NAME: ${{ inputs.ci-name }}`.
+      CI_NAME: REFERENCE_INPUTS['ci-name'],
       HEAD_SHA_FIXTURE: GATE_HEAD,
       RUNS_JSON: JSON.stringify(runs),
       GITHUB_OUTPUT: githubOutput,
@@ -491,16 +515,16 @@ esac
 `;
 
 function runAssertStep({ prState, headBranch, comments, since }) {
-  const out = renderTo();
-  const workflow = readFileSync(join(out, '.github/workflows/dependabot-review.yml'), 'utf8');
+  const workflow = workflowText('review');
   const block = runBlocks(workflow).find((b) => b.stepName.startsWith('Assert the review deliverable exists'));
   assert.ok(block, 'the deliverable-assertion step must exist — the rest of this test is vacuous without it');
-  // The assertion runs the copies the step after checkout makes, so that step
-  // runs first, as in the job.
-  const keep = runBlocks(workflow).find((b) => b.stepName.startsWith("Keep this job's scripts"));
-  assert.ok(keep, 'the step that copies the scripts must exist');
-  const runnerTemp = mkdtempSync(join(tmpdir(), 'ds-art-'));
-  execFileSync('bash', ['-e', '-c', stripActionsExpressions(keep.script)], { cwd: out, stdio: 'pipe', env: { ...process.env, RUNNER_TEMP: runnerTemp } });
+  // The assertion runs the copies the tools step makes before the agent
+  // starts, so that step must be in the job, ahead of it.
+  const steps = parseJobs(workflow).review.steps;
+  const keepAt = steps.findIndex((st) => /^raphaelcm\/dep-steward\/actions\/tools@/.test(st.uses ?? ''));
+  const assertAt = steps.findIndex((st) => (st.name ?? '').startsWith('Assert the review deliverable exists'));
+  assert.ok(keepAt >= 0 && keepAt < assertAt, 'the tools step that copies the scripts must run before the assertion');
+  const runnerTemp = TOOLS.RUNNER_TEMP;
 
   const bin = mkdtempSync(join(tmpdir(), 'ds-abin-'));
   writeFileSync(join(bin, 'gh'), ASSERT_GH_STUB, { mode: 0o755 });
@@ -513,13 +537,15 @@ function runAssertStep({ prState, headBranch, comments, since }) {
   let stdout = '';
   try {
     stdout = execFileSync('bash', ['-e', script], {
-      cwd: out,
+      cwd: WORKDIR,
       encoding: 'utf8',
       stdio: 'pipe',
       env: {
         ...process.env,
         PATH: `${bin}:${process.env.PATH}`,
         GH_LOG: ghLog,
+        ...TOOLS,
+        ...shippedEnv('review', 'review'),
         GH_TOKEN: 'x',
         RUNNER_TEMP: runnerTemp,
         REPO: 'octocat/repo',
@@ -656,8 +682,7 @@ echo "2026-08-10T06:00:00Z"
 `;
 
 function runPromptLoadStep({ stubAuthor }) {
-  const out = renderTo();
-  const workflow = readFileSync(join(out, '.github/workflows/dependabot-review.yml'), 'utf8');
+  const workflow = workflowText('review');
   const block = runBlocks(workflow).find((b) => b.stepName === 'Load agent prompt');
   assert.ok(block, 'the Load agent prompt step must exist — the rest of this test is vacuous without it');
 
@@ -675,11 +700,13 @@ function runPromptLoadStep({ stubAuthor }) {
   let stderr = '';
   try {
     execFileSync('bash', ['-e', script], {
-      cwd: out,
+      cwd: WORKDIR,
       encoding: 'utf8',
       stdio: 'pipe',
       env: {
         ...process.env,
+        ...TOOLS,
+        ...shippedEnv('review', 'review'),
         PATH: `${bin}:${process.env.PATH}`,
         GH_LOG: ghLog,
         STUB_AUTHOR: stubAuthor,
@@ -728,7 +755,7 @@ test('prompt-load: a non-Dependabot author lands verbatim in the escalation rule
 // Both halves of that are wrong in a way reading cannot catch and `bash -n`
 // cannot catch — it parses perfectly either way. Only executing the branch with
 // each spelling shows which logins the guard actually admits, so that is what
-// this does, against the REAL rendered shell.
+// this does, against the REAL shipped shell.
 
 const RESOLVE_GH_STUB = `#!/usr/bin/env bash
 printf '%s\\n' "$*" >> "$GH_LOG"
@@ -742,8 +769,7 @@ esac
 `;
 
 function runResolveStep({ author }) {
-  const out = renderTo();
-  const workflow = readFileSync(join(out, '.github/workflows/dependabot-review.yml'), 'utf8');
+  const workflow = workflowText('review');
   const block = runBlocks(workflow).find((b) => b.stepName.startsWith('Resolve the PR'));
   assert.ok(block, 'the autofix resolve step must exist — the rest of this test is vacuous without it');
 
@@ -763,11 +789,12 @@ function runResolveStep({ author }) {
   let stdout = '';
   try {
     stdout = execFileSync('bash', ['-e', script], {
-      cwd: out,
+      cwd: WORKDIR,
       encoding: 'utf8',
       stdio: 'pipe',
       env: {
         ...process.env,
+        ...shippedEnv('review', 'autofix'),
         PATH: `${bin}:${process.env.PATH}`,
         GH_LOG: ghLog,
         GH_TOKEN: 'x',
@@ -948,18 +975,15 @@ esac
 }
 
 function runAutofixPromptLoadStep({ runStartedAt = '', createdAt = '', realDate = false, ciRuns = [['900', '1', 'failure']], earlierAttempts = {} } = {}) {
-  const out = renderTo();
-  const workflow = readFileSync(join(out, '.github/workflows/dependabot-review.yml'), 'utf8');
+  const workflow = workflowText('review');
   const block = runBlocks(workflow).find((b) => b.stepName === 'Load the autofix prompt');
   assert.ok(block, 'the autofix prompt-load step must exist — the rest of this test is vacuous without it');
 
   const bin = mkdtempSync(join(tmpdir(), 'ds-afp-'));
   if (!realDate) writeFileSync(join(bin, 'date'), AUTOFIX_DATE_STUB, { mode: 0o755 });
   writeFileSync(join(bin, 'gh'), ciHistoryStub(ciRuns, earlierAttempts), { mode: 0o755 });
-  // The snapshot step's copy of the prompt, where this step reads it.
-  const runnerTemp = mkdtempSync(join(tmpdir(), 'ds-afp-rt-'));
-  mkdirSync(join(runnerTemp, 'dep-steward'));
-  writeFileSync(join(runnerTemp, 'dep-steward/dependabot-autofix-prompt.md'), readFileSync(join(out, '.github/dependabot-autofix-prompt.md')));
+  // The tools step's filled copy of the prompt, where this step reads it.
+  const runnerTemp = TOOLS.RUNNER_TEMP;
   const githubOutput = join(bin, 'github_output');
   writeFileSync(githubOutput, '');
   const script = join(bin, 'step.sh');
@@ -969,11 +993,12 @@ function runAutofixPromptLoadStep({ runStartedAt = '', createdAt = '', realDate 
   let stderr = '';
   try {
     execFileSync('bash', ['-e', script], {
-      cwd: out,
+      cwd: WORKDIR,
       encoding: 'utf8',
       stdio: 'pipe',
       env: {
         ...process.env,
+        ...shippedEnv('review', 'autofix'),
         PATH: `${bin}:${process.env.PATH}`,
         PR_NUMBER: '123',
         RUNNER_TEMP: runnerTemp,
