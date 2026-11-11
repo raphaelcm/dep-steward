@@ -1,0 +1,24 @@
+# dep-steward: copies the secrets CI reads into Dependabot's own secret store,
+# sealed so no person or log sees a value. /dep-steward:install runs it; it
+# does nothing on its own. The pipeline itself lives in raphaelcm/dep-steward
+# at the commit pinned below.
+name: Dependabot seal CI secrets
+
+on:
+  workflow_dispatch:
+    inputs:
+      public-key:
+        description: The Dependabot secret store's public key (the install skill fills it in)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  seal:
+    uses: raphaelcm/dep-steward/.github/workflows/seal-ci-secrets.yml@__DEP_STEWARD_REF__
+    with:
+      ci-name: "__CI_NAME__"
+      public-key: ${{ inputs.public-key }}
+    secrets: inherit

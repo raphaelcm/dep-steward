@@ -1,0 +1,60 @@
+name: dep-steward tools
+description: >-
+  Puts dep-steward's scripts and filled-in prompts in $RUNNER_TEMP/dep-steward,
+  read-only, and exports ROOT_FILES (the default branch's root file names) for
+  the gate. Used by dep-steward's own reusable workflows.
+inputs:
+  github-token:
+    description: Token that can read the repository's contents.
+    required: true
+  assignee:
+    description: GitHub login to assign on escalation, or empty for nobody.
+    required: false
+    default: ''
+runs:
+  using: composite
+  steps:
+    - name: Copy dep-steward's scripts where the agent cannot write them
+      # Reads: this action's own files, the default branch's root tree.
+      # Writes: $RUNNER_TEMP/dep-steward (read-only afterwards), ROOT_FILES in
+      # $GITHUB_ENV. Touches nothing in the checkout.
+      #
+      # Every script a job runs once an agent has started (the lint hook before
+      # each Bash call, the gate and the lint in the deliverable assertion, the
+      # autofix bounds) would run an agent's rewrite with what its caller
+      # holds. So they run from these copies, taken before any agent starts,
+      # and the agent has no shell to change that. The root tree is the
+      # DEFAULT branch's, never a PR's: a PR that adds a manifest must not
+      # widen the whitelist that judges it.
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        ASSIGNEE: ${{ inputs.assignee }}
+        REPO: ${{ github.repository }}
+      run: |
+        set -euo pipefail
+        D="$RUNNER_TEMP/dep-steward"
+        # A runner that keeps its temp directory between jobs (self-hosted)
+        # can still hold the last job's read-only copies.
+        chmod -R u+w "$D" 2>/dev/null || true
+        rm -rf "$D"
+        mkdir -p "$D"
+        DEFAULT_BRANCH=$(gh api "repos/$REPO" --jq .default_branch)
+        ROOT_FILES=$(gh api "repos/$REPO/git/trees/$DEFAULT_BRANCH" --jq '.tree[] | select(.type == "blob") | .path')
+        if [ -z "$ROOT_FILES" ]; then
+          echo "::error::Could not list the root of $REPO's default branch ($DEFAULT_BRANCH)."
+          exit 1
+        fi
+        cp "$GITHUB_ACTION_PATH"/ecosystems.cjs "$GITHUB_ACTION_PATH"/gate.cjs \
+           "$GITHUB_ACTION_PATH"/review-lint.cjs "$GITHUB_ACTION_PATH"/autofix-bounds.cjs \
+           "$GITHUB_ACTION_PATH"/regenerate-take.sh "$GITHUB_ACTION_PATH"/ci-secrets.cjs "$D"/
+        export ROOT_FILES
+        node "$GITHUB_ACTION_PATH/render-prompt.cjs" "$GITHUB_ACTION_PATH/review-prompt.md" > "$D/review-prompt.md"
+        node "$GITHUB_ACTION_PATH/render-prompt.cjs" "$GITHUB_ACTION_PATH/autofix-prompt.md" > "$D/autofix-prompt.md"
+        chmod -R a-w "$D"
+        {
+          echo 'ROOT_FILES<<ROOT_FILES_EOF_7Q1'
+          printf '%s\n' "$ROOT_FILES"
+          echo 'ROOT_FILES_EOF_7Q1'
+        } >> "$GITHUB_ENV"
+        echo "dep-steward tools ready in $D; ecosystems: $(node -e 'console.log(require(process.argv[1]).ecosystemsFromEnv().human)' "$D/ecosystems.cjs")"

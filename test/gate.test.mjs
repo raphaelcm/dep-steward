@@ -1,20 +1,18 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 /**
- * Tests for the deterministic auto-merge gate (`templates/gate.cjs`, rendered
- * to `.github/dependabot-automerge/gate.cjs` by install.sh). We render the
- * gate fresh from the templates so the tests exercise exactly what an adopter
- * ships, not a hand-copied snapshot.
+ * Tests for the deterministic auto-merge gate (`actions/tools/gate.cjs`), run
+ * exactly as the workflows run it: with ROOT_FILES naming the default
+ * branch's root files, from which it derives its group prefixes and path
+ * whitelist (ecosystems.cjs).
  *
  * Two branches:
- *   - Group PRs (minor/patch group, branch prefix matches an entry in
- *     ELIGIBLE_GROUP_PREFIXES): zero LLM input — dependabot.yml guarantees
+ *   - Group PRs (minor/patch group, branch prefix matches a group prefix
+ *     derived from the root files): zero LLM input — dependabot.yml guarantees
  *     non-major by construction; the gate just verifies CI, author, PR state,
  *     and the path whitelist.
  *   - Singleton / major PRs: the review job posts a fenced
@@ -31,23 +29,10 @@ import { fileURLToPath } from 'node:url';
  */
 
 const REPO = dirname(dirname(fileURLToPath(import.meta.url)));
-
-function renderGate() {
-  const fakeRepo = mkdtempSync(join(tmpdir(), 'ds-repo-'));
-  // Multi-ecosystem, so the gate's whitelist + group prefixes cover more than npm.
-  for (const m of ['package.json', 'package-lock.json', 'requirements.txt', 'Cargo.toml', 'go.mod', 'Dockerfile']) {
-    writeFileSync(join(fakeRepo, m), '\n');
-  }
-  const out = mkdtempSync(join(tmpdir(), 'ds-out-'));
-  execFileSync('sh', [join(REPO, 'plugin', 'install.sh'), '--render-only', '--out', out, '--ci-name', 'CI'], {
-    cwd: fakeRepo,
-    env: { ...process.env, DEP_STEWARD_SRC: join(REPO, 'plugin') },
-    stdio: 'pipe',
-  });
-  return join(out, '.github', 'dependabot-automerge', 'gate.cjs');
-}
-
-const GATE = renderGate();
+const GATE = join(REPO, 'actions', 'tools', 'gate.cjs');
+// Multi-ecosystem, so the gate's whitelist + group prefixes cover more than npm.
+const ROOT_FILES = ['package.json', 'package-lock.json', 'requirements.txt', 'Cargo.toml', 'go.mod', 'Dockerfile'].join('\n');
+process.env.ROOT_FILES = ROOT_FILES;
 
 function runGate(env) {
   const raw = execFileSync('node', [GATE], { env: { ...process.env, ...env }, encoding: 'utf8' });
@@ -622,3 +607,34 @@ for (const [eco, branch] of [
     assert.equal(classifyGate(branch), 'group=true');
   });
 }
+
+// A pipeline never approves its own upgrade. Dependabot proposes a new
+// dep-steward release as a change to the caller workflows (an actions group
+// bump or a singleton); either way the gate leaves it to a person, even with
+// a merge verdict, and the escalation is the auto-merge job's to send.
+test('a change to a dep-steward caller workflow never merges, group or singleton', () => {
+  for (const file of ['.github/workflows/dependabot-review.yml', '.github/workflows/dependabot-automerge.yml', '.github/workflows/dependabot-seal.yml']) {
+    const group = runGate({ ...OK_NPM, HEAD_BRANCH: 'dependabot/github_actions/actions-minor-patch-0a1b2c', CHANGED_PATHS: `${file}\n.github/workflows/ci.yml` });
+    assert.equal(group.decision, 'skip', file);
+    assert.equal(group.code, 'dep_steward_upgrade', file);
+    const single = runGate({ ...OK_SINGLETON, HEAD_BRANCH: 'dependabot/github_actions/raphaelcm/dep-steward-0.19.0', CHANGED_PATHS: file });
+    assert.equal(single.code, 'dep_steward_upgrade', file);
+  }
+  // Another workflow's bump in the same group is unaffected.
+  const other = runGate({ ...OK_NPM, HEAD_BRANCH: 'dependabot/github_actions/actions-minor-patch-0a1b2c', CHANGED_PATHS: '.github/workflows/ci.yml' });
+  assert.equal(other.decision, 'merge');
+});
+
+test('the gate refuses to guess its ecosystems when ROOT_FILES is missing', () => {
+  const env = { ...process.env, ...OK_NPM };
+  delete env.ROOT_FILES;
+  assert.throws(() => execFileSync('node', [GATE], { env, stdio: 'pipe' }), /ROOT_FILES is empty/);
+});
+
+test('the ecosystems come from the root files: a repo with only a Gemfile gets bundler and actions, nothing else', () => {
+  const r = runGate({ ...OK_NPM, ROOT_FILES: 'Gemfile\nREADME.md' });
+  assert.equal(r.decision, 'skip');
+  assert.equal(r.code, 'paths_not_whitelisted');
+  const ok = runGate({ ...OK_NPM, ROOT_FILES: 'Gemfile\nREADME.md', HEAD_BRANCH: 'dependabot/bundler/bundler-minor-patch-1f2e', CHANGED_PATHS: 'Gemfile.lock' });
+  assert.equal(ok.decision, 'merge');
+});

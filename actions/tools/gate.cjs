@@ -6,8 +6,8 @@
  * decides whether a Dependabot PR may auto-merge after running deterministic
  * checks. There are two paths through it:
  *
- *   1. **Group PRs** (branch prefix matches an entry in
- *      `ELIGIBLE_GROUP_PREFIXES`): `.github/dependabot.yml` guarantees the
+ *   1. **Group PRs** (branch prefix matches a group prefix
+ *      derived by ecosystems.cjs): `.github/dependabot.yml` guarantees the
  *      group contains only minor + patch bumps. No LLM input needed; the
  *      gate just verifies CI, author, who pushed the head commit, PR state,
  *      and the path whitelist.
@@ -23,6 +23,9 @@
  *      are applied independently of anything the LLM says.
  *
  * Inputs (env):
+ *   - ROOT_FILES: newline-separated names of the files at the root of the
+ *     DEFAULT branch, from which ecosystems.cjs derives the group prefixes
+ *     and the path whitelist
  *   - HEAD_BRANCH, CI_CONCLUSION, PR_AUTHOR, PR_STATE, CHANGED_PATHS
  *     (CHANGED_PATHS is newline-separated)
  *   - HEAD_SHA: the commit CI_CONCLUSION and HEAD_PUSHER were read for;
@@ -49,13 +52,28 @@
  * re-parsing prose to decide that is how a notifier goes wrong.
  */
 
-// One prefix per configured ecosystem: `dependabot/<branch-slug>/<group-name>-`.
-// The installer renders these from the ecosystems it detected — the branch slug
-// is Dependabot's own (npm→npm_and_yarn, gomod→go_modules, …), not the config
-// value.
-const ELIGIBLE_GROUP_PREFIXES = [
-//__PREFIXES__
-];
+// The group prefixes (`dependabot/<branch-slug>/<group-name>-`), the path
+// whitelist, and the human-readable list all come from one function of the
+// default branch's root files (ecosystems.cjs), computed when the gate runs.
+// The branch slug is Dependabot's own (npm→npm_and_yarn, gomod→go_modules, …),
+// not the config value.
+const { ecosystemsFromEnv } = require('./ecosystems.cjs');
+let ECOSYSTEMS = null;
+function ecosystems() {
+  if (!ECOSYSTEMS) ECOSYSTEMS = ecosystemsFromEnv(process.env);
+  return ECOSYSTEMS;
+}
+
+// dep-steward's own files in the adopting repo: the three caller workflows.
+// Each holds nothing but a `uses:` of dep-steward's reusable workflow at a
+// pinned commit, so ANY change to one is a change to the pipeline that is
+// judging it. A pipeline never approves its own upgrade: such a PR always
+// goes to a person, whatever the review says and whether or not it is a group.
+const DEP_STEWARD_CALLERS = new Set([
+  '.github/workflows/dependabot-review.yml',
+  '.github/workflows/dependabot-automerge.yml',
+  '.github/workflows/dependabot-seal.yml',
+]);
 
 // Two strings, one identity. The Dependabot GitHub App's login is normalized
 // differently across GitHub surfaces: `github.event.pull_request.user.login`
@@ -86,20 +104,14 @@ const TRUSTED_DECISION_AUTHORS = new Set(['github-actions[bot]']);
 const V1_OPEN = '<!-- AUTOMERGE-DECISION-V1 -->';
 const V1_CLOSE = '<!-- /AUTOMERGE-DECISION-V1 -->';
 
-// The dependency surface a routine bump may touch, rendered from the detected
-// ecosystems: exact manifest/lock filenames plus regexes for the variable ones
-// (requirements*.txt, *.csproj, the GitHub Actions surface, …). A PR that
-// changes anything NOT matched here is rejected regardless of the LLM.
-const WHITELIST_EXACT = new Set([
-//__WL_EXACT__
-]);
-const WHITELIST_REGEX = [
-//__WL_REGEX__
-];
-
+// The dependency surface a routine bump may touch: exact manifest/lock
+// filenames plus regexes for the variable ones (requirements*.txt, *.csproj,
+// the GitHub Actions surface, …), from the same ecosystems. A PR that changes
+// anything NOT matched here is rejected regardless of the LLM.
 function isWhitelistedPath(p) {
-  if (WHITELIST_EXACT.has(p)) return true;
-  for (const re of WHITELIST_REGEX) {
+  const { whitelistExact, whitelistRegex } = ecosystems();
+  if (whitelistExact.has(p)) return true;
+  for (const re of whitelistRegex) {
     if (re.test(p)) return true;
   }
   return false;
@@ -366,8 +378,19 @@ function decide(env) {
     };
   }
 
+  // Before any merge path: an upgrade of dep-steward itself is a person's call.
+  // Terminal on sight, like the whitelist: only a new push changes the paths.
+  const callers = changedPaths.filter((p) => DEP_STEWARD_CALLERS.has(p));
+  if (callers.length > 0) {
+    return {
+      decision: 'skip',
+      code: 'dep_steward_upgrade',
+      reason: `changes dep-steward's own workflow(s): ${callers.join(', ')}; the pipeline does not approve its own upgrade`,
+    };
+  }
+
   // Branch on group vs singleton.
-  const matchedPrefix = ELIGIBLE_GROUP_PREFIXES.find((pfx) => headBranch.startsWith(pfx));
+  const matchedPrefix = ecosystems().prefixes.find((pfx) => headBranch.startsWith(pfx));
   if (matchedPrefix) {
     return {
       decision: 'merge',
@@ -426,13 +449,13 @@ function decide(env) {
 
 // Classification mode, used by the review workflow's deliverable-assertion —
 // NOT the merge path. It answers only "is this branch a minor/patch group?"
-// from the same ELIGIBLE_GROUP_PREFIXES the merge path uses, so the two can
+// from the same group prefixes the merge path uses, so the two can
 // never disagree about which PRs the gate merges without a review verdict. It
 // is a pure branch-name match with no privilege — it authorizes nothing — so
 // running it from a PR checkout (as the review job does) is safe.
 if ((process.env.GATE_MODE || '') === 'classify') {
   const headBranch = (process.env.HEAD_BRANCH || '').trim();
-  const isGroup = ELIGIBLE_GROUP_PREFIXES.some((pfx) => headBranch.startsWith(pfx));
+  const isGroup = ecosystems().prefixes.some((pfx) => headBranch.startsWith(pfx));
   process.stdout.write(`group=${isGroup}\n`);
   process.exit(0);
 }
