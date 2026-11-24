@@ -356,14 +356,16 @@ test('a terminal refusal escalates; a transient one stays silent', () => {
     'an exact, delimited match: a code that is a prefix of another must not match it');
   for (const autofix of [true, false]) {
     const codes = escalatable(autofix);
-    for (const terminal of ['paths_not_whitelisted', 'verdict_malformed', 'head_pushed_by_other', 'dep_steward_upgrade']) {
+    // ci_indeterminate: the CI resolver says it only once nothing on the head
+    // is still running, so no CI completion will wake the gate again.
+    for (const terminal of ['paths_not_whitelisted', 'verdict_malformed', 'head_pushed_by_other', 'dep_steward_upgrade', 'ci_indeterminate']) {
       assert.ok(codes.includes(terminal), `${terminal} must escalate (autofix ${autofix})`);
     }
   }
   // An allow-list, so a code added later defaults to silence. These must NOT
   // appear as escalation targets — each already has an owner, or is transient.
   const caseArm = escalatable(true).join('|');
-  for (const silent of ['ci_pending', 'ci_indeterminate', 'verdict_missing', 'verdict_escalate',
+  for (const silent of ['ci_pending', 'verdict_missing', 'verdict_escalate',
     'usage_affected', 'author_not_dependabot', 'pr_not_open', 'no_changed_paths', 'head_moved', 'head_pusher_unknown']) {
     for (const autofix of [true, false]) {
       assert.ok(!escalatable(autofix).includes(silent), `${silent} must not escalate — it is transient or already owned`);
