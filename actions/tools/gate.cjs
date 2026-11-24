@@ -276,14 +276,13 @@ function findLatestDecision(commentsJson) {
 //
 //   PENDING       nothing has concluded yet. Always silent — the gate will be
 //                 woken again when it does.
-//   INDETERMINATE concluded, but not with a verdict about the code: a run
-//                 someone cancelled, one that timed out, one awaiting manual
-//                 approval. A new push re-runs CI and re-wakes the gate, so
-//                 these resolve themselves more often than not. Deliberately
-//                 NOT escalatable: a new code defaults to silence rather than
-//                 noise, and a false ping teaches you to ignore the label.
-//                 Documented as a known gap; revisit if one is seen stranding
-//                 a PR in practice.
+//   INDETERMINATE concluded, but not with a verdict about the code: every run
+//                 on the head cancelled, or the newest one timed out or is
+//                 awaiting manual approval. The workflow reports this only when
+//                 nothing on the head is still running (a cancelled duplicate
+//                 beside a live or green run is not evidence about the head),
+//                 so no CI completion will wake the gate again: the workflow
+//                 escalates it, once per PR.
 //   anything else is a real failure -> `ci_failed`.
 const CI_PENDING = new Set(['', 'pending', 'queued', 'in_progress', 'waiting', 'requested']);
 const CI_INDETERMINATE = new Set(['cancelled', 'timed_out', 'action_required', 'neutral', 'skipped', 'stale']);

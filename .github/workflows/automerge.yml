@@ -144,7 +144,7 @@ jobs:
       # step, and the codes that page a person, computed by expression so the
       # script sees only the taken branch.
       ASSIGNEE: ${{ inputs.assignee }}
-      ESCALATABLE_CODES: ${{ inputs.autofix && 'paths_not_whitelisted|verdict_malformed|head_pushed_by_other|dep_steward_upgrade' || 'paths_not_whitelisted|verdict_malformed|head_pushed_by_other|dep_steward_upgrade|ci_failed' }}
+      ESCALATABLE_CODES: ${{ inputs.autofix && 'paths_not_whitelisted|verdict_malformed|head_pushed_by_other|dep_steward_upgrade|ci_indeterminate' || 'paths_not_whitelisted|verdict_malformed|head_pushed_by_other|dep_steward_upgrade|ci_indeterminate|ci_failed' }}
     concurrency:
       # One run per PR at a time, whatever woke it. Not the waking run's
       # branch: a replay runs on the default branch, so every replay would
@@ -173,17 +173,34 @@ jobs:
           # An unfilled placeholder would read as "CI never finished" on every
           # wake, forever, and nothing would ever merge. Red instead.
           case "$CI_NAME" in ''|__*__) echo "::error::ci-name is '$CI_NAME': set it to the exact name: of your CI workflow in .github/workflows/dependabot-automerge.yml"; exit 1 ;; esac
-          # Query the latest CI workflow run for this PR's head SHA. The gate
-          # needs the current state, not the (possibly older) trigger payload.
+          # Every CI run on this PR's head, read now: the trigger payload is one
+          # run, and the gate needs the head's current state.
           HEAD_SHA=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json headRefOid --jq '.headRefOid')
-          CI_CONCLUSION=$(gh run list --repo "$REPO" --workflow "$CI_NAME" --commit "$HEAD_SHA" \
-            --limit 1 --json conclusion --jq '.[0].conclusion // "pending"')
+          RUNS=$(gh run list --repo "$REPO" --workflow "$CI_NAME" --commit "$HEAD_SHA" \
+            --limit 100 --json databaseId,createdAt,status,conclusion)
+          # One head can carry several runs. A CI that runs on `opened` and
+          # `labeled` and cancels in-progress runs per PR starts three in the
+          # same second when Dependabot opens a PR and labels it, and cancels
+          # two. A cancelled run with a sibling on the head says nothing about
+          # the head, and the API lists same-second runs in no fixed order, so
+          # taking its first run read a cancelled duplicate while the green one
+          # sat next to it (Runsense-ai/runsense#3440 and #3441). So: order by
+          # creation, run id breaking ties; the newest run that was NOT
+          # cancelled decides (pending while it runs); the head is cancelled
+          # only when every run on it was; no run at all is pending.
+          CI_CONCLUSION=$(printf '%s' "$RUNS" | jq -r '
+            sort_by(.createdAt, .databaseId) | reverse
+            | if length == 0 then "pending"
+              else (map(select(.conclusion != "cancelled")) | first) as $live
+                | if $live == null then "cancelled"
+                  elif $live.status != "completed" or ($live.conclusion // "") == "" then "pending"
+                  else $live.conclusion end
+              end')
           # Who pushed that commit: the actor of the first CI run GitHub created
           # for it. The push itself creates that run; a reopen or a re-run comes
           # later and names whoever clicked. Empty when it cannot be read, which
           # the gate refuses rather than guesses.
-          FIRST_RUN=$(gh run list --repo "$REPO" --workflow "$CI_NAME" --commit "$HEAD_SHA" \
-            --limit 100 --json databaseId,createdAt --jq 'sort_by(.createdAt) | .[0].databaseId // empty' 2>/dev/null || true)
+          FIRST_RUN=$(printf '%s' "$RUNS" | jq -r 'sort_by(.createdAt, .databaseId) | .[0].databaseId // empty' 2>/dev/null || true)
           HEAD_PUSHER=''
           if [ -n "$FIRST_RUN" ]; then
             HEAD_PUSHER=$(gh api "repos/$REPO/actions/runs/$FIRST_RUN" --jq '.actor.login // empty' 2>/dev/null || true)
@@ -348,7 +365,7 @@ jobs:
           }
 
           if [ "$DECISION" != "merge" ]; then
-            echo "Not auto-merging PR #$PR_NUMBER — left for human review ($REASON)"
+            echo "Not auto-merging PR #$PR_NUMBER on this wake ($CODE: $REASON)"
             # Arming is a latch, and the gate is re-derived on every wake, so a
             # later `skip` MUST revoke an earlier `merge`. Otherwise a singleton
             # whose LLM posts a superseding `escalate` verdict, or whose CI goes
@@ -401,10 +418,6 @@ jobs:
             #   verdict_escalate / usage_affected
             #                      the reviewer labels the PR itself, by design
             #   ci_pending         transient by definition
-            #   ci_indeterminate   cancelled / timed out / awaiting approval: a new
-            #                      push re-runs CI and re-wakes the gate, so these
-            #                      usually resolve themselves. Known gap, on
-            #                      purpose; revisit if one is seen stranding a PR.
             #   author_not_dependabot / pr_not_open / no_changed_paths
             #                      anomalies, not stuck PRs — the gate is looking at
             #                      something it should not act on, and paging about
@@ -413,6 +426,16 @@ jobs:
             #   head_moved         the new head's CI run wakes the gate again
             #   head_pusher_unknown
             #                      a read that failed; the next wake reads again
+            #
+            # ci_indeterminate escalates. The CI-resolve step says it only when
+            #                      nothing on the head is still running: every run
+            #                      was cancelled, or the newest one timed out or
+            #                      waits for approval. No CI completion is coming
+            #                      to wake the gate again, and nobody else watches
+            #                      it (autofix wakes only on `failure`), so silence
+            #                      here stranded green Runsense-ai/runsense#3440
+            #                      and #3441 for 11 hours. A re-run that goes green
+            #                      wakes the gate, which then merges as usual.
             #
             #   ci_failed belongs to exactly ONE owner. When CI goes red, the
             #                      autofix job and this gate wake from the SAME
@@ -431,6 +454,11 @@ jobs:
                   echo "PR #$PR_NUMBER is already labelled needs-human-review — not commenting again ($CODE)."
                 else
                   echo "::warning::PR #$PR_NUMBER cannot merge without a human ($CODE): $REASON"
+                  # What a person can do about it, where there is one thing to do.
+                  case "$CODE" in
+                    ci_indeterminate) HINT="No CI run on this commit is still going, so none will wake the gate. Re-run CI on it (or approve the waiting run): when that run is green the gate wakes and merges as usual." ;;
+                    *) HINT='Nothing further will happen to this PR until a person acts. The gate will keep refusing it on every wake-up, and this notice is posted once.' ;;
+                  esac
                   notify_human "$(printf '%s\n' \
                     '## dep-steward cannot merge this PR on its own' \
                     '' \
@@ -442,7 +470,7 @@ jobs:
                     '' \
                     "Reason code: \`$CODE\`" \
                     '' \
-                    'Nothing further will happen to this PR until a person acts. The gate will keep refusing it on every wake-up, and this notice is posted once.')"
+                    "$HINT")"
                 fi
                 ;;
             esac

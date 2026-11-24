@@ -206,7 +206,8 @@ case "$1 $2" in
       *autoMergeRequest*) echo "\${ARMED_BY:-none}"; exit 0 ;;
     esac
     jq -nc --arg head "$PR_HEAD_FIXTURE" --argjson comments "\${GH_VIEW_COMMENTS:-[]}" \\
-      '{state: "OPEN", headRefOid: $head, author: {is_bot: true, login: "app/dependabot"}, comments: $comments, labels: []}' \\
+      --argjson labels "\${PR_LABELS_FIXTURE:-[]}" \\
+      '{state: "OPEN", headRefOid: $head, author: {is_bot: true, login: "app/dependabot"}, comments: $comments, labels: $labels}' \\
       | jq -rc "$(jq_arg "$@")" ;;
   "pr diff")
     printf '%s\\n' "\${PR_DIFF_FIXTURE:-.github/workflows/ci.yml}" ;;
@@ -228,7 +229,7 @@ esac
 
 const GATE_HEAD = '9ee40cf2a1b3c4d5e6f708192a3b4c5d6e7f8091';
 
-function runGateStep({ acceptMethods, allowedMergeMethods, headPusher = 'dependabot[bot]', prHeadSha = GATE_HEAD, armedBy = 'none', headBranch = 'dependabot/github_actions/actions-minor-patch-a', changedPaths, comments = [] }) {
+function runGateStep({ acceptMethods, allowedMergeMethods, headPusher = 'dependabot[bot]', prHeadSha = GATE_HEAD, armedBy = 'none', headBranch = 'dependabot/github_actions/actions-minor-patch-a', changedPaths, comments = [], ciConclusion = 'success', labels = [] }) {
   const workflow = workflowText('automerge');
   const block = runBlocks(workflow).find((b) => b.stepName === 'Deterministic auto-merge gate');
   assert.ok(block, 'the auto-merge gate step must exist — the rest of this test is vacuous without it');
@@ -261,7 +262,8 @@ function runGateStep({ acceptMethods, allowedMergeMethods, headPusher = 'dependa
         HEAD_BRANCH: headBranch,
         ...(changedPaths ? { PR_DIFF_FIXTURE: changedPaths } : {}),
         ...commentSurfaces(comments),
-        CI_CONCLUSION: 'success',
+        CI_CONCLUSION: ciConclusion,
+        PR_LABELS_FIXTURE: JSON.stringify(labels.map((name) => ({ name }))),
         ALLOWED_MERGE_METHODS: allowedMergeMethods,
         HEAD_SHA: GATE_HEAD,
         HEAD_PUSHER: headPusher,
@@ -394,7 +396,9 @@ case "$1 $2" in
   "pr view") printf '%s\\n' "$HEAD_SHA_FIXTURE"; exit 0 ;;
   "run list")
     # Newest first, as gh lists them; the step's own --jq runs over it.
-    printf '%s' "$RUNS_JSON" | jq -r "$(flag --jq "$@")"; exit 0 ;;
+    # gh fetches at most --limit runs, in the API's order, then applies --jq.
+    prog=$(flag --jq "$@"); prog="\${prog:-.}"
+    printf '%s' "$RUNS_JSON" | jq -c --argjson n "$(flag --limit "$@")" '.[:$n]' | jq -r "$prog"; exit 0 ;;
   "api repos/octocat/repo/actions/runs/"*)
     id="\${2##*/}"
     printf '%s' "$RUNS_JSON" | jq -r --arg id "$id" '.[] | select((.databaseId|tostring) == $id) | .actor'; exit 0 ;;
@@ -436,7 +440,9 @@ function runResolveCiStep(runs) {
   return { stdout, outputs };
 }
 
-const run = (id, createdAt, actor, conclusion) => ({ databaseId: id, createdAt, actor, conclusion });
+// `gh run list --json status,conclusion` gives a run that has not finished an
+// empty conclusion, so a conclusion here means the run completed.
+const run = (id, createdAt, actor, conclusion, status = conclusion ? 'completed' : 'in_progress') => ({ databaseId: id, createdAt, actor, status, conclusion });
 
 test('resolve: the pusher is whoever caused the commit\'s first CI run, not a later reopen', () => {
   const { outputs } = runResolveCiStep([
@@ -457,6 +463,125 @@ test('resolve: with no CI run yet, the pusher is empty, not guessed', () => {
   const { outputs } = runResolveCiStep([]);
   assert.equal(outputs.head_pusher, '');
   assert.equal(outputs.ci_conclusion, 'pending');
+});
+
+// ---- several CI runs on ONE head --------------------------------------------
+//
+// A CI workflow that runs on `opened` and `labeled` and cancels in-progress
+// runs per PR starts three runs on a Dependabot PR in the same second
+// (Dependabot opens it, then adds two labels), and two of them are cancelled
+// by the third. Measured on Runsense-ai/runsense, 2026-11-23, with the order
+// the runs API returned them in. A cancelled run with a sibling on the same
+// head says nothing about the head; the gate reads the newest run that was
+// not cancelled, and calls the head cancelled only when every run was.
+
+const DUP_AT = '2026-11-23T04:34:02Z';
+
+test('resolve: two cancelled duplicates listed before the green run do not hide it (runsense#3441)', () => {
+  const { outputs } = runResolveCiStep([
+    run(45112619397, DUP_AT, 'dependabot[bot]', 'cancelled'),
+    run(45112619611, DUP_AT, 'dependabot[bot]', 'cancelled'),
+    run(45112619757, DUP_AT, 'dependabot[bot]', 'success'),
+  ]);
+  assert.equal(outputs.ci_conclusion, 'success');
+  assert.equal(outputs.head_pusher, 'dependabot[bot]');
+});
+
+test('resolve: the green run between two cancelled duplicates is the head\'s result (runsense#3440)', () => {
+  const at = '2026-11-23T04:33:37Z';
+  const { outputs } = runResolveCiStep([
+    run(45112578671, at, 'dependabot[bot]', 'cancelled'),
+    run(45112579574, at, 'dependabot[bot]', 'success'),
+    run(45112579426, at, 'dependabot[bot]', 'cancelled'),
+  ]);
+  assert.equal(outputs.ci_conclusion, 'success');
+});
+
+test('resolve: a cancelled duplicate does not hide a red run either', () => {
+  const { outputs } = runResolveCiStep([
+    run(3, DUP_AT, 'dependabot[bot]', 'cancelled'),
+    run(4, DUP_AT, 'dependabot[bot]', 'failure'),
+  ]);
+  assert.equal(outputs.ci_conclusion, 'failure');
+});
+
+test('resolve: while the surviving run is still going, the head is pending, not cancelled', () => {
+  const { outputs } = runResolveCiStep([
+    run(1, DUP_AT, 'dependabot[bot]', 'cancelled'),
+    run(2, DUP_AT, 'dependabot[bot]', 'cancelled'),
+    run(3, DUP_AT, 'dependabot[bot]', ''),
+  ]);
+  assert.equal(outputs.ci_conclusion, 'pending');
+});
+
+test('resolve: the head is cancelled only when every run on it was cancelled', () => {
+  const { outputs } = runResolveCiStep([
+    run(1, DUP_AT, 'dependabot[bot]', 'cancelled'),
+    run(2, DUP_AT, 'dependabot[bot]', 'cancelled'),
+  ]);
+  assert.equal(outputs.ci_conclusion, 'cancelled');
+});
+
+test('resolve: of the runs not cancelled, the newest decides (a red re-run after a green one is red)', () => {
+  const { outputs } = runResolveCiStep([
+    run(9, '2026-11-23T06:00:00Z', 'raphaelcm', 'failure'),
+    run(8, '2026-11-23T05:00:00Z', 'raphaelcm', 'cancelled'),
+    run(1, '2026-11-23T04:00:00Z', 'dependabot[bot]', 'success'),
+  ]);
+  assert.equal(outputs.ci_conclusion, 'failure');
+  assert.equal(outputs.head_pusher, 'dependabot[bot]');
+});
+
+test('resolve: same-second runs are ordered by run id, whatever order the API lists them in', () => {
+  const { outputs } = runResolveCiStep([
+    run(5, DUP_AT, 'dependabot[bot]', 'success'),
+    run(6, DUP_AT, 'dependabot[bot]', 'failure'),
+  ]);
+  assert.equal(outputs.ci_conclusion, 'failure', 'run 6 was created after run 5');
+});
+
+// ---- a refusal CI cannot clear by itself reaches a person -------------------
+//
+// With the resolver above, the gate says ci_indeterminate only once nothing on
+// the head is still running: every run was cancelled, or the newest one timed
+// out or waits for approval. No further CI completion will wake the gate, so
+// staying silent strands the PR. It is labelled, assigned and commented once,
+// and the comment says how to clear it.
+
+test('a head whose CI was all cancelled is labelled, assigned and commented on, once', () => {
+  const { status, stdout, ghCalls, ghLogText } = runGateStep({
+    acceptMethods: 'squash,rebase',
+    allowedMergeMethods: 'squash,rebase',
+    ciConclusion: 'cancelled',
+  });
+  assert.equal(status, 0, `a correct refusal is not a malfunction:\n${stdout}`);
+  assert.match(stdout, /^code=ci_indeterminate$/m);
+  assert.ok(!ghCalls.some((c) => c.startsWith('pr merge') && c.includes('--auto')), 'never armed');
+  assert.equal(ghCalls.filter((c) => c.startsWith('pr comment')).length, 1, ghLogText);
+  assert.ok(ghCalls.some((c) => c.startsWith('pr edit') && c.includes('--add-label needs-human-review') && c.includes('--add-assignee octocat')),
+    `labelled and assigned:\n${ghLogText}`);
+  assert.match(ghLogText, /re-run/i, 'the notice says how to clear it');
+});
+
+test('a PR already labelled is not commented on again for ci_indeterminate', () => {
+  const { status, stdout, ghCalls } = runGateStep({
+    acceptMethods: 'squash,rebase',
+    allowedMergeMethods: 'squash,rebase',
+    ciConclusion: 'timed_out',
+    labels: ['dependencies', 'needs-human-review'],
+  });
+  assert.equal(status, 0, stdout);
+  assert.equal(ghCalls.filter((c) => c.startsWith('pr comment')).length, 0);
+});
+
+test('CI still running stays silent', () => {
+  const { status, stdout, ghCalls } = runGateStep({
+    acceptMethods: 'squash,rebase',
+    allowedMergeMethods: 'squash,rebase',
+    ciConclusion: 'pending',
+  });
+  assert.equal(status, 0, stdout);
+  assert.equal(ghCalls.filter((c) => c.startsWith('pr comment') || c.startsWith('pr edit')).length, 0);
 });
 
 test('when every ranked method is refused, one escalation carries them all', () => {
