@@ -33,3 +33,31 @@ jobs:
         env:
           REQUIRE_ACTIONLINT: '1'
         run: node --test test/*.test.mjs
+
+  # Publishes the release main declares, once main's tests pass: the tag
+  # vX.Y.Z at the commit the caller templates pin, and the GitHub release with
+  # its CHANGELOG.md notes (scripts/release.mjs). A push whose release is
+  # already published changes nothing, and a tag is never moved.
+  release:
+    needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    concurrency:
+      group: release
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The release commit must be in main's history.
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Tag the release commit and publish its notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GIT_COMMITTER_NAME: github-actions[bot]
+          GIT_COMMITTER_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
+        run: node scripts/release.mjs

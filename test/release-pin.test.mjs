@@ -5,6 +5,7 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { REPO } from './lib/dep-steward.mjs';
 import { REUSABLE, CALLERS, TOOLS_REF, CALLER_REF } from '../scripts/pin.mjs';
+import { declaredRelease } from '../scripts/release.mjs';
 
 /**
  * A pinned workflow must run the code it was released with.
@@ -20,7 +21,9 @@ import { REUSABLE, CALLERS, TOOLS_REF, CALLER_REF } from '../scripts/pin.mjs';
  *   - R's actions/ and reusable workflows are this tree's, so an install made
  *     from these templates runs exactly this code;
  *   - the version comment on R is plugin.json's version, which is the release
- *     tag Dependabot reads to propose the next one.
+ *     tag Dependabot reads to propose the next one;
+ *   - CHANGELOG.md holds that version's notes, which CI's release job
+ *     publishes with the tag when this tree reaches main (scripts/release.mjs).
  *
  * It fails between a code change and its pin commits, by design: the release
  * is the commit that passes it.
@@ -64,4 +67,10 @@ test('the caller templates pin a commit whose pipeline is this tree, labelled wi
   assert.ok(sameTree(sha, ['actions/', ...REUSABLE]), `the pipeline at ${sha} differs from this tree: pin the tools, commit, then pin the callers`);
   const { version } = JSON.parse(read('plugin/.claude-plugin/plugin.json'));
   for (const r of refs) assert.equal(r.version, `v${version}`, `${r.file}: the version comment matches plugin.json`);
+});
+
+test('CHANGELOG.md holds the notes of the release this tree declares', () => {
+  const { version, title, notes } = declaredRelease(REPO);
+  assert.ok(title.startsWith(`${version}: `) && title.length > version.length + 2, `the heading names ${version} and a headline: ${title}`);
+  assert.ok(notes.length > 0);
 });
