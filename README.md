@@ -237,7 +237,8 @@ The tests run the shipped files themselves, through a step simulator (`test/lib/
 - `test/ci-secrets.test.mjs`: the installed seal job, with the real seal step, seals exactly the secrets CI reads, with the Dependabot store's key.
 - `test/actionlint.test.mjs`: the reusable workflows and the installed caller files pass actionlint (required in this repo's CI).
 - `test/plugin.test.mjs`, `test/plugin-policy.test.mjs`: the manifests agree, and every file in `plugin/` is a type Anthropic's plugin directory accepts (Markdown, text, JSON, YAML, images; nothing that starts with `#!`).
-- `test/release-pin.test.mjs`: the pinned commits run the code in this tree.
+- `test/release-pin.test.mjs`: the pinned commits run the code in this tree, and `CHANGELOG.md` holds the release's notes.
+- `test/release.test.mjs`: CI's release job tags the release commit and publishes its notes once, after the tests, and never moves a tag.
 - `test/actions-sim.test.mjs`: the GitHub rules the simulator copies.
 
 ### Releasing
@@ -246,12 +247,14 @@ A pinned workflow must run the code it was released with, and a called workflow 
 
 ```sh
 node scripts/pin.mjs tools            # the reusable workflows use actions/tools at HEAD
-git commit -am "Pin the tools"        # the release commit: tag vX.Y.Z here
+git commit -am "Pin the tools"        # the release commit, which tag vX.Y.Z will name
 node scripts/pin.mjs callers vX.Y.Z   # the caller templates pin that commit; plugin.json version
 git commit -am "Pin the callers"
 ```
 
-Merge the release PR with a merge commit, not a squash, so every pinned commit stays on `main`.
+In the same PR, put the release's notes at the top of [`CHANGELOG.md`](CHANGELOG.md), under `## vX.Y.Z: <headline>`. CI fails a tree whose release has no notes there.
+
+Merge the release PR with a merge commit, not a squash, so every pinned commit stays on `main`. Merging publishes the release: once `main`'s tests pass, CI's `release` job ([`scripts/release.mjs`](scripts/release.mjs)) pushes the annotated tag `vX.Y.Z` at the release commit and creates the GitHub release from those notes. A push to `main` whose release is already published changes nothing. The job never moves a tag: if `vX.Y.Z` already names another commit, it fails and publishes nothing.
 
 Working on the plugin locally:
 

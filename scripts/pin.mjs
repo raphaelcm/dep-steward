@@ -5,12 +5,14 @@
 // written here, in two steps:
 //
 //   node scripts/pin.mjs tools            # reusable workflows -> actions/tools at HEAD
-//   git commit -am "Pin the tools"        # this commit is the release (tag it)
+//   git commit -am "Pin the tools"        # this commit is the release
 //   node scripts/pin.mjs callers v0.18.0  # caller templates -> that commit; plugin.json version
 //   git commit -am "Pin the callers"
 //
 // Merge the PR with a merge commit (not squash), so every pinned SHA stays on
-// main. test/release-pin.test.mjs checks both pins against the tree.
+// main. test/release-pin.test.mjs checks both pins against the tree. Once
+// main's tests pass, CI tags the release commit and publishes the release
+// with its CHANGELOG.md notes (scripts/release.mjs).
 import { execFileSync } from 'node:child_process';
 import { readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
@@ -46,7 +48,7 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
     const json = JSON.parse(readFileSync(manifest, 'utf8'));
     json.version = version.slice(1);
     writeFileSync(manifest, `${JSON.stringify(json, null, 2)}\n`);
-    console.log(`caller templates now pin ${head} (${version}); tag ${version} at ${head}`);
+    console.log(`caller templates now pin ${head} (${version}); add its notes to CHANGELOG.md, and CI tags ${version} at ${head} when the PR merges`);
   } else {
     console.error('usage: node scripts/pin.mjs tools | callers vX.Y.Z');
     process.exit(2);
