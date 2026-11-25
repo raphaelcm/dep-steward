@@ -187,7 +187,7 @@ jobs:
         id: review
         # SHA-pinned: the moving @v1 tag silently shipped a breaking bot-gate
         # change that broke this workflow. Bump deliberately, not implicitly.
-        uses: anthropics/claude-code-action@61a9c274fa7110a66dfafc1bbbced03833eb25fe # v1.0.269
+        uses: anthropics/claude-code-action@acfe7992852970efb4fee683d63d628e3e52df67 # v1.0.286
         env:
           PR_NUMBER: ${{ inputs.pr_number || github.event.pull_request.number }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -1028,7 +1028,7 @@ jobs:
         id: fixer
         if: steps.attempt.outputs.proceed == 'true'
         # SHA-pinned, same as the review job — bump deliberately, not implicitly.
-        uses: anthropics/claude-code-action@61a9c274fa7110a66dfafc1bbbced03833eb25fe # v1.0.269
+        uses: anthropics/claude-code-action@acfe7992852970efb4fee683d63d628e3e52df67 # v1.0.286
         env:
           PR_NUMBER: ${{ steps.pr.outputs.pr_number }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
